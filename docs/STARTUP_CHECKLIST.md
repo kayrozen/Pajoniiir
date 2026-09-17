@@ -839,6 +839,72 @@ R5 cleanup status:
 - [x] R5F clean P4 image wired-flashed and monitored without reset/panic/watchdog;
 - [x] R5F clean S3 image wired-flashed and final dual-target scratch soak accepted.
 
+## JC1060P470C 7" Display Target Bring-Up
+
+New ESP32-P4 target (Guition JC1060P470C_I_W_Y). Phase 1 is scaffolded but
+not yet hardware-validated. See
+[`firmware/main-deck-jc1060/BRING_UP_GUIDE.md`](../firmware/main-deck-jc1060/BRING_UP_GUIDE.md).
+
+### Phase 1: Hardware Bring-Up (code ready, hardware pending)
+
+- [ ] Initialize ESP-IDF v6.0.2 environment and verify `idf.py --version`.
+- [ ] `idf.py set-target esp32p4` in `firmware/main-deck-jc1060/examples/esp_draw_bit`.
+- [ ] Flash to JC1060P470C board and verify boot log matches expected sequence:
+  - [ ] Display: `JD9165 panel created`, `Display initialized: 1024x600 @ 60Hz`.
+  - [ ] Touch: `GT911 touch initialized: 1024x600`.
+  - [ ] Audio: `ES8311 codec initialized`, `Audio initialization complete`.
+  - [ ] Backlight: `Backlight on`.
+- [ ] Visual tests: 8 colour bars, horizontal gradient, vertical gradient,
+      solid colour screens.
+- [ ] Touch test: tapping draws white circles and logs coordinates.
+- [ ] No DSI underrun, watchdog or panic during the test.
+- [ ] Verify GPIO12 conflict resolution: software I2C on GPIO14/15 for touch
+      and codec while hardware I2S uses GPIO12/13.
+
+### Phase 2: LVGL UI Port (planned, after Phase 1 acceptance)
+
+- [ ] Copy UI components from `main-deck-p4/components/ui/`.
+- [ ] Adapt layouts for 1024x600 native landscape.
+- [ ] Remove PPA rotation (native landscape, no rotation needed).
+- [ ] Validate DSI-synchronised dual-waveform at 1024x600.
+
+### Phase 3: DDJ-400 Integration (planned, after Phase 2)
+
+- [ ] Wire DDJ-400 MIDI parser into S3 build.
+- [ ] Adapt UI for 6 hot cues (hide G/H).
+- [ ] Test control-link transport, jog, loop, Pad FX, Beat FX.
+
+### Phase 4: Validation (planned)
+
+- [ ] Audio soak test (5+ hours).
+- [ ] Thermal enclosure test.
+- [ ] USB library validation.
+- [ ] Tag `RC1-jc1060p470c`.
+
+## Pioneer DDJ-400 Controller Bring-Up
+
+Second operator surface. Parser is scaffolded but not hardware-validated. See
+[`controllers/pioneer_ddj_400/README.md`](../controllers/pioneer_ddj_400/README.md).
+
+- [ ] Build S3 firmware with DDJ-400 parser component included.
+- [ ] Connect physical DDJ-400 to S3 USB host port.
+- [ ] Verify enumeration: VID `0x0853`, PID `0x0504`.
+- [ ] Capture and verify MIDI messages for all control categories:
+  - [ ] Transport: PLAY, CUE, SYNC, SHIFT, LOAD, TRACK UP/DOWN.
+  - [ ] Hot cues: 6 pads A-F (notes 0x14-0x19), verify G/H are inert.
+  - [ ] Jog wheel: touch (0x28), rotate (CC 0x00), center press (0x29).
+  - [ ] Pitch fader (CC 0x08), pitch range toggle (0x1E).
+  - [ ] Filter (CC 0x56), EQ low/mid/high (CC 0x50-0x52), trim (CC 0x53).
+  - [ ] Loop section: IN/OUT/SHIFT/RELOOP/HALF/DOUBLE (0x30-0x35).
+  - [ ] Beat jump: 8 directions (0x38-0x3F).
+  - [ ] Pad FX mode: 6 pads (0x40-0x45), FX on/off (0x4A), select/level/beat.
+  - [ ] Master/booth/crossfader (CC 0x20-0x22).
+- [ ] Verify `control_link` events arrive at P4 for each category.
+- [ ] Generate `profile.s3bin` from mapping definition.
+- [ ] Add host unit tests for all MIDI message types.
+- [ ] Adapt UI to show only 6 hot cue pads.
+
+
 ## Deferred libapta P4 integration entry gate
 
 This is a future-phase gate, not part of current RC2 bring-up. The complete plan

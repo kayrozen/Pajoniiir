@@ -33,6 +33,12 @@ accepted hardware baseline.
 - [`CODE_REVIEW_REMEDIATION_20260816.md`](CODE_REVIEW_REMEDIATION_20260816.md) — current master code-review findings, ordered remediation path and release gates.
 - [`migration/ESP_IDF_6_0_2_MIGRATION.md`](migration/ESP_IDF_6_0_2_MIGRATION.md) — ESP-IDF 6.0.2 migration status and validation matrix.
 
+## In-progress integrations
+
+- [`../controllers/pioneer_ddj_400/README.md`](../controllers/pioneer_ddj_400/README.md) — DDJ-400 MIDI-CI parser, mapping research and integration status.
+- [`../controllers/pioneer_ddj_400/MIDI_MAP_RESEARCH.md`](../controllers/pioneer_ddj_400/MIDI_MAP_RESEARCH.md) — complete DDJ-400 MIDI mapping (transport, 6 hot cues, jog, loop, Pad FX, Beat FX).
+- [`../firmware/main-deck-jc1060/BRING_UP_GUIDE.md`](../firmware/main-deck-jc1060/BRING_UP_GUIDE.md) — JC1060P470C 7" display target bring-up guide and phased plan.
+
 ## Analysis and decision records
 
 These explain earlier constraints and choices. Their status headers identify

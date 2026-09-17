@@ -81,6 +81,21 @@ layer. The detailed ownership and data flow are documented in
   MIDI/LED/reconnect and USB-audio qualification remains pending.
 - Signed dual-slot OTA, validation and rollback on both processors.
 
+## Upcoming Targets
+
+The following integrations are **work in progress** (uncommitted):
+
+- **Pioneer DDJ-400**: MIDI-CI parser with full mapping for transport, 6 hot
+  cues (A-F), jog, pitch, EQ/filter, manual loop, beat jump, 13 Pad FX and
+  Beat FX. Differs from the FLX4 in having 6 hot cues instead of 8, no LCD, no
+  Smart CFX and dedicated physical loop buttons. See
+  `controllers/pioneer_ddj_400/`.
+- **Guition JC1060P470C 7" display**: new ESP32-P4 target with JD9165
+  MIPI-DSI 1024x600 panel, GT911 capacitive touch and ES8311 audio codec. BSP
+  and bring-up example are scaffolded; LVGL UI porting and control-link
+  integration are the next phases. See
+  [`firmware/main-deck-jc1060/BRING_UP_GUIDE.md`](firmware/main-deck-jc1060/BRING_UP_GUIDE.md).
+
 Detailed implementation and acceptance status belongs in
 [Project Overview](docs/PROJECT_OVERVIEW.md),
 [Development Plan](docs/DEVELOPMENT_PLAN.md) and
@@ -101,9 +116,14 @@ The Hot Cues tab is implemented but does not yet have an archived screenshot.
 
 ```text
 controllers/                 Compiled and source controller profiles
+  pioneer_ddj_flx4/          DDJ-FLX4 profile (production, hardware-verified)
+  pioneer_ddj_400/           DDJ-400 MIDI-CI parser and mapping research (WIP)
+  hercules_djcontrol_inpulse_500/  Hercules Inpulse 500 profile (host-qualified)
+  generic_midi_ci/           Generic profile path for host testing
 firmware/
   control-board-s3/          ESP32-S3 host/translator/audio-bridge firmware
-  main-deck-p4/              ESP32-P4 playback/audio/UI firmware
+  main-deck-p4/              ESP32-P4 playback/audio/UI firmware (JC4880 4.3")
+  main-deck-jc1060/          ESP32-P4 target for JC1060P470 7" 1024x600 (WIP)
   common/                    Shared firmware components
 docs/                        Product, protocol, validation and design records
 tests/                       PC-side regression tests

@@ -34,6 +34,7 @@ The system is split into two firmware targets:
 - `firmware/control-board-s3`: USB MIDI host and protocol translator, FLX4
   USB-headphone output bridge, runtime diagnostics and S3 OTA service.
 - `firmware/main-deck-p4`: media library, dual deck engine, UI, audio mixer.
+  Runs on the JC4880P443C ESP32-P4 board with a 4.3" ST7701S display.
 
 The S3 stays non-authoritative. It reads raw FLX4 MIDI input, maps it to
 semantic events, forwards those events over UART, mirrors P4 LED feedback back
@@ -44,6 +45,24 @@ playback state.
 The P4 owns all authoritative deck state. It loads Rekordbox media from USB,
 tracks current position, controls audio decode, drives the local display, and
 decides which LEDs should be on.
+
+## Upcoming Targets (Work In Progress)
+
+Two new integrations are scaffolded but not yet committed:
+
+- **Pioneer DDJ-400** (`controllers/pioneer_ddj_400/`): a second controller
+  surface with a complete MIDI-CI parser converting raw MIDI to
+  `control_link` events. Key differences from the FLX4: 6 hot cues (A-F)
+  instead of 8, no on-controller LCD, no Smart CFX, dedicated physical loop
+  buttons, and 13 Pad FX. The MIDI mapping is researched from Mixxx and
+  community sources; physical hardware validation is pending.
+- **Guition JC1060P470C 7" display** (`firmware/main-deck-jc1060/`): a second
+  ESP32-P4 target with a JD9165 MIPI-DSI 1024x600 panel, GT911 capacitive
+  touch and ES8311 audio codec. The BSP is scaffolded with display, touch and
+  audio drivers, plus a bring-up test example. A GPIO12 conflict between I2S
+  LRCK and I2C SDA is resolved with software I2C on GPIO14/15. Phases: Phase 1
+  (hardware bring-up) is scaffolded; Phase 2 (LVGL UI port to 1024x600),
+  Phase 3 (DDJ-400 integration) and Phase 4 (validation) are planned.
 
 ## Inherited Firmware Baseline
 

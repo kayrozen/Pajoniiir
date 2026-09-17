@@ -2901,6 +2901,99 @@ otherwise the waveform comes back blank.
   dismissal;
 - setting survives a reboot.
 
+## Phase 21: JC1060P470C 7" Display Target
+
+Status: **Phase 1 scaffolded; hardware bring-up pending.**
+
+Goal: port the Pajoniiir firmware to the Guition JC1060P470C_I_W_Y board as a
+second ESP32-P4 target with a larger 1024x600 landscape display.
+
+### Phase 1: Hardware Bring-Up (scaffolded)
+
+- BSP `bsp_jc1060p470` created with JD9165 MIPI-DSI driver (1024x600, 51.2 MHz
+  pixel clock, 2 lanes @ 1.0 Gbps), GT911 capacitive touch (I2C 0x5D) and
+  ES8311 audio codec (I2C 0x18, I2S 44100 Hz 16-bit stereo).
+- GPIO12 conflict between I2S LRCK and I2C SDA resolved with software I2C
+  bit-bang on GPIO14 (SDA) / GPIO15 (SCL).
+- Bring-up example `esp_draw_bit` draws colour bars/gradients and logs touch
+  events.
+- UART control-link pins provisioned: GPIO28 (TX) / GPIO29 (RX) at 460800 baud.
+- USB host and SDMMC pins provisioned for music library access.
+- ESP-Hosted ESP32-C6 co-processor pins provisioned (verify from schematic).
+- See `firmware/main-deck-jc1060/BRING_UP_GUIDE.md`.
+
+Exit criteria:
+
+- boot log matches expected sequence (display, touch, audio, backlight);
+- all four visual test patterns render correctly;
+- touch coordinates map to display coordinates;
+- audio codec initialises without noise;
+- no DSI underrun or watchdog reset during the test.
+
+### Phase 2: LVGL UI Porting (planned)
+
+- Copy UI components from `firmware/main-deck-p4/components/ui/` to the
+  `jc1060` target.
+- Adapt all layouts for 1024x600 native landscape (vs current 800x480 portrait
+  rotated). Redimension waveforms, panels and fonts.
+- Remove the PPA rotation logic since the panel is native landscape.
+- Validate DSI-synchronised dual-waveform rendering at the higher resolution.
+
+### Phase 3: DDJ-400 Integration (planned)
+
+- Wire the DDJ-400 MIDI-CI parser into the S3 firmware build.
+- Adapt the UI to hide hot cues G/H (DDJ-400 has only 6 pads A-F).
+- Test control-link transport, jog, loop, Pad FX and Beat FX paths.
+
+### Phase 4: Validation (planned)
+
+- Soak test audio (5+ hours).
+- Thermal enclosure test.
+- USB library validation.
+- Tag `RC1-jc1060p470c`.
+
+## Phase 22: Pioneer DDJ-400 Controller Support
+
+Status: **Parser scaffolded; physical hardware validation pending.**
+
+Goal: support the Pioneer DDJ-400 as an alternative operator surface alongside
+the FLX4.
+
+### Delivered
+
+- `controllers/pioneer_ddj_400/ddj400_midi_ci.c` (440 lines): full MIDI parser
+  converting raw DDJ-400 MIDI to `control_link` events.
+- `controllers/pioneer_ddj_400/MIDI_MAP_RESEARCH.md`: comprehensive mapping
+  covering transport (PLAY/CUE/SYNC/SHIFT/LOAD), 6 hot cues (A-F, notes
+  0x14-0x19), jog wheel (touch 0x28, rotate CC 0x00), pitch fader (CC 0x08),
+  filter (CC 0x56), three-band EQ (CC 0x50-0x52), trim (CC 0x53), manual loop
+  section (notes 0x30-0x35), beat jump (notes 0x38-0x3F), 13 Pad FX (notes
+  0x40-0x45) and Beat FX section (CC 0x5A-0x5C, note 0x4A).
+- `controllers/pioneer_ddj_400/ddj400_midi_ci.h`: public API with
+  `ddj400_init()`, `ddj400_midi_parse()` and `ddj400_get_info()`.
+- VID:PID identified: `0x0853:0x0504` (alternative `0x0505` firmware-update
+  mode).
+
+### Key Differences vs DDJ-FLX4
+
+| Feature | DDJ-400 | DDJ-FLX4 |
+| --- | --- | --- |
+| Hot cues | 6 (A-F) | 8 (A-H) |
+| On-controller LCD | No | Yes |
+| Smart CFX | No | Yes |
+| Pad FX count | 13 | 14 |
+| Loop controls | Dedicated buttons | Touch pads |
+| Jog type | Mechanical + sensor | Platter + ring |
+
+### Remaining Tasks
+
+- Generate `profile.s3bin` from the mapping definition.
+- Add host unit tests for all MIDI message types.
+- Adapt the UI to show only 6 hot cue pads.
+- Validate with physical DDJ-400 hardware.
+- Document Pad FX assignment details.
+
+
 ## Deferred Phase: Native Folder Library And libapta-audio 1.1
 
 Status: **planned for after the upstream libapta-audio `v1.1.0` release; not

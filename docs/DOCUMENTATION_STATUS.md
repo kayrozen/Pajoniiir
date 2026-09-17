@@ -107,6 +107,7 @@ existing Rekordbox/PDB/ANLZ path remain authoritative.
 | Effects | Beat FX Filter/Echo/Flanger/Delay all have recorded hardware acceptance as of 2026-07-24 (Flanger re-tuned; Echo/Delay confirmed as-is). A measured headroom defect in all three - wet added on unity dry peaks at up to 3.34x and hard-clipped inside the effect - was fixed with a soft knee in `RC1-223-gdfa619a9` |
 | OTA | ECDSA P-256 signed `.ddjota`, dual-slot update, rejection, interruption safety and forced rollback hardware-accepted on both targets 2026-07-14; both RC2 applications installed successfully through OTA on 2026-08-02. A P4-only `RC2-51-g050ab43` push on 2026-08-22 reached `ota_0 / valid`, while S3 remained on `RC2-44-g1923a3b`; this did not repeat the negative matrix or full functional smoke. Pull OTA is hardware-proven and software-hardened with newer-only policy, offer expiry, channel hash/size checks, strict relative paths, mDNS and dynamic Host validation. OTA does not replace the bootloader, so the IDF 6 boot chain requires a wired flash per target |
 | Profiles | SD loading, registry matching and S3 transfer are hardware-verified with FLX4; `generic_midi_ci` and the official-specification-derived Hercules Inpulse 500 profile are compile/registry/runtime/LED host-tested, with Hercules P4 Sync Off/autoloop behavior covered; atomic web overwrite/rescan/reactivation and all non-FLX4 physical/audio paths still await hardware acceptance |
+| New targets (WIP) | Two new integrations are scaffolded but uncommitted: (1) Pioneer DDJ-400 controller (`controllers/pioneer_ddj_400/`) — MIDI-CI parser with full mapping, differs from FLX4 in 6 hot cues, no LCD, no Smart CFX, manual loop buttons, 13 Pad FX; parser implemented, `profile.s3bin` and hardware validation pending. (2) Guition JC1060P470C 7" display (`firmware/main-deck-jc1060/`) — ESP32-P4 target with JD9165 MIPI-DSI 1024x600, GT911 touch, ES8311 codec; BSP and bring-up example scaffolded, GPIO12 conflict resolved with software I2C, LVGL UI port and DDJ-400 integration planned |
 
 ## Remaining work
 
@@ -138,7 +139,14 @@ existing Rekordbox/PDB/ANLZ path remain authoritative.
 - hardware-accept web profile overwrite, corrupt/interrupted rejection,
   automatic S3 reactivation and reboot persistence;
 - complete only the still-pending hardware rows identified in the MIDI and
-  validation documents.
+  validation documents;
+- **JC1060P470C 7" target**: hardware-bring-up the `main-deck-jc1060` target
+  (flash `esp_draw_bit`, verify display/touch/audio/boot log), then port LVGL
+  UI to 1024x600 native landscape, then wire DDJ-400 integration and run
+  validation soak;
+- **DDJ-400 controller**: generate `profile.s3bin`, add host unit tests for
+  all MIDI message types, validate with physical hardware, and adapt the UI
+  to show only 6 hot cue pads.
 
 The one-time Deck 1 pad sweep observed for one initial load ordering is tracked
 as a low-priority cosmetic indication. Routing, playback and pad state were
