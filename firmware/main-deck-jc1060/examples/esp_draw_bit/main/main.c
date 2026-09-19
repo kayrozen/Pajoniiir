@@ -27,6 +27,7 @@
 #include "bsp/audio.h"
 #include "bsp/sd.h"
 #include "usb_host_bringup.h"
+#include "eth_bringup.h"
 #include "nvs_flash.h"
 #include "esp_wifi.h"
 
@@ -286,6 +287,9 @@ void app_main(void)
 
     // USB host bring-up (enumeration of devices behind the hub)
     usb_host_bringup_start();
+
+    // Ethernet bring-up (RMII + IP101) - path proven for DJ Link later
+    eth_bringup_start();
 
     // Main test loop
     int test_pattern = 0;

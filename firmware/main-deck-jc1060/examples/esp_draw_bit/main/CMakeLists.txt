@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.c" "usb_host_bringup.c"
+idf_component_register(SRCS "main.c" "usb_host_bringup.c" "eth_bringup.c"
                     INCLUDE_DIRS "."
                     REQUIRES
                         bsp_jc1060p470
@@ -7,4 +7,6 @@ idf_component_register(SRCS "main.c" "usb_host_bringup.c"
                         lvgl
                         nvs_flash
                         esp_wifi
+                        esp_eth
+                        esp_event
 )
