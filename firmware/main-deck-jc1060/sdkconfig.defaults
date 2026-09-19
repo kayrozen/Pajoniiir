@@ -1,52 +1,62 @@
-# SDK Configuration defaults for JC1060P470C target
+# SDK Configuration defaults for JC1060P470C_I_W_Y draw-bit bring-up example
 
 # Target ESP32-P4
 CONFIG_IDF_TARGET="esp32p4"
 
-# Pre-v3 ESP32-P4 silicon support (production board)
+# Production board uses pre-v3 silicon
 CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
 CONFIG_ESP32P4_REV_MIN_100=y
 CONFIG_ESP32P4_REV_MIN_FULL=100
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
 
-# PSRAM configuration (16MB HEX mode)
+# 16MB octal PSRAM in HEX mode (needed for the DPI framebuffer ~1.2 MB)
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MODE_HEX=y
 CONFIG_SPIRAM_SPEED_200M=y
-CONFIG_IDF_EXPERIMENTAL_FEATURES=y
 CONFIG_SPIRAM_SIZE_OVERRIDE=16
 
-# LCD/DPI configuration
-CONFIG_LCD_PANEL_IO_FORMAT_BUF_SIZE=32
-CONFIG_LCD_RGB_EDK_SUPPORT=y
+# Custom partition table: 4MB factory app (Wi-Fi + USB + LVGL stack is big)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 
-# LVGL configuration
-CONFIG_LVGL_VERSION_8=y
-CONFIG_LVGL_COLOR_DEPTH_16=y
-CONFIG_LVGL_MEM_CUSTOM=y
-CONFIG_LVGL_MEM_CUSTOM_ALLOC="heap_caps_malloc"
-CONFIG_LVGL_MEM_CUSTOM_FREE="heap_caps_free"
-CONFIG_LVGL_DISP_DEF_REFR_PERIOD=30
-CONFIG_LVGL_DPI=130
+# Audio codec support (includes ES8311 device in esp_codec_dev)
+CONFIG_CODEC_ES8311_SUPPORT=y
 
-# I2C configuration
-CONFIG_I2C_ENABLE=y
-CONFIG_I2C_ISR_IRAM_SAFE=y
+# USB host: allow hubs (DDJ-400 + USB mass storage behind one powered hub)
+CONFIG_USB_HOST_HUBS_SUPPORTED=y
+# DDJ-400 is a composite audio+MIDI+HID device: its config descriptor
+# exceeds the 256-byte default enum buffer. Raise the control transfer
+# buffer so it enumerates.
+CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1024
 
-# I2S configuration
-CONFIG_I2S_ENABLE=y
-CONFIG_I2S_ISR_IRAM_SAFE=y
+# ESP-Hosted: Wi-Fi/BT via the on-board ESP32-C6 (SDIO slot 1: D0-3=14-17,
+# CLK=18, CMD=19 - same pinout as the P4 Function EV board). C6 reset on
+# GPIO54, CHIP_PU active-high -> reset line asserted when low.
+CONFIG_ESP_HOSTED_CP_TARGET_ESP32C6=y
+CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
+CONFIG_ESP_HOSTED_P4_DEV_BOARD_FUNC_BOARD=y
+CONFIG_ESP_HOSTED_SDIO_RESET_GPIO=54
+CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_LOW=y
+# C6 boots in parallel with the P4 (released from reset at board init) and is
+# ready well before esp_wifi_init - do not re-reset it there, or the 1.5 s
+# card-init window closes before the C6 finishes booting.
+CONFIG_ESP_HOSTED_SLAVE_RESET_ONLY_IF_NECESSARY=y
+CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y
+CONFIG_FREERTOS_HZ=1000
 
-# USB Host configuration
-CONFIG_USB_HOST_ENABLE=y
+# OTA: dual-slot with rollback - new image must prove itself (30 s uptime)
+# before being marked valid, else bootloader falls back to the other slot.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+# LAN bring-up: plain HTTP OTA (production uses signed HTTPS OTA)
+CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y
 
-# SDMMC configuration
-CONFIG_SDMMC_TRANS_SPEED_LIMIT=0
-CONFIG_SDMMC_USING_DMA=y
-
-# Heap tracing for debugging
-CONFIG_HEAP_TRACING=y
-
-# Log levels
+# Log level INFO for bring-up diagnostics
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LOG_DEFAULT_LEVEL=3
+
+# Route the ROM/build console to USB-Serial-JTAG (same connector as flashing)
+# so the bring-up log is visible on the host USB port.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

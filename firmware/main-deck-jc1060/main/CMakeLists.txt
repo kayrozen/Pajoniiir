@@ -1,0 +1,14 @@
+idf_component_register(SRCS "main.c" "usb_host_bringup.c" "eth_bringup.c" "wifi_console.c" "ota_update.c" "midi_host.c"
+                    INCLUDE_DIRS "."
+                    REQUIRES
+                        bsp_jc1060p470
+                        driver
+                        esp_lcd
+                        lvgl
+                        nvs_flash
+                        esp_wifi
+                        esp_eth
+                        esp_event
+                        app_update
+                        esp_https_ota
+)
