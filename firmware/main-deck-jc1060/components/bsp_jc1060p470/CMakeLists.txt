@@ -6,6 +6,7 @@ idf_component_register(
         "src/bsp_display.c"
         "src/bsp_touch.c"
         "src/bsp_audio.c"
+        "src/bsp_sd.c"
     INCLUDE_DIRS
         "include"
         "include/bsp"
@@ -21,6 +22,9 @@ idf_component_register(
         esp_driver_i2c
         esp_driver_ledc
         esp_driver_gpio
+        esp_driver_sdmmc
+        sdmmc
+        fatfs
     PRIV_REQUIRES
         esp_hw_support
 )

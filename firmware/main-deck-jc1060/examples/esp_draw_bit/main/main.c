@@ -24,6 +24,7 @@
 #include "bsp/display.h"
 #include "bsp/touch.h"
 #include "bsp/audio.h"
+#include "bsp/sd.h"
 
 static const char* TAG = "draw_bit";
 
@@ -240,6 +241,21 @@ void app_main(void)
     // Turn on backlight
     bsp_display_backlight_on();
     ESP_LOGI(TAG, "Backlight on");
+
+    // SD card bring-up test (non-fatal if no card inserted)
+    sdmmc_card_t* card = NULL;
+    if (bsp_sd_mount("/sdcard", &card) == ESP_OK) {
+        FILE* f = fopen("/sdcard/bringup.txt", "w");
+        if (f != NULL) {
+            fprintf(f, "JC1060P470C bring-up %s\n", "OK");
+            fclose(f);
+            ESP_LOGI(TAG, "Wrote /sdcard/bringup.txt");
+        } else {
+            ESP_LOGE(TAG, "Failed to write /sdcard/bringup.txt");
+        }
+    } else {
+        ESP_LOGW(TAG, "SD card not available");
+    }
 
     // Main test loop
     int test_pattern = 0;
