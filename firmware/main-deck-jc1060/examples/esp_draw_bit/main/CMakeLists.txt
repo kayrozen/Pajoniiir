@@ -1,6 +1,6 @@
-idf_component_register(SRCS "main.c"
+idf_component_register(SRCS "main.c" "usb_host_bringup.c"
                     INCLUDE_DIRS "."
-                    REQUIRES 
+                    REQUIRES
                         bsp_jc1060p470
                         driver
                         esp_lcd

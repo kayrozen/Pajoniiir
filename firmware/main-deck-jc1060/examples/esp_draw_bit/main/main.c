@@ -25,6 +25,7 @@
 #include "bsp/touch.h"
 #include "bsp/audio.h"
 #include "bsp/sd.h"
+#include "usb_host_bringup.h"
 
 static const char* TAG = "draw_bit";
 
@@ -256,6 +257,9 @@ void app_main(void)
     } else {
         ESP_LOGW(TAG, "SD card not available");
     }
+
+    // USB host bring-up (enumeration of devices behind the hub)
+    usb_host_bringup_start();
 
     // Main test loop
     int test_pattern = 0;

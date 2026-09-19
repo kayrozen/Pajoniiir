@@ -19,6 +19,9 @@ CONFIG_SPIRAM_SIZE_OVERRIDE=16
 # Audio codec support (includes ES8311 device in esp_codec_dev)
 CONFIG_CODEC_ES8311_SUPPORT=y
 
+# USB host: allow hubs (DDJ-400 + USB mass storage behind one powered hub)
+CONFIG_USB_HOST_HUBS_SUPPORTED=y
+
 # Log level INFO for bring-up diagnostics
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LOG_DEFAULT_LEVEL=3
