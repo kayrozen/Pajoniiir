@@ -246,25 +246,10 @@ void app_main(void)
     bsp_display_backlight_on();
     ESP_LOGI(TAG, "Backlight on");
 
-    // SD card bring-up test (non-fatal if no card inserted)
-    sdmmc_card_t* card = NULL;
-    if (bsp_sd_mount("/sdcard", &card) == ESP_OK) {
-        FILE* f = fopen("/sdcard/bringup.txt", "w");
-        if (f != NULL) {
-            fprintf(f, "JC1060P470C bring-up %s\n", "OK");
-            fclose(f);
-            ESP_LOGI(TAG, "Wrote /sdcard/bringup.txt");
-        } else {
-            ESP_LOGE(TAG, "Failed to write /sdcard/bringup.txt");
-        }
-    } else {
-        ESP_LOGW(TAG, "SD card not available");
-    }
-
-    // USB host bring-up (enumeration of devices behind the hub)
-    usb_host_bringup_start();
-
-    // Wi-Fi bring-up via ESP32-C6 co-processor (ESP-Hosted, SDIO)
+    // Wi-Fi bring-up via ESP32-C6 co-processor (ESP-Hosted, SDIO).
+    // MUST run before the SD card mount: ESP-Hosted claims the (single)
+    // SDMMC host controller here, and the SD card (slot 0) then mounts on
+    // top of it - see bsp_sd.c coexistence workaround.
     esp_err_t nvs_ret = nvs_flash_init();
     if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -283,6 +268,24 @@ void app_main(void)
             ESP_LOGE(TAG, "esp_wifi_init failed: %s", esp_err_to_name(wifi_ret));
         }
     }
+
+    // SD card bring-up test (non-fatal if no card inserted)
+    sdmmc_card_t* card = NULL;
+    if (bsp_sd_mount("/sdcard", &card) == ESP_OK) {
+        FILE* f = fopen("/sdcard/bringup.txt", "w");
+        if (f != NULL) {
+            fprintf(f, "JC1060P470C bring-up %s\n", "OK");
+            fclose(f);
+            ESP_LOGI(TAG, "Wrote /sdcard/bringup.txt");
+        } else {
+            ESP_LOGE(TAG, "Failed to write /sdcard/bringup.txt");
+        }
+    } else {
+        ESP_LOGW(TAG, "SD card not available");
+    }
+
+    // USB host bring-up (enumeration of devices behind the hub)
+    usb_host_bringup_start();
 
     // Main test loop
     int test_pattern = 0;

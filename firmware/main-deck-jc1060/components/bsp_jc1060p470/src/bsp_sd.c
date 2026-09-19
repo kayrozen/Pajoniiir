@@ -11,16 +11,34 @@
 #include "bsp/sd.h"
 #include "esp_log.h"
 #include "esp_check.h"
+#include "esp_idf_version.h"
 #include "driver/sdmmc_host.h"
 #include "sd_pwr_ctrl_by_on_chip_ldo.h"
 #include "ff.h"
 #include "esp_vfs_fat.h"
+
+/*
+ * Coexistence workaround (esp_hosted example `host_sdcard_with_hosted`):
+ * with ESP-Hosted on SDIO (IDF >= 6.0), the SDMMC host controller is already
+ * initialised by ESP-Hosted - the SD card code must not init/deinit it again.
+ */
+#if CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE && (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0))
+#define WORKAROUND_HOSTED_DOES_SDMMC_HOST_INIT 1
+#else
+#define WORKAROUND_HOSTED_DOES_SDMMC_HOST_INIT 0
+#endif
 
 static const char* TAG = "bsp_sd";
 
 static sdmmc_card_t s_card;
 static sd_pwr_ctrl_handle_t s_ldo_handle = NULL;
 static bool s_mounted = false;
+
+#if WORKAROUND_HOSTED_DOES_SDMMC_HOST_INIT
+/* The SDMMC host controller is already managed by ESP-Hosted. */
+static esp_err_t sdmmc_host_init_dummy(void) { return ESP_OK; }
+static esp_err_t sdmmc_host_deinit_dummy(void) { return ESP_OK; }
+#endif
 
 esp_err_t bsp_sd_mount(const char* mount_point, sdmmc_card_t** out_card)
 {
@@ -40,6 +58,14 @@ esp_err_t bsp_sd_mount(const char* mount_point, sdmmc_card_t** out_card)
     host.slot = BSP_SDMMC_SLOT;
     host.max_freq_khz = SDMMC_FREQ_HIGHSPEED; /* driver falls back if unsupported */
     host.pwr_ctrl_handle = s_ldo_handle;      /* IDF6: power control lives on the host */
+
+#if WORKAROUND_HOSTED_DOES_SDMMC_HOST_INIT
+    /* ESP-Hosted (SDIO slot 1) has already initialised the SDMMC host
+     * controller - skip its init/deinit here (see esp_hosted example
+     * `host_sdcard_with_hosted`). */
+    host.init = &sdmmc_host_init_dummy;
+    host.deinit = &sdmmc_host_deinit_dummy;
+#endif
 
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
     slot_config.clk = BSP_SDMMC_CLK_GPIO;
