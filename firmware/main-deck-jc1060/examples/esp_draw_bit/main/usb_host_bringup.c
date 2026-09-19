@@ -166,14 +166,18 @@ static void enum_task(void* arg)
     }
 
     uint8_t dev_addr;
-    while (s_new_dev_queue && xQueueReceive(s_new_dev_queue, &dev_addr, portMAX_DELAY) == pdTRUE) {
-        usb_device_handle_t dev_hdl = NULL;
-        if (usb_host_device_open(s_client, dev_addr, &dev_hdl) != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to open device %u", dev_addr);
-            continue;
+    while (1) {
+        /* Pump client events (runs client_event_cb) then drain the queue. */
+        usb_host_client_handle_events(s_client, pdMS_TO_TICKS(50));
+        while (xQueueReceive(s_new_dev_queue, &dev_addr, 0) == pdTRUE) {
+            usb_device_handle_t dev_hdl = NULL;
+            if (usb_host_device_open(s_client, dev_addr, &dev_hdl) != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to open device %u", dev_addr);
+                continue;
+            }
+            classify_device(dev_addr, dev_hdl);
+            usb_host_device_close(s_client, dev_hdl);
         }
-        classify_device(dev_addr, dev_hdl);
-        usb_host_device_close(s_client, dev_hdl);
     }
     vTaskDelete(NULL);
 }
