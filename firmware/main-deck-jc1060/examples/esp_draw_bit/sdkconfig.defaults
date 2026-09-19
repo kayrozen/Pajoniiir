@@ -47,9 +47,15 @@ CONFIG_ESP_HOSTED_SLAVE_RESET_ONLY_IF_NECESSARY=y
 CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y
 CONFIG_FREERTOS_HZ=1000
 
-# Log level DEBUG for bring-up diagnostics (USB enumeration detail)
-CONFIG_LOG_DEFAULT_LEVEL_DEBUG=y
-CONFIG_LOG_DEFAULT_LEVEL=4
+# OTA: dual-slot with rollback - new image must prove itself (30 s uptime)
+# before being marked valid, else bootloader falls back to the other slot.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+# LAN bring-up: plain HTTP OTA (production uses signed HTTPS OTA)
+CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y
+
+# Log level INFO for bring-up diagnostics
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_DEFAULT_LEVEL=3
 
 # Route the ROM/build console to USB-Serial-JTAG (same connector as flashing)
 # so the bring-up log is visible on the host USB port.

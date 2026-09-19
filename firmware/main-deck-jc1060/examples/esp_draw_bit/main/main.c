@@ -29,6 +29,7 @@
 #include "usb_host_bringup.h"
 #include "eth_bringup.h"
 #include "wifi_console.h"
+#include "ota_update.h"
 #include "nvs_flash.h"
 #include "esp_wifi.h"
 
@@ -264,6 +265,7 @@ void app_main(void)
     if (!wifi_console_start()) {
         ESP_LOGW(TAG, "Wi-Fi console not available");
     }
+    ota_update_start();
 
     // SD card bring-up test (non-fatal if no card inserted)
     sdmmc_card_t* card = NULL;

@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.c" "usb_host_bringup.c" "eth_bringup.c" "wifi_console.c"
+idf_component_register(SRCS "main.c" "usb_host_bringup.c" "eth_bringup.c" "wifi_console.c" "ota_update.c"
                     INCLUDE_DIRS "."
                     REQUIRES
                         bsp_jc1060p470
@@ -9,4 +9,6 @@ idf_component_register(SRCS "main.c" "usb_host_bringup.c" "eth_bringup.c" "wifi_
                         esp_wifi
                         esp_eth
                         esp_event
+                        app_update
+                        esp_https_ota
 )

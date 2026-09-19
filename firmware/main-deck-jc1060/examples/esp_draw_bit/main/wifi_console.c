@@ -21,6 +21,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "ota_update.h"
 #include <stdlib.h>
 
 #define WIFI_SSID        "kayrozen"
@@ -112,7 +113,14 @@ static void console_server_task(void* arg)
             }
             s_client_sock = sock;
             xSemaphoreGive(s_sock_mutex);
-            ESP_LOGI(TAG, "Console client connected");
+            char ip[16];
+            snprintf(ip, sizeof(ip), "%u.%u.%u.%u",
+                     (unsigned)(ntohl(client.sin_addr.s_addr) >> 24) & 0xFF,
+                     (unsigned)(ntohl(client.sin_addr.s_addr) >> 16) & 0xFF,
+                     (unsigned)(ntohl(client.sin_addr.s_addr) >> 8) & 0xFF,
+                     (unsigned)(ntohl(client.sin_addr.s_addr) >> 0) & 0xFF);
+            ESP_LOGI(TAG, "Console client connected from %s", ip);
+            ota_update_set_host(ip);
         }
     }
 }
@@ -125,7 +133,10 @@ static void wifi_event_cb(void* arg, esp_event_base_t base,
                           int32_t id, void* data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "Wi-Fi disconnected, retrying...");
+        wifi_event_sta_disconnected_t* evt = (wifi_event_sta_disconnected_t*)data;
+        ESP_LOGW(TAG, "Wi-Fi disconnected, reason=%d, retrying in 3 s...",
+                 evt->reason);
+        vTaskDelay(pdMS_TO_TICKS(3000));
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* evt = (ip_event_got_ip_t*)data;
@@ -195,6 +206,12 @@ bool wifi_console_start(void)
         } else {
             ESP_LOGE(TAG, "esp_wifi_scan_start failed (RPC vers C6 ?)");
         }
+    }
+
+    /* Association: without this the STA starts but never associates. */
+    esp_err_t conn_ret = esp_wifi_connect();
+    if (conn_ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(conn_ret));
     }
 
     /* Wait for IP (up to 60 s - first association can be slow). */
