@@ -162,7 +162,7 @@ static esp_err_t bsp_lcd_panel_init(esp_lcd_dsi_bus_handle_t dsi_bus,
         .dpi_clk_src = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
         .dpi_clock_freq_mhz = BSP_LCD_PIXEL_CLOCK_HZ / 1000000.0f,
         .virtual_channel = 0,
-        .in_color_format = LCD_COLOR_FMT_RGB565,
+        .in_color_format = LCD_COLOR_FMT_RGB888,  // Factory demo: PIXEL_RGB888 / COLOR_FORMAT_RGB888
         .num_fbs = BSP_LCD_FRAMEBUFFER_COUNT,
         .video_timing = {
             .h_size = BSP_LCD_H_RES,

@@ -391,3 +391,9 @@ En cas de problème bloquant :
   - Crash `sdio_mempool_create` réglé par `ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y`
     (GDMA du P4 accède à la PSRAM) + `CONFIG_FREERTOS_HZ=1000`.
   - Partition table custom 4 Mo app requise avec le stack Wi-Fi (16 Mo flash).
+- Couleurs JD9165 : **résolues** — le panneau fonctionne en **RGB888 (24 bits)**, pas RGB565
+  (config factory `PIXEL_RGB888` / `COLOR_FORMAT_RGB888`, dépôt `deeploop/JC1060P470C_I_W_Y`).
+  Symptôme en 16 bits : couleurs pastel mélangées (désalignement 2 vs 3 octets/pixel).
+  Toute la chaîne passée en RGB888 (DPI + framebuffer 1,8 Mo + patterns). Ne PAS réintroduire
+  le COLMOD 0x3A=0x55 (forcé 16bpp, vient d'une autre variante de panneau).
+  Pour LVGL : utiliser LV_COLOR_FORMAT_RGB888.

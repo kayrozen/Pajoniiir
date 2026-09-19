@@ -12,6 +12,7 @@
  */
 
 #include <stdio.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
@@ -31,35 +32,35 @@
 
 static const char* TAG = "draw_bit";
 
-#define COLOR_RED       0xF800
-#define COLOR_GREEN     0x07E0
-#define COLOR_BLUE      0x001F
-#define COLOR_WHITE     0xFFFF
-#define COLOR_BLACK     0x0000
-#define COLOR_YELLOW    0xFFE0
-#define COLOR_CYAN      0x07FF
-#define COLOR_MAGENTA   0xF81F
+/* RGB888 (24-bit) colors - the JD9165 factory config uses PIXEL_RGB888 */
+#define COLOR_RED       0xFF0000U
+#define COLOR_GREEN     0x00FF00U
+#define COLOR_BLUE      0x0000FFU
+#define COLOR_WHITE     0xFFFFFFU
+#define COLOR_BLACK     0x000000U
+#define COLOR_YELLOW    0xFFFF00U
+#define COLOR_CYAN      0x00FFFFU
+#define COLOR_MAGENTA   0xFF00FFU
 
 static esp_lcd_panel_handle_t g_panel = NULL;
-/**
- * @brief Fill rectangle with color
- */
+
 static void fill_rect(esp_lcd_panel_handle_t panel,
                       int x, int y, int w, int h,
-                      uint16_t color)
+                      uint32_t color)
 {
-    // Row-by-row fill with a single line buffer: a full-frame DMA allocation
-    // (1024*600*2 = 1.2 MB) cannot come from the DMA-capable heap.
-    size_t line_pixels = (size_t)w;
-    uint16_t* color_line = heap_caps_malloc(line_pixels * sizeof(uint16_t),
-                                             MALLOC_CAP_DMA);
+    // Row-by-row fill with a single line buffer (RGB888: 3 bytes per pixel).
+    size_t line_bytes = (size_t)w * 3;
+    uint8_t* color_line = heap_caps_malloc(line_bytes, MALLOC_CAP_DMA);
     if (color_line == NULL) {
         ESP_LOGE(TAG, "Failed to allocate fill line buffer");
         return;
     }
 
-    for (size_t i = 0; i < line_pixels; i++) {
-        color_line[i] = color;
+    color_line[0] = (uint8_t)((color >> 16) & 0xFF);  /* R */
+    color_line[1] = (uint8_t)((color >> 8) & 0xFF);   /* G */
+    color_line[2] = (uint8_t)(color & 0xFF);          /* B */
+    for (size_t i = 1; i < (size_t)w; i++) {
+        memcpy(&color_line[i * 3], color_line, 3);
     }
     for (int yy = y; yy < y + h; yy++) {
         esp_lcd_panel_draw_bitmap(panel, x, yy, x + w, yy + 1, color_line);
@@ -80,7 +81,7 @@ static void draw_color_bars(esp_lcd_panel_handle_t panel)
     ESP_LOGI(TAG, "Drawing color bars: %dx%d", h_res, v_res);
 
     // Draw 8 color bars
-    uint16_t colors[] = {
+    uint32_t colors[] = {
         COLOR_BLACK,   // 0
         COLOR_BLUE,    // 1
         COLOR_GREEN,   // 2
@@ -110,8 +111,8 @@ static void draw_gradient(esp_lcd_panel_handle_t panel, bool horizontal)
 
     ESP_LOGI(TAG, "Drawing %s gradient", horizontal ? "horizontal" : "vertical");
 
-    size_t line_pixels = (size_t)h_res;
-    uint16_t* line = heap_caps_malloc(line_pixels * sizeof(uint16_t), MALLOC_CAP_DMA);
+    size_t line_bytes = (size_t)h_res * 3;
+    uint8_t* line = heap_caps_malloc(line_bytes, MALLOC_CAP_DMA);
     if (line == NULL) {
         ESP_LOGE(TAG, "Failed to allocate gradient line buffer");
         return;
@@ -122,18 +123,18 @@ static void draw_gradient(esp_lcd_panel_handle_t panel, bool horizontal)
             uint8_t r, g, b;
             if (horizontal) {
                 // Horizontal gradient: left to right per row.
-                r = (uint8_t)((x * 31) / h_res);
-                g = (uint8_t)(((x & 0xFF) * 63) / 255);
-                b = (uint8_t)(((x % 32) * 31) / 32);
+                r = (uint8_t)((x * 255) / h_res);
+                g = (uint8_t)((x * 127) / h_res);
+                b = (uint8_t)(255 - (x * 255) / h_res);
             } else {
                 // Vertical gradient: top to bottom, each row uniform.
-                r = (uint8_t)((y * 31) / v_res);
-                g = (uint8_t)(((y & 0xFF) * 63) / 255);
-                b = (uint8_t)(((y % 32) * 31) / 32);
+                r = (uint8_t)((y * 255) / v_res);
+                g = (uint8_t)((y * 127) / v_res);
+                b = (uint8_t)(255 - (y * 255) / v_res);
             }
-            line[x] = (uint16_t)(((uint16_t)(r & 0x1F) << 11) |
-                                 ((uint16_t)(g & 0x3F) << 5) |
-                                 (b & 0x1F));
+            line[x * 3 + 0] = r;
+            line[x * 3 + 1] = g;
+            line[x * 3 + 2] = b;
         }
         esp_lcd_panel_draw_bitmap(panel, 0, y, h_res, y + 1, line);
         // Keep CPU0 alive so the task watchdog does not fire during long fills.
@@ -160,7 +161,7 @@ static void touch_monitor_task(void* pvParameters)
             ESP_LOGI(TAG, "Touch: (%d, %d) strength=%d", x, y, strength);
             
             // Draw circle at touch position
-            uint16_t white = COLOR_WHITE;
+            const uint8_t white[3] = {0xFF, 0xFF, 0xFF};
             int radius = 20;
             for (int dy = -radius; dy <= radius; dy++) {
                 for (int dx = -radius; dx <= radius; dx++) {
@@ -170,7 +171,7 @@ static void touch_monitor_task(void* pvParameters)
                         if (px >= 0 && px < BSP_LCD_H_RES && 
                             py >= 0 && py < BSP_LCD_V_RES) {
                             esp_lcd_panel_draw_bitmap(g_panel, px, py, 
-                                                       px + 1, py + 1, &white);
+                                                       px + 1, py + 1, white);
                         }
                     }
                 }
@@ -194,7 +195,7 @@ void app_main(void)
     bsp_display_cfg_t disp_cfg = {
         .h_res = BSP_LCD_H_RES,
         .v_res = BSP_LCD_V_RES,
-        .bits_per_pixel = 16,
+        .bits_per_pixel = 24,
         .double_buffer = false,
         .buffer_size = BSP_LCD_H_RES * 50,
         .flags = {
