@@ -378,6 +378,12 @@ En cas de problème bloquant :
   répond jamais). Config production : DDJ en direct sur un USB-C, stockage sur microSD
   (ou clé sur l'autre port). Un hub FS-only ou le support TT d'IDF débloquera le hub.
   Host stack IDF 6.0.2 = composant managé `espressif/usb`, hubs via `CONFIG_USB_HOST_HUBS_SUPPORTED`.
+  ❌ **Port FS = jamais hôte USB** : la pile host ne pilote que le DWC2.0 (UTMI/HS) ;
+  le mapping PHY↔contrôleur est fixe (DWC2.0↔UTMI, DWC1.1↔FSLS) et le DWC1.1 n'est
+  pas supporté par la pile host en IDF 6.0.2 / esp-usb 1.5.0. Le port FS ne peut donc
+  pas héberger hub/clé/DDJ, même avec la console déplacée sur Wi-Fi. Layout final :
+  DDJ direct sur port HS, microSD pour le stockage, console Wi-Fi (telnet port 2333).
+  À surveiller : support DWC1.1 host / TT / dual-host dans les futures versions esp-usb.
 - ESP-Hosted / C6 (🔶 en cours) :
   - Composants : `espressif/esp_hosted` + `espressif/esp_wifi_remote`, transport SDIO
     (pin map = P4 Function EV board : CMD=19, CLK=18, D0-D3=14-17), reset GPIO54.
