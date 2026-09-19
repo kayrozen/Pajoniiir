@@ -351,4 +351,13 @@ En cas de problème bloquant :
 
 ---
 
-**Statut Phase 1** : 🔶 **Logiciel prêt** - Build ESP-IDF 6.0.2 validé (example `esp_draw_bit`), en attente du flash et de la validation physique (patterns, tactile, audio).
+**Statut Phase 1** : ✅ **Bring-up matériel validé** (2026-09-19, bench physique)
+
+- Écran JD9165 : OK — MIPI-DSI 2 lanes @ 1000 Mbps, 1024x600 @ 59 Hz, patterns en boucle sans WDT.
+  Root cause du WDT initial : rail analogique du PHY DSI = LDO interne VO3 (canal 3, 2.5 V) non acquis.
+- Touch GT911 : OK — bus I2C partagé SDA=GPIO7/SCL=GPIO8, 821 events sur toute la surface (0-1023 / 0-599).
+- Audio ES8311 : OK — bip test 440 Hz audible via NS4150 (PA-CTRL=GPIO11). Adresse esp_codec_dev en forme 8 bits (0x30).
+- I2S : BCLK=12, WS=10, MCLK=13 (requis par l'ES8311), DOUT=9, DIN=48.
+- Pattern 3 : OK (fill ligne par ligne, plus d'allocation DMA 1,2 Mo).
+- Pin map de référence : repo `p1ngb4ck/unofficial_guition_esp32p4_repo`, `JC1060P470_I_W_Y/esphome_yaml_example/`.
+- ⚠️ Pas encore validés : SDMMC, ESP32-C6/ESP-Hosted (SDIO 14-19), UART control link, USB host (pins DM/DP du BSP à revoir — 19 est la CMD SDIO du C6).
