@@ -27,6 +27,10 @@ CONFIG_CODEC_ES8311_SUPPORT=y
 
 # USB host: allow hubs (DDJ-400 + USB mass storage behind one powered hub)
 CONFIG_USB_HOST_HUBS_SUPPORTED=y
+# DDJ-400 is a composite audio+MIDI+HID device: its config descriptor
+# exceeds the 256-byte default enum buffer. Raise the control transfer
+# buffer so it enumerates.
+CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1024
 
 # ESP-Hosted: Wi-Fi/BT via the on-board ESP32-C6 (SDIO slot 1: D0-3=14-17,
 # CLK=18, CMD=19 - same pinout as the P4 Function EV board). C6 reset on
@@ -43,9 +47,9 @@ CONFIG_ESP_HOSTED_SLAVE_RESET_ONLY_IF_NECESSARY=y
 CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y
 CONFIG_FREERTOS_HZ=1000
 
-# Log level INFO for bring-up diagnostics
-CONFIG_LOG_DEFAULT_LEVEL_INFO=y
-CONFIG_LOG_DEFAULT_LEVEL=3
+# Log level DEBUG for bring-up diagnostics (USB enumeration detail)
+CONFIG_LOG_DEFAULT_LEVEL_DEBUG=y
+CONFIG_LOG_DEFAULT_LEVEL=4
 
 # Route the ROM/build console to USB-Serial-JTAG (same connector as flashing)
 # so the bring-up log is visible on the host USB port.
