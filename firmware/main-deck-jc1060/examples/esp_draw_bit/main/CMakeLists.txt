@@ -5,4 +5,6 @@ idf_component_register(SRCS "main.c" "usb_host_bringup.c"
                         driver
                         esp_lcd
                         lvgl
+                        nvs_flash
+                        esp_wifi
 )

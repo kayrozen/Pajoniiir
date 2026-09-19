@@ -26,6 +26,8 @@
 #include "bsp/audio.h"
 #include "bsp/sd.h"
 #include "usb_host_bringup.h"
+#include "nvs_flash.h"
+#include "esp_wifi.h"
 
 static const char* TAG = "draw_bit";
 
@@ -260,6 +262,26 @@ void app_main(void)
 
     // USB host bring-up (enumeration of devices behind the hub)
     usb_host_bringup_start();
+
+    // Wi-Fi bring-up via ESP32-C6 co-processor (ESP-Hosted, SDIO)
+    esp_err_t nvs_ret = nvs_flash_init();
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_ret = nvs_flash_init();
+    }
+    if (nvs_ret != ESP_OK) {
+        ESP_LOGE(TAG, "NVS init failed: %s", esp_err_to_name(nvs_ret));
+    } else {
+        wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
+        esp_err_t wifi_ret = esp_wifi_init(&wifi_cfg);
+        if (wifi_ret == ESP_OK) {
+            ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+            ESP_ERROR_CHECK(esp_wifi_start());
+            ESP_LOGI(TAG, "Wi-Fi started (via C6 co-processor)");
+        } else {
+            ESP_LOGE(TAG, "esp_wifi_init failed: %s", esp_err_to_name(wifi_ret));
+        }
+    }
 
     // Main test loop
     int test_pattern = 0;

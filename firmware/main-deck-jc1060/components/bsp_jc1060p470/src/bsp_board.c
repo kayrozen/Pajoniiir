@@ -112,9 +112,9 @@ esp_err_t bsp_board_init(void)
             .intr_type = GPIO_INTR_DISABLE,
         };
         ESP_ERROR_CHECK(gpio_config(&rst_config));
-        // Keep C6 in reset initially
-        gpio_set_level(BSP_ESP_HOSTED_RST_GPIO, 0);
-        ESP_LOGI(TAG, "ESP32-C6 held in reset (GPIO%d)", BSP_ESP_HOSTED_RST_GPIO);
+        // Release C6 from reset (temporarily, to test C6 USB enumeration)
+        gpio_set_level(BSP_ESP_HOSTED_RST_GPIO, 1);
+        ESP_LOGI(TAG, "ESP32-C6 released from reset (GPIO%d)", BSP_ESP_HOSTED_RST_GPIO);
     }
 #endif
 
