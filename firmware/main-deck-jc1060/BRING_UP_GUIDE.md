@@ -125,6 +125,43 @@ idf.py -p /dev/ttyACM0 flash monitor
 idf.py -p COM15 flash monitor
 ```
 
+### 4. Flash / monitor via Docker (carte unique, sans IDF natif installé)
+
+Cette variante est utilisée lorsque l'hôte n'a pas d'ESP-IDF natif et que la
+carte est la seule pouvant exposer la console. Tout se passe dans le conteneur
+`espressif/idf:v6.0.2`.
+
+Flash :
+
+```bash
+cd firmware/main-deck-jc1060/examples/esp_draw_bit
+docker run --rm --user root --group-add dialout -e HOME=/tmp \
+  --device=/dev/ttyACM0 \
+  -v "$(git rev-parse --show-toplevel):/host" \
+  -w /host/firmware/main-deck-jc1060/examples/esp_draw_bit \
+  espressif/idf:v6.0.2 bash -lc \
+  'source /opt/esp/idf/export.sh >/dev/null && idf.py -p /dev/ttyACM0 flash'
+```
+
+Monitoring (rebondit le log de boot en direct) :
+
+```bash
+docker run --rm --user root --group-add dialout -e HOME=/tmp \
+  --device=/dev/ttyACM0 \
+  -v "$(git rev-parse --show-toplevel):/host" \
+  -w /host/firmware/main-deck-jc1060/examples/esp_draw_bit \
+  espressif/idf:v6.0.2 bash -lc \
+  'source /opt/esp/idf/export.sh >/dev/null && idf.py -p /dev/ttyACM0 monitor'
+```
+
+Pour sortir du monitor, taper `ctrl+]`. En scriptshell non-interactif, encadrer
+avec `timeout N` pour borner la capture.
+
+> Le conteneur est lancé en `root` uniquement pour accéder au device USB
+> (`/dev/ttyACM0` appartient à `root:dialout`). Utiliser
+> `--group-add dialout` seul ne suffit pas toujours selon la version de docker ;
+> `--device=/dev/ttyACM0` expose le nœud hôte tel quel.
+
 ---
 
 ## ✅ Checklist de validation

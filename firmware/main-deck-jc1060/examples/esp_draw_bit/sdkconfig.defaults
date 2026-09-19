@@ -22,3 +22,7 @@ CONFIG_CODEC_ES8311_SUPPORT=y
 # Log level INFO for bring-up diagnostics
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LOG_DEFAULT_LEVEL=3
+
+# Route the ROM/build console to USB-Serial-JTAG (same connector as flashing)
+# so the bring-up log is visible on the host USB port.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

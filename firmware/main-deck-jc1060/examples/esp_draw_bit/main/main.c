@@ -92,7 +92,11 @@ static void draw_color_bars(esp_lcd_panel_handle_t panel)
 }
 
 /**
- * @brief Draw gradient test
+ * @brief Draw gradient test, row-by-row (fast, keeps CPU0 responsive)
+ *
+ * Both variants draw full-screen line strips with a bounded number of
+ * draw_bitmap calls (<= 600), avoiding thousands of 1-pixel transfers and
+ * giving main() regular yields so the task watchdog is never starved.
  */
 static void draw_gradient(esp_lcd_panel_handle_t panel, bool horizontal)
 {
@@ -101,26 +105,39 @@ static void draw_gradient(esp_lcd_panel_handle_t panel, bool horizontal)
 
     ESP_LOGI(TAG, "Drawing %s gradient", horizontal ? "horizontal" : "vertical");
 
+    size_t line_pixels = (size_t)h_res;
+    uint16_t* line = heap_caps_malloc(line_pixels * sizeof(uint16_t), MALLOC_CAP_DMA);
+    if (line == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate gradient line buffer");
+        return;
+    }
+
     for (int y = 0; y < v_res; y++) {
         for (int x = 0; x < h_res; x++) {
-            uint16_t color;
+            uint8_t r, g, b;
             if (horizontal) {
-                // Horizontal gradient: left to right
-                uint8_t r = (x * 31) / h_res;
-                uint8_t g = ((x % 256) * 63) / 256;
-                uint8_t b = ((x % 32) * 31) / 32;
-                color = ((r & 0x1F) << 11) | ((g & 0x3F) << 5) | (b & 0x1F);
+                // Horizontal gradient: left to right per row.
+                r = (uint8_t)((x * 31) / h_res);
+                g = (uint8_t)(((x & 0xFF) * 63) / 255);
+                b = (uint8_t)(((x % 32) * 31) / 32);
             } else {
-                // Vertical gradient: top to bottom
-                uint8_t r = (y * 31) / v_res;
-                uint8_t g = ((y % 256) * 63) / 256;
-                uint8_t b = ((y % 32) * 31) / 32;
-                color = ((r & 0x1F) << 11) | ((g & 0x3F) << 5) | (b & 0x1F);
+                // Vertical gradient: top to bottom, each row uniform.
+                r = (uint8_t)((y * 31) / v_res);
+                g = (uint8_t)(((y & 0xFF) * 63) / 255);
+                b = (uint8_t)(((y % 32) * 31) / 32);
             }
-
-            esp_lcd_panel_draw_bitmap(panel, x, y, x + 1, y + 1, &color);
+            line[x] = (uint16_t)(((uint16_t)(r & 0x1F) << 11) |
+                                 ((uint16_t)(g & 0x3F) << 5) |
+                                 (b & 0x1F));
+        }
+        esp_lcd_panel_draw_bitmap(panel, 0, y, h_res, y + 1, line);
+        // Keep CPU0 alive so the task watchdog does not fire during long fills.
+        if ((y & 0x3F) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
     }
+
+    heap_caps_free(line);
 }
 
 /**

@@ -57,6 +57,21 @@ Or on Windows:
 idf.py -p COM15 flash monitor
 ```
 
+No native IDF on the host? Everything happens in the official container:
+
+```bash
+docker run --rm --user root --group-add dialout -e HOME=/tmp \
+  --device=/dev/ttyACM0 \
+  -v "$(git rev-parse --show-toplevel):/host" \
+  -w /host/firmware/main-deck-jc1060/examples/esp_draw_bit \
+  espressif/idf:v6.0.2 bash -lc \
+  'source /opt/esp/idf/export.sh >/dev/null && idf.py -p /dev/ttyACM0 flash monitor'
+```
+
+(`root` + `--group-add dialout` is only needed to reach the host USB node
+owned by `root:dialout`; `--device=/dev/ttyACM0` exposes it. Exit the monitor
+with `ctrl+]`.)
+
 ## Expected Output
 
 1. **Boot log** should show:

@@ -35,7 +35,7 @@ extern "C" {
 
 /** @brief MIPI-DSI configuration */
 #define BSP_LCD_MIPI_DSI_LANE_NUM        (2)           // 2 data lanes
-#define BSP_LCD_MIPI_DSI_LANE_BITRATE_MBPS (1000)      // 1.0 Gbps per lane
+#define BSP_LCD_MIPI_DSI_LANE_BITRATE_MBPS (1000)      // 1.0 Gbps per lane (proven value for this panel)
 #define BSP_LCD_PIXEL_CLOCK_HZ           (51200000)    // 51.2 MHz
 
 /** @brief Display timing parameters (from JD9165 datasheet) */
