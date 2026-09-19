@@ -40,25 +40,26 @@ static esp_lcd_panel_handle_t g_panel = NULL;
 /**
  * @brief Fill rectangle with color
  */
-static void fill_rect(esp_lcd_panel_handle_t panel, 
-                      int x, int y, int w, int h, 
+static void fill_rect(esp_lcd_panel_handle_t panel,
+                      int x, int y, int w, int h,
                       uint16_t color)
 {
-    size_t pixel_count = w * h;
-    uint16_t* color_line = heap_caps_malloc(pixel_count * sizeof(uint16_t), 
+    // Row-by-row fill with a single line buffer: a full-frame DMA allocation
+    // (1024*600*2 = 1.2 MB) cannot come from the DMA-capable heap.
+    size_t line_pixels = (size_t)w;
+    uint16_t* color_line = heap_caps_malloc(line_pixels * sizeof(uint16_t),
                                              MALLOC_CAP_DMA);
     if (color_line == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate buffer");
+        ESP_LOGE(TAG, "Failed to allocate fill line buffer");
         return;
     }
 
-    // Fill buffer with color
-    for (size_t i = 0; i < pixel_count; i++) {
+    for (size_t i = 0; i < line_pixels; i++) {
         color_line[i] = color;
     }
-
-    // Draw to display
-    esp_lcd_panel_draw_bitmap(panel, x, y, x + w, y + h, color_line);
+    for (int yy = y; yy < y + h; yy++) {
+        esp_lcd_panel_draw_bitmap(panel, x, yy, x + w, yy + 1, color_line);
+    }
 
     heap_caps_free(color_line);
 }
