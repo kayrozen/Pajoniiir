@@ -63,7 +63,8 @@ esp_err_t bsp_touch_new(const bsp_touch_config_t* config,
         return ret;
     }
 
-    // Create GT911 touch panel
+    // Create GT911 touch panel (RST/INT are not wired to software GPIOs on
+    // this board - the driver runs with GPIO_NUM_NC for both).
     esp_lcd_touch_handle_t tp = NULL;
     ret = esp_lcd_touch_new_i2c_gt911(tp_io_handle, &tp_config, &tp);
     if (ret != ESP_OK) {
@@ -75,16 +76,6 @@ esp_err_t bsp_touch_new(const bsp_touch_config_t* config,
     ESP_LOGI(TAG, "GT911 touch initialized: %dx%d, swap=%d, mirror_x=%d, mirror_y=%d",
              config->x_max, config->y_max,
              config->swap_xy, config->mirror_x, config->mirror_y);
-
-    // Configure interrupt pin for touch events
-    gpio_config_t int_config = {
-        .pin_bit_mask = (1ULL << BSP_TOUCH_INT_GPIO),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_NEGEDGE,  // Falling edge
-    };
-    gpio_config(&int_config);
 
     *ret_touch = tp;
     g_touch_handle = tp;

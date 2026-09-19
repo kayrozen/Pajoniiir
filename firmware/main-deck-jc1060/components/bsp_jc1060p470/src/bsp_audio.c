@@ -68,6 +68,15 @@ static esp_err_t bsp_i2s_init(const bsp_audio_config_t* config)
  */
 static esp_err_t bsp_codec_init(void)
 {
+    /* Diagnostic: probe every 7-bit address on the shared bus once. */
+    i2c_master_bus_handle_t bus = bsp_i2c_get_shared();
+    ESP_LOGI(TAG, "I2C bus scan:");
+    for (uint8_t addr = 0x03; addr <= 0x77; addr++) {
+        if (i2c_master_probe(bus, addr, 20) == ESP_OK) {
+            ESP_LOGI(TAG, "  device ACK at 0x%02X", addr);
+        }
+    }
+
     /* I2S data interface backed by the TX channel created by bsp_i2s_init(). */
     audio_codec_i2s_cfg_t i2s_cfg = {
         .port      = BSP_AUDIO_I2S_PORT,

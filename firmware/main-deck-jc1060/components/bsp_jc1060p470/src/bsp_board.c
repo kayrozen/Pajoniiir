@@ -66,9 +66,9 @@ esp_err_t bsp_board_init(void)
     };
     ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
 
-    // Initialize software I2C for touch (to avoid GPIO12 conflict)
+    // Initialize shared I2C master (GT911 + ES8311) on GPIO7/8
 #if BSP_USE_SW_I2C_FOR_TOUCH
-    ESP_LOGI(TAG, "Initializing software I2C for touch on GPIO%d/%d", 
+    ESP_LOGI(TAG, "Initializing shared I2C master on GPIO%d/%d",
              BSP_I2C_SW_SDA_GPIO, BSP_I2C_SW_SCL_GPIO);
     ESP_ERROR_CHECK(bsp_i2c_init_sw(BSP_TOUCH_I2C_PORT,
                                      BSP_I2C_SW_SDA_GPIO,
@@ -162,25 +162,26 @@ const char* bsp_board_get_name(void)
 esp_err_t bsp_i2c_init_sw(i2c_port_t port, int sda_gpio, int scl_gpio,
                           uint32_t clk_speed_hz, i2c_master_bus_handle_t* i2c_handle)
 {
-    // Use software I2C (bit-banged) to avoid GPIO conflicts
+    // Hardware i2c_master on the board's dedicated I2C pins (GPIO7/8).
+    // The board has external pull-ups, so internal ones stay disabled.
     i2c_master_bus_config_t bus_config = {
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .i2c_port = port,
         .scl_io_num = scl_gpio,
         .sda_io_num = sda_gpio,
         .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
+        .flags.enable_internal_pullup = false,
     };
 
     esp_err_t ret = i2c_new_master_bus(&bus_config, i2c_handle);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize software I2C bus");
+        ESP_LOGE(TAG, "Failed to initialize shared I2C bus");
         return ret;
     }
 
-    ESP_LOGI(TAG, "Software I2C bus initialized on GPIO%d (SDA), GPIO%d (SCL)", 
+    ESP_LOGI(TAG, "Shared I2C bus initialized on GPIO%d (SDA), GPIO%d (SCL)",
              sda_gpio, scl_gpio);
-    
+
     return ESP_OK;
 }
 

@@ -70,16 +70,26 @@ extern "C" {
 // TOUCH SCREEN - GT911
 // =============================================================================
 
-/** @brief I2C configuration for touch */
-#define BSP_TOUCH_I2C_PORT        (I2C_NUM_1)
-#define BSP_TOUCH_I2C_SDA_GPIO    (GPIO_NUM_12)
-#define BSP_TOUCH_I2C_SCL_GPIO    (GPIO_NUM_10)
+/** @brief I2C configuration for touch
+ *
+ *  Shared hardware I2C master on GPIO7 (SDA) / GPIO8 (SCL) with GT911 and
+ *  ES8311 (per the official board pin map / ESPHome example). The board has
+ *  external pull-ups; internal pull-ups are not required.
+ */
+#define BSP_TOUCH_I2C_PORT        (I2C_NUM_0)
+#define BSP_TOUCH_I2C_SDA_GPIO    (GPIO_NUM_7)
+#define BSP_TOUCH_I2C_SCL_GPIO    (GPIO_NUM_8)
 #define BSP_TOUCH_I2C_CLK_SPEED_HZ (400000)       // 400 kHz
 
-/** @brief GT911 configuration */
+/** @brief GT911 configuration
+ *
+ *  The reference firmware does not wire GT911 RST/INT to software GPIOs
+ *  (power-on default address 0x5D). Do NOT drive GPIO7/8 as RST/INT - they
+ *  are the I2C bus lines themselves.
+ */
 #define BSP_TOUCH_I2C_ADDR        (0x5D)          // GT911 I2C address
-#define BSP_TOUCH_RST_GPIO        (GPIO_NUM_8)
-#define BSP_TOUCH_INT_GPIO        (GPIO_NUM_7)
+#define BSP_TOUCH_RST_GPIO        (GPIO_NUM_NC)
+#define BSP_TOUCH_INT_GPIO        (GPIO_NUM_NC)
 
 /** @brief Touch resolution (matches display) */
 #define BSP_TOUCH_X_MAX           (BSP_LCD_H_RES)
@@ -94,23 +104,32 @@ extern "C" {
 // AUDIO - ES8311 Codec
 // =============================================================================
 
-/** @brief I2C configuration for audio codec */
-#define BSP_AUDIO_I2C_PORT        (I2C_NUM_0)     // Separate I2C for audio
-#define BSP_AUDIO_I2C_SDA_GPIO    (GPIO_NUM_7)    // Shared with touch SDA
-#define BSP_AUDIO_I2C_SCL_GPIO    (GPIO_NUM_8)    // Shared with touch SCL
+/** @brief I2C configuration for audio codec
+ *
+ *  ES8311 shares the touch I2C master bus (GPIO7 SDA / GPIO8 SCL);
+ *  BSP_AUDIO_I2C_PORT is unused for control (bus_handle is passed instead).
+ */
+#define BSP_AUDIO_I2C_PORT        (I2C_NUM_0)     // Shared with touch (via bus_handle)
+#define BSP_AUDIO_I2C_SDA_GPIO    (GPIO_NUM_7)    // Shared bus (informational)
+#define BSP_AUDIO_I2C_SCL_GPIO    (GPIO_NUM_8)    // Shared bus (informational)
 #define BSP_AUDIO_I2C_CLK_SPEED_HZ (400000)
 
 /** @brief ES8311 configuration */
-#define BSP_AUDIO_CODEC_ADDR      (0x18)          // ES8311 I2C address (default)
-#define BSP_AUDIO_PA_CTRL_GPIO    (GPIO_NUM_1)    // NS4150 PA enable
+/** @brief ES8311 configuration
+ *
+ *  esp_codec_dev expects the address in 8-bit form (it shifts right by 1
+ *  internally); 0x30 == 7-bit 0x18. Passing the 7-bit form targets 0x0C.
+ */
+#define BSP_AUDIO_CODEC_ADDR      (0x30)          // ES8311 (esp_codec_dev 8-bit form; 7-bit = 0x18)
+#define BSP_AUDIO_PA_CTRL_GPIO    (GPIO_NUM_11)   // NS4150 PA enable (PA-CTRL)
 
-/** @brief I2S configuration */
+/** @brief I2S configuration (official pin map: BCLK=12, WS=10, MCLK=13, DOUT=9, DIN=48) */
 #define BSP_AUDIO_I2S_PORT        (I2S_NUM_0)
-#define BSP_AUDIO_I2S_SCLK_GPIO   (GPIO_NUM_13)
-#define BSP_AUDIO_I2S_LRCK_GPIO   (GPIO_NUM_12)   // ⚠️ CONFLICT: Same as touch SDA!
+#define BSP_AUDIO_I2S_SCLK_GPIO   (GPIO_NUM_12)   // BCLK
+#define BSP_AUDIO_I2S_LRCK_GPIO   (GPIO_NUM_10)   // WS / LRCK
 #define BSP_AUDIO_I2S_DOUT_GPIO   (GPIO_NUM_9)
-#define BSP_AUDIO_I2S_DIN_GPIO    (GPIO_NUM_NC)   // Not used (playback only)
-#define BSP_AUDIO_I2S_MCLK_GPIO   (GPIO_NUM_NC)   // Not required by ES8311
+#define BSP_AUDIO_I2S_DIN_GPIO    (GPIO_NUM_48)   // Microphone input
+#define BSP_AUDIO_I2S_MCLK_GPIO   (GPIO_NUM_13)   // Required by ES8311 (use_mclk=true)
 
 /** @brief Audio sample rates */
 #define BSP_AUDIO_SAMPLE_RATE     (44100)
@@ -118,44 +137,24 @@ extern "C" {
 #define BSP_AUDIO_CHANNEL_FORMAT  (I2S_SLOT_MODE_STEREO)
 
 // =============================================================================
-// ⚠️ GPIO CONFLICT RESOLUTION
+// I2C BUS PLAN (per official JC1060P470C_I_W_Y pin map)
 // =============================================================================
+//
+// The real board wires GT911 AND ES8311 on a single I2C bus:
+//   SDA = GPIO7, SCL = GPIO8 (external pull-ups on the board).
+// There is NO GPIO12 conflict: GPIO12 is I2S BCLK and GPIO10 is I2S WS.
+// GPIO14/15 are reserved for the ESP32-C6 SDIO (Wi-Fi) - never use them
+// as I2C. We therefore use the regular hardware i2c_master driver on 7/8.
+//
+// NOTE: GPIO14/15 are SDIO D0/D1 of the C6; the I2S1 "alternative pins"
+// below are likewise NOT free (14-17 = C6 SDIO).
 
-/**
- * @brief CRITICAL: GPIO12 conflict between I2S LRCK and I2C SDA
- * 
- * The JC1060P470C schematic shows:
- * - GPIO12: I2S LRCK (audio)
- * - GPIO12: Also routed to I2C SDA (touch/codec)
- * 
- * This is a HARDWARE DESIGN ISSUE. Solutions:
- * 
- * OPTION 1 (Recommended): Use I2S1 for audio instead of I2S0
- *   - I2S0: Keep for other peripherals if needed
- *   - I2S1: Use GPIOs 14-17 for audio (check availability)
- * 
- * OPTION 2: Bit-bang I2C on different GPIOs
- *   - Use GPIO14/15 for I2C (software I2C)
- *   - Keep hardware I2S on GPIO12
- * 
- * OPTION 3: Hardware modification (not recommended)
- *   - Cut trace and jumper to different GPIO
- * 
- * For this implementation, we'll use OPTION 2 (software I2C for touch/codec).
- */
+#define BSP_USE_SW_I2C_FOR_TOUCH  (1)   // Shared I2C master created in bsp_board_init()
+#define BSP_USE_SW_I2C_FOR_AUDIO  (1)   // Touch + audio share the same master bus
 
-#define BSP_USE_SW_I2C_FOR_TOUCH  (1)   // Use software I2C for touch
-#define BSP_USE_SW_I2C_FOR_AUDIO  (1)   // Use software I2C for codec
-
-// Alternative I2C pins for software bit-banging
-#define BSP_I2C_SW_SDA_GPIO       (GPIO_NUM_14)
-#define BSP_I2C_SW_SCL_GPIO       (GPIO_NUM_15)
-
-// Alternative I2S1 pins (if OPTION 1 is chosen)
-#define BSP_AUDIO_I2S1_SCLK_GPIO  (GPIO_NUM_14)
-#define BSP_AUDIO_I2S1_LRCK_GPIO  (GPIO_NUM_15)
-#define BSP_AUDIO_I2S1_DOUT_GPIO  (GPIO_NUM_16)
-#define BSP_AUDIO_I2S1_MCLK_GPIO  (GPIO_NUM_17)
+// Kept for API compatibility with bsp_i2c_init_sw() call sites:
+#define BSP_I2C_SW_SDA_GPIO       (GPIO_NUM_7)
+#define BSP_I2C_SW_SCL_GPIO       (GPIO_NUM_8)
 
 // =============================================================================
 // USB HOST (MSC for music library)
