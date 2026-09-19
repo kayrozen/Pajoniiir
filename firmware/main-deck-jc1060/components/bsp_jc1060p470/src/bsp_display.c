@@ -16,6 +16,7 @@
 #include "esp_lcd_jd9165.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
+#include "esp_ldo_regulator.h"
 #include "esp_private/esp_clk.h"
 #include "esp_heap_caps.h"
 
@@ -89,13 +90,23 @@ static esp_lcd_panel_handle_t g_panel = NULL;
 
 /**
  * @brief Enable power for MIPI DSI PHY
+ *
+ * On ESP32-P4 the MIPI-DSI PHY analog rail is the internal LDO VO3
+ * (channel 3, 2.5 V). It must be software-enabled before esp_lcd_new_dsi_bus(),
+ * otherwise the PHY PLL never locks and the driver spins in
+ * while(!is_pll_locked()) until the task watchdog fires.
  */
+static esp_ldo_channel_handle_t s_ldo_mipi = NULL;
+
 static esp_err_t bsp_enable_dsi_phy_power(void)
 {
-    // MIPI DSI PHY powered by LDO VO3 (2.5V)
-    // In production, this should be controlled by PMIC
-    // For now, assume always-on from USB power
-    ESP_LOGI(TAG, "MIPI DSI PHY powered on (assumed always-on)");
+    esp_ldo_channel_config_t ldo_config = {
+        .chan_id = 3,
+        .voltage_mv = 2500,
+    };
+    ESP_RETURN_ON_ERROR(esp_ldo_acquire_channel(&ldo_config, &s_ldo_mipi),
+                        TAG, "Failed to acquire LDO VO3 for MIPI DSI PHY");
+    ESP_LOGI(TAG, "MIPI DSI PHY LDO VO3 acquired (2500 mV)");
     return ESP_OK;
 }
 
