@@ -376,3 +376,18 @@ En cas de problème bloquant :
   Layout retenu : DDJ-400 en direct sur un USB-C, stockage sur l'autre USB-C (ou microSD
   déjà fonctionnelle). Le port FS/Serial-JTAG reste prioritaire pour le flash/console.
   Host stack IDF 6.0.2 = composant managé `espressif/usb`, hubs via `CONFIG_USB_HOST_HUBS_SUPPORTED`.
+- ESP-Hosted / C6 (🔶 en cours) :
+  - Composants : `espressif/esp_hosted` + `espressif/esp_wifi_remote`, transport SDIO
+    (pin map = P4 Function EV board : CMD=19, CLK=18, D0-D3=14-17), reset GPIO54.
+  - L'USB du C6 n'est **pas** routé vers les USB-C (le second port est bien le P4 OTG,
+    prouvé par l'énumération host) — le C6 se flashe via ses pins UART du header
+    (C6_U0TXD/U0RXD, CHIP_PU, IO9 sur le 2×10).
+  - **Exclusivité SDMMC** : le P4 n'a qu'UN contrôleur SDMMC (2 slots) et ESP-Hosted le
+    revendique dès le démarrage → microSD (slot 0) et C6 Wi-Fi (slot 1) incompatibles.
+    Arbitrage requis : Wi-Fi (debug telnet + OTA, stockage sur clé USB) OU microSD
+    (debug via pont UART XIAO).
+  - Handshake SDIO actuellement en échec (`sdmmc_card_init 0x107` en boucle) : firmware
+    usine du C6 à vérifier (slave ESP-Hosted compatible ? strapping IO9 ?).
+  - Crash `sdio_mempool_create` réglé par `ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y`
+    (GDMA du P4 accède à la PSRAM) + `CONFIG_FREERTOS_HZ=1000`.
+  - Partition table custom 4 Mo app requise avec le stack Wi-Fi (16 Mo flash).
