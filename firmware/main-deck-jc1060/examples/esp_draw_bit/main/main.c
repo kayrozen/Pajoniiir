@@ -232,6 +232,7 @@ void app_main(void)
     esp_err_t audio_ret = bsp_audio_init(&audio_cfg);
     if (audio_ret == ESP_OK) {
         ESP_LOGI(TAG, "Audio initialized");
+        bsp_audio_test_tone();
     } else {
         ESP_LOGW(TAG, "Audio init failed: %s", esp_err_to_name(audio_ret));
     }

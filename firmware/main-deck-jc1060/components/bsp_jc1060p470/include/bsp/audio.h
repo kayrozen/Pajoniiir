@@ -62,6 +62,13 @@ esp_err_t bsp_audio_set_volume(int volume);
 int bsp_audio_get_volume(void);
 
 /**
+ * @brief Play a 1 s 440 Hz test tone on the codec output (bring-up helper)
+ *
+ * @return ESP_OK on success
+ */
+esp_err_t bsp_audio_test_tone(void);
+
+/**
  * @brief Mute/unmute audio
  * 
  * @param mute true to mute

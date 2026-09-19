@@ -15,6 +15,7 @@
 #include "driver/gpio.h"
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
+#include <math.h>
 
 static const char* TAG = "bsp_audio";
 
@@ -169,6 +170,16 @@ esp_err_t bsp_audio_init(const bsp_audio_config_t* config)
     }
 
     bsp_audio_set_volume(config->volume);
+
+    /* Open the codec output stream (required before esp_codec_dev_write). */
+    esp_codec_dev_sample_info_t fs = {
+        .sample_rate = config->sample_rate,
+        .channel = 2,
+        .bits_per_sample = 16,
+    };
+    ESP_RETURN_ON_ERROR(esp_codec_dev_open(g_codec_dev, &fs),
+                        TAG, "Failed to open codec output stream");
+
     g_initialized = true;
     ESP_LOGI(TAG, "Audio initialization complete");
     return ESP_OK;
@@ -199,6 +210,34 @@ esp_err_t bsp_audio_set_volume(int volume)
 
 int bsp_audio_get_volume(void) { return g_current_volume_db; }
 
+esp_err_t bsp_audio_test_tone(void)
+{
+    /* Bring-up helper: 1 s of 440 Hz sine on the codec output. */
+    if (g_codec_dev == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    enum { SR = 44100, FREQ = 440, CHUNK_FRAMES = 1024, TOTAL_FRAMES = SR };
+    static int16_t frames[CHUNK_FRAMES * 2];
+
+    ESP_LOGI(TAG, "Playing 1 s test tone (%d Hz)", FREQ);
+    for (int written = 0; written < TOTAL_FRAMES; written += CHUNK_FRAMES) {
+        for (int i = 0; i < CHUNK_FRAMES; i++) {
+            double t = (double)(written + i) / SR;
+            int16_t s = (int16_t)(12000.0 * sin(2.0 * 3.14159265358979323846 * FREQ * t));
+            frames[2 * i]     = s;   /* left  */
+            frames[2 * i + 1] = s;   /* right */
+        }
+        int ret = esp_codec_dev_write(g_codec_dev, frames, sizeof(frames));
+        if (ret != ESP_CODEC_DEV_OK) {
+            ESP_LOGE(TAG, "Test tone write failed: %d", ret);
+            return ESP_FAIL;
+        }
+    }
+    ESP_LOGI(TAG, "Test tone done");
+    return ESP_OK;
+}
+
 esp_err_t bsp_audio_set_mute(bool mute)
 {
     if (g_codec_dev == NULL) {
@@ -216,7 +255,9 @@ esp_err_t bsp_audio_deinit(void)
     ESP_LOGI(TAG, "Deinitializing audio");
 
     if (g_codec_dev != NULL) {
-        esp_codec_dev_close(g_codec_dev);
+        if (g_initialized) {
+            esp_codec_dev_close(g_codec_dev);
+        }
         esp_codec_dev_delete(g_codec_dev);
         g_codec_dev = NULL;
     }
