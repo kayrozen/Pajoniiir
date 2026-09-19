@@ -392,8 +392,21 @@ En cas de problème bloquant :
     du host (1,5 s). Fix : `CONFIG_ESP_HOSTED_SLAVE_RESET_ONLY_IF_NECESSARY=y` (le C6
     boote en parallèle au P4 et est prêt avant esp_wifi_init).
     ⚠️ Version mismatch Host 2.12.0 > Co-proc 2.3.0 — upgrade du slave recommandé
-    (risque de timeouts RPC), via les pins UART du C6 sur le header 2×10.
-    Console du C6 observable sur un adaptateur USB-UART branché sur ces pins.
+    (risque de timeouts RPC). Procédure d'upgrade du C6 (non effectuée, pins
+    incomplètes sur l'adaptateur USB-UART au moment du test) :
+      1. Firmwares slaves précompilés : livrés avec le composant esp_hosted
+         (répertoire `slave/`, à builder avec `idf.py` pour la version exacte
+         du host, cible esp32c6, transport SDIO).
+      2. Câblage requis sur le header 2×10 : C6_U0TXD (pin 12) → RX adaptateur,
+         C6_U0RXD (pin 13) ← TX adaptateur, GND commun, **plus** C6_CHIP_PU
+         (pin 15) et C6_IO9 (pin 14, boot strap) reliés à l'adaptateur ou
+         pilotables : le C6 entre en download mode avec IO9=bas + impulsion
+         CHIP_PU (CHIP_PU est aussi piloté par le P4 sur GPIO54 — à isoler
+         pendant le flash).
+      3. `esptool --chip esp32c6 -p /dev/ttyUSB0 write-flash @flash_args`
+         avec les partitions `partitions.esp32c6.csv` du composant.
+      4. Console C6 observable à 115200 bauds sur l'adaptateur (validé :
+         log de boot visible, slave ESP-Hosted 2.3.0 opérationnel).
   - Crash `sdio_mempool_create` réglé par `ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y`
     (GDMA du P4 accède à la PSRAM) + `CONFIG_FREERTOS_HZ=1000`.
   - Partition table custom 4 Mo app requise avec le stack Wi-Fi (16 Mo flash).
