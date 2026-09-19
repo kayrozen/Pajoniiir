@@ -382,10 +382,11 @@ En cas de problème bloquant :
   - L'USB du C6 n'est **pas** routé vers les USB-C (le second port est bien le P4 OTG,
     prouvé par l'énumération host) — le C6 se flashe via ses pins UART du header
     (C6_U0TXD/U0RXD, CHIP_PU, IO9 sur le 2×10).
-  - **Exclusivité SDMMC** : le P4 n'a qu'UN contrôleur SDMMC (2 slots) et ESP-Hosted le
-    revendique dès le démarrage → microSD (slot 0) et C6 Wi-Fi (slot 1) incompatibles.
-    Arbitrage requis : Wi-Fi (debug telnet + OTA, stockage sur clé USB) OU microSD
-    (debug via pont UART XIAO).
+  - **Exclusivité SDMMC levée** : le contrôleur SDMMC est unique, mais microSD (slot 0) et
+    C6 Wi-Fi (slot 1) **coexistent** via le workaround officiel esp_hosted
+    (`host_sdcard_with_hosted`) : hosted initialise le contrôleur, le code SD remplace
+    init/deinit par des stubs. Wi-Fi init AVANT le montage SD. MicroSD validée montée
+    avec ESP-Hosted actif.
   - Handshake SDIO actuellement en échec (`sdmmc_card_init 0x107` en boucle) : firmware
     usine du C6 à vérifier (slave ESP-Hosted compatible ? strapping IO9 ?).
   - Crash `sdio_mempool_create` réglé par `ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y`
