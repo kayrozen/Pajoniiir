@@ -28,6 +28,7 @@
 #include "bsp/sd.h"
 #include "usb_host_bringup.h"
 #include "eth_bringup.h"
+#include "wifi_console.h"
 #include "nvs_flash.h"
 #include "esp_wifi.h"
 
@@ -251,6 +252,7 @@ void app_main(void)
     // MUST run before the SD card mount: ESP-Hosted claims the (single)
     // SDMMC host controller here, and the SD card (slot 0) then mounts on
     // top of it - see bsp_sd.c coexistence workaround.
+    // wifi_console_start() connects STA + starts the TCP log console.
     esp_err_t nvs_ret = nvs_flash_init();
     if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -258,16 +260,9 @@ void app_main(void)
     }
     if (nvs_ret != ESP_OK) {
         ESP_LOGE(TAG, "NVS init failed: %s", esp_err_to_name(nvs_ret));
-    } else {
-        wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
-        esp_err_t wifi_ret = esp_wifi_init(&wifi_cfg);
-        if (wifi_ret == ESP_OK) {
-            ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-            ESP_ERROR_CHECK(esp_wifi_start());
-            ESP_LOGI(TAG, "Wi-Fi started (via C6 co-processor)");
-        } else {
-            ESP_LOGE(TAG, "esp_wifi_init failed: %s", esp_err_to_name(wifi_ret));
-        }
+    }
+    if (!wifi_console_start()) {
+        ESP_LOGW(TAG, "Wi-Fi console not available");
     }
 
     // SD card bring-up test (non-fatal if no card inserted)
