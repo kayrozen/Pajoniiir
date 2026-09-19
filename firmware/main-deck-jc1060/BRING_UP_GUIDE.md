@@ -373,10 +373,9 @@ En cas de problème bloquant :
   detected » en direct sur le port) et **DDJ-400 validé** (Pioneer 0x2B73:0x0026, interfaces
   audio + MIDI streaming + HID détectées après passage du buffer d'énumération à 1024 octets).
   Le port racine gère les devices FS nativement.
-  ❌ **Devices derrière un hub HS : non supportés par IDF** (Transaction Translator non
-  implémenté, esp-idf#17245, confirmé par test avec 2 câbles : port reset OK, device ne
-  répond jamais). Config production : DDJ en direct sur un USB-C, stockage sur microSD
-  (ou clé sur l'autre port). Un hub FS-only ou le support TT d'IDF débloquera le hub.
+- USB host : layout final retenu = **DDJ-400 en direct sur le port HS** (device FS, énuméré,
+  MIDI streaming détecté). En attente du support **TT Espressif** (esp-idf#17245) pour
+  remettre le hub HS alimenté (alim DDJ + tablette) avec devices derrière.
   Host stack IDF 6.0.2 = composant managé `espressif/usb`, hubs via `CONFIG_USB_HOST_HUBS_SUPPORTED`.
   ❌ **Port FS = jamais hôte USB** : la pile host ne pilote que le DWC2.0 (UTMI/HS) ;
   le mapping PHY↔contrôleur est fixe (DWC2.0↔UTMI, DWC1.1↔FSLS) et le DWC1.1 n'est

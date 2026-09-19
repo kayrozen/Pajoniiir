@@ -19,6 +19,9 @@
 #include "freertos/queue.h"
 #include "esp_log.h"
 #include "usb/usb_host.h"
+#include "usb/usb_types_ch9.h"
+#include "usb/usb_helpers.h"
+#include "midi_host.h"
 
 static const char* TAG = "usb_bringup";
 
@@ -28,6 +31,7 @@ static const char* TAG = "usb_bringup";
 #define USB_ENUM_TASK_PRIO      (3)
 
 static QueueHandle_t s_new_dev_queue = NULL;
+static QueueHandle_t s_gone_dev_queue = NULL;
 static usb_host_client_handle_t s_client = NULL;
 static SemaphoreHandle_t s_installed_sem = NULL;
 
@@ -35,7 +39,8 @@ static SemaphoreHandle_t s_installed_sem = NULL;
 /* Device classification                                              */
 /* ------------------------------------------------------------------ */
 
-static void classify_device(uint8_t dev_addr, usb_device_handle_t dev_hdl)
+/* Returns true when the device should stay open (claimed by a sub-driver). */
+static bool classify_device(uint8_t dev_addr, usb_device_handle_t dev_hdl)
 {
     const usb_device_desc_t* dev_desc = NULL;
     const usb_config_desc_t* cfg_desc = NULL;
@@ -43,7 +48,7 @@ static void classify_device(uint8_t dev_addr, usb_device_handle_t dev_hdl)
     if (usb_host_get_device_descriptor(dev_hdl, &dev_desc) != ESP_OK ||
         usb_host_get_active_config_descriptor(dev_hdl, &cfg_desc) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to read descriptors");
-        return;
+        return false;
     }
 
     ESP_LOGI(TAG, "Device addr=%u: VID=0x%04X PID=0x%04X, class=0x%02X",
@@ -61,7 +66,7 @@ static void classify_device(uint8_t dev_addr, usb_device_handle_t dev_hdl)
         const usb_intf_desc_t* ifc =
             usb_parse_interface_descriptor(cfg_desc, i, 0, &offset);
         if (ifc == NULL) {
-            break;
+            continue;
         }
         ESP_LOGI(TAG, "  ifc %d: class=0x%02X sub=0x%02X proto=0x%02X, %d EP",
                  i, ifc->bInterfaceClass, ifc->bInterfaceSubClass,
@@ -89,6 +94,8 @@ static void classify_device(uint8_t dev_addr, usb_device_handle_t dev_hdl)
     if (!is_midi && !is_audio && !is_msc && !is_hub && !is_hid) {
         ESP_LOGI(TAG, ">>> Unclassified device");
     }
+
+    return is_midi && midi_host_attach(dev_hdl, cfg_desc);
 }
 
 /* ------------------------------------------------------------------ */
@@ -106,6 +113,9 @@ static void client_event_cb(const usb_host_client_event_msg_t* msg, void* arg)
             break;
         case USB_HOST_CLIENT_EVENT_DEV_GONE:
             ESP_LOGW(TAG, "Device gone");
+            if (s_gone_dev_queue) {
+                xQueueSend(s_gone_dev_queue, &msg->dev_gone.dev_hdl, portMAX_DELAY);
+            }
             break;
         default:
             break;
@@ -164,10 +174,12 @@ static void enum_task(void* arg)
         vTaskDelete(NULL);
         return;
     }
+    midi_host_init(s_client);
 
     uint8_t dev_addr;
+    usb_device_handle_t midi_dev = NULL;
     while (1) {
-        /* Pump client events (runs client_event_cb) then drain the queue. */
+        /* Pump client events (runs client_event_cb) then drain the queues. */
         usb_host_client_handle_events(s_client, pdMS_TO_TICKS(50));
         while (xQueueReceive(s_new_dev_queue, &dev_addr, 0) == pdTRUE) {
             usb_device_handle_t dev_hdl = NULL;
@@ -175,8 +187,20 @@ static void enum_task(void* arg)
                 ESP_LOGE(TAG, "Failed to open device %u", dev_addr);
                 continue;
             }
-            classify_device(dev_addr, dev_hdl);
-            usb_host_device_close(s_client, dev_hdl);
+            if (classify_device(dev_addr, dev_hdl)) {
+                /* MIDI claimed: keep the device open while attached. */
+                midi_dev = dev_hdl;
+            } else {
+                usb_host_device_close(s_client, dev_hdl);
+            }
+        }
+        usb_device_handle_t gone;
+        while (xQueueReceive(s_gone_dev_queue, &gone, 0) == pdTRUE) {
+            midi_host_detach(gone);
+            usb_host_device_close(s_client, gone);
+            if (midi_dev == gone) {
+                midi_dev = NULL;
+            }
         }
     }
     vTaskDelete(NULL);
@@ -188,6 +212,7 @@ bool usb_host_bringup_start(void)
 {
     s_installed_sem = xSemaphoreCreateBinary();
     s_new_dev_queue = xQueueCreate(8, sizeof(uint8_t));
+    s_gone_dev_queue = xQueueCreate(8, sizeof(usb_device_handle_t));
     if (s_new_dev_queue == NULL) {
         return false;
     }
