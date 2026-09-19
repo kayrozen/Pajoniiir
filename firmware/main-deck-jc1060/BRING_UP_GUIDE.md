@@ -370,11 +370,13 @@ En cas de problème bloquant :
   Alimentation carte via LDO interne canal 4 @ 2,7 V (API IDF 6.0.2 : `sd_pwr_ctrl_ldo_config_t`,
   `host.pwr_ctrl_handle` sur le host config).
 - USB host : **énumération validée** (clé USB 0x090C/0x1000, class 0x08, « Mass-storage device
-  detected » en direct sur le port). Le port racine gère les devices FS nativement.
-  ⚠️ Limitation IDF : le driver EXT_HUB n'implémente pas la Transaction Translator → les
-  devices FS/LS derrière un hub High-Speed ne s'énumèrent pas (le hub lui-même s'énumère).
-  Layout retenu : DDJ-400 en direct sur un USB-C, stockage sur l'autre USB-C (ou microSD
-  déjà fonctionnelle). Le port FS/Serial-JTAG reste prioritaire pour le flash/console.
+  detected » en direct sur le port) et **DDJ-400 validé** (Pioneer 0x2B73:0x0026, interfaces
+  audio + MIDI streaming + HID détectées après passage du buffer d'énumération à 1024 octets).
+  Le port racine gère les devices FS nativement.
+  ❌ **Devices derrière un hub HS : non supportés par IDF** (Transaction Translator non
+  implémenté, esp-idf#17245, confirmé par test avec 2 câbles : port reset OK, device ne
+  répond jamais). Config production : DDJ en direct sur un USB-C, stockage sur microSD
+  (ou clé sur l'autre port). Un hub FS-only ou le support TT d'IDF débloquera le hub.
   Host stack IDF 6.0.2 = composant managé `espressif/usb`, hubs via `CONFIG_USB_HOST_HUBS_SUPPORTED`.
 - ESP-Hosted / C6 (🔶 en cours) :
   - Composants : `espressif/esp_hosted` + `espressif/esp_wifi_remote`, transport SDIO
