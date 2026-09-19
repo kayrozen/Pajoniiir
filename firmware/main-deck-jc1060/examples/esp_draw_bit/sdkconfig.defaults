@@ -36,6 +36,10 @@ CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
 CONFIG_ESP_HOSTED_P4_DEV_BOARD_FUNC_BOARD=y
 CONFIG_ESP_HOSTED_SDIO_RESET_GPIO=54
 CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_LOW=y
+# C6 boots in parallel with the P4 (released from reset at board init) and is
+# ready well before esp_wifi_init - do not re-reset it there, or the 1.5 s
+# card-init window closes before the C6 finishes booting.
+CONFIG_ESP_HOSTED_SLAVE_RESET_ONLY_IF_NECESSARY=y
 CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y
 CONFIG_FREERTOS_HZ=1000
 

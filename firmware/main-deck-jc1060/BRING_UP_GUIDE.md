@@ -387,8 +387,13 @@ En cas de problème bloquant :
     (`host_sdcard_with_hosted`) : hosted initialise le contrôleur, le code SD remplace
     init/deinit par des stubs. Wi-Fi init AVANT le montage SD. MicroSD validée montée
     avec ESP-Hosted actif.
-  - Handshake SDIO actuellement en échec (`sdmmc_card_init 0x107` en boucle) : firmware
-    usine du C6 à vérifier (slave ESP-Hosted compatible ? strapping IO9 ?).
+  - Handshake SDIO **résolu** : le firmware usine du C6 EST un slave ESP-Hosted (2.3.0),
+    mais la course temporelle reset→boot C6 (~1,75 s) dépassait la fenêtre d'init carte
+    du host (1,5 s). Fix : `CONFIG_ESP_HOSTED_SLAVE_RESET_ONLY_IF_NECESSARY=y` (le C6
+    boote en parallèle au P4 et est prêt avant esp_wifi_init).
+    ⚠️ Version mismatch Host 2.12.0 > Co-proc 2.3.0 — upgrade du slave recommandé
+    (risque de timeouts RPC), via les pins UART du C6 sur le header 2×10.
+    Console du C6 observable sur un adaptateur USB-UART branché sur ces pins.
   - Crash `sdio_mempool_create` réglé par `ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y`
     (GDMA du P4 accède à la PSRAM) + `CONFIG_FREERTOS_HZ=1000`.
   - Partition table custom 4 Mo app requise avec le stack Wi-Fi (16 Mo flash).
