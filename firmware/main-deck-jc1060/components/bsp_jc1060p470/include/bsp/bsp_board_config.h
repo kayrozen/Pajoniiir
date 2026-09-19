@@ -182,8 +182,11 @@ extern "C" {
 // =============================================================================
 
 #define BSP_UART_CONTROL_LINK     (UART_NUM_1)
-#define BSP_UART_TX_GPIO          (GPIO_NUM_28)   // To S3 RX
-#define BSP_UART_RX_GPIO          (GPIO_NUM_29)   // From S3 TX
+// JC1060P470C: GPIO28/29 are consumed by the Ethernet RMII (IP101) and are
+// not on any connector. Use GPIO45/46 exposed on the 2x10 2.54 mm expansion
+// header (JP1 area of the Expand IO page): pin 10 = GPIO45, pin 9 = GPIO46.
+#define BSP_UART_TX_GPIO          (GPIO_NUM_45)   // To S3 RX (GPIO6)
+#define BSP_UART_RX_GPIO          (GPIO_NUM_46)   // From S3 TX (GPIO5)
 #define BSP_UART_BAUDRATE         (460800)
 
 // =============================================================================
