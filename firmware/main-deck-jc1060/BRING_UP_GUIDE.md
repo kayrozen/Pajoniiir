@@ -360,4 +360,17 @@ En cas de problème bloquant :
 - I2S : BCLK=12, WS=10, MCLK=13 (requis par l'ES8311), DOUT=9, DIN=48.
 - Pattern 3 : OK (fill ligne par ligne, plus d'allocation DMA 1,2 Mo).
 - Pin map de référence : repo `p1ngb4ck/unofficial_guition_esp32p4_repo`, `JC1060P470_I_W_Y/esphome_yaml_example/`.
-- ⚠️ Pas encore validés : SDMMC, ESP32-C6/ESP-Hosted (SDIO 14-19), UART control link, USB host (pins DM/DP du BSP à revoir — 19 est la CMD SDIO du C6).
+- UART control link : remappé sur **GPIO45 (P4 TX) / GPIO46 (P4 RX)**, exposés sur le header
+  d'extension 2×10 2,54 mm (bloc « Expand IO » du schéma, pins 10 et 9 ; GND pins 3/4).
+  ⚠️ GPIO28/29 de `HARDWARE_WIRING.md` étaient valables pour le JC4880 uniquement : sur la
+  JC1060 ils sont câblés au PHY Ethernet IP101 (RMII) et n'arrivent sur aucun connecteur.
+  Côté XIAO S3 : GPIO5 (TX) → P4 GPIO46, GPIO6 (RX) ← P4 GPIO45, masses communes, pas de
+  3V3 croisée si alim USB séparées.
+- SDMMC : OK — microSD SDSC 480 MB, 4 bits @ 40 MHz, montage FAT `/sdcard` + écriture.
+  Alimentation carte via LDO interne canal 4 @ 2,7 V (API IDF 6.0.2 : `sd_pwr_ctrl_ldo_config_t`,
+  `host.pwr_ctrl_handle` sur le host config).
+- USB host (exploration faite, à implémenter) : les 2 USB-C du board vont aux 2 PHY USB du P4
+  (UTMI HS 480 Mbps / FSLS FS 12 Mbps, 2 contrôleurs OTG distincts). Plan retenu :
+  hub USB alimenté sur le port **HS** pour DDJ-400 (MIDI) + stockage de masse USB ;
+  le port **FS** reste la console USB-Serial-JTAG (flashing). Host stack IDF 6.0.2 =
+  composant managé `espressif/usb_host_lib`, hubs via `CONFIG_USB_HOST_HUBS_SUPPORTED`.

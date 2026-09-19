@@ -157,12 +157,27 @@ extern "C" {
 #define BSP_I2C_SW_SCL_GPIO       (GPIO_NUM_8)
 
 // =============================================================================
-// USB HOST (MSC for music library)
+// USB HOST (DDJ-400 controller + USB mass storage)
 // =============================================================================
-
-#define BSP_USB_HOST_ENABLED      (1)
-#define BSP_USB_DM_GPIO           (GPIO_NUM_19)   // D+ (check schematic)
-#define BSP_USB_DP_GPIO           (GPIO_NUM_20)   // D- (check schematic)
+//
+// The P4 has TWO OTG controllers (SOC_USB_OTG_PERIPH_NUM=2):
+//   - OTG on the internal UTMI PHY  -> HS port  (480 Mbps)
+//   - OTG on the internal FSLS PHY  -> FS port  (12 Mbps)
+// On the JC1060 both reach a USB-C receptacle ("High Speed USB" and "Full
+// Speed USB" schematic blocks). The USB D+/D- pads are dedicated: no GPIO
+// configuration needed (the old BSP_USB_DM/DP GPIO defines below are only
+// kept as placeholders and must not be trusted).
+// The FSLS PHY is muxed with USB-Serial-JTAG: the FS USB-C is currently our
+// flashing/console port (CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y). Using it as
+// host would kill the console.
+// Plan (see BRING_UP_GUIDE): powered hub on the HS USB-C for DDJ-400 + MSC,
+// FS USB-C stays the console. Host stack on IDF 6.0.2 = espressif/usb_host_lib
+// managed component; hub support = CONFIG_USB_HOST_HUBS_SUPPORTED.
+//
+// Legacy placeholders (WRONG on this board - GPIO19 is the C6 SDIO CMD):
+#define BSP_USB_HOST_ENABLED      (0)
+#define BSP_USB_DM_GPIO           (GPIO_NUM_NC)
+#define BSP_USB_DP_GPIO           (GPIO_NUM_NC)
 
 // =============================================================================
 // SDMMC (for config/cache, optional)
