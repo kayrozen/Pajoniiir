@@ -8,18 +8,21 @@ idf_component_register(
         "src/bsp_audio.c"
     INCLUDE_DIRS
         "include"
+        "include/bsp"
     REQUIRES
-        driver
         esp_lcd
         esp_lcd_touch
         esp_lcd_touch_gt911
         esp_codec_dev
-        esp_codec_dev_es8311
         lvgl
         esp_timer
-        heap_caps
+        heap
+        esp_driver_i2s
+        esp_driver_i2c
+        esp_driver_ledc
+        esp_driver_gpio
     PRIV_REQUIRES
-        esp_private
+        esp_hw_support
 )
 
 # Add compile definitions for board-specific settings

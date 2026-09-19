@@ -221,6 +221,25 @@ Carte stable.
 - **Build échoue** : confirmer `idf.py --version` donne bien v6.0.2. Effacer
   `build/` et `managed_components/` puis recommencer `set-target`.
 
+## Statut logiciel (build)
+
+La migration ESP-IDF 6.0.2 / LVGL 9 de l'exemple `esp_draw_bit` est validée :
+build propre sous `espressif/idf:v6.0.2` (Linux, via Docker) sans erreur ni
+warning. Le binaire généré est
+`firmware/main-deck-jc1060/examples/esp_draw_bit/build/esp_draw_bit.bin`
+(app ~0xa37 Ko, ~36 % libre). Composants managés épinglés dans
+`dependencies.lock` (LVGL 9.6, esp_lcd_jd9165 2.0.2, esp_codec_dev 1.6.2,
+esp_lcd_touch 1.2.1).
+
+Attention : `sdkconfig.defaults` de l'exemple force le target ESP32-P4, le
+PSRAM octal 16MB (HEX) requis par le framebuffer DPI, le support ES8311 et le
+silicon « less than v3 » de la carte de production. Ne pas réactiver les
+options LVGL8 (`CONFIG_LVGL_VERSION_8`) ni l'ancienne config DPI
+(`pixel_clock_hz`/`timing`) : elles sont obsolètes.
+
+Restent à réaliser physiquement : le flash et la checklist des critères de
+sortie ci-dessous (patterns, tactile, audio, stabilité).
+
 ## Critères de sortie Phase 1
 
 - [ ] Boot log correspond à la séquence attendue (display, touch, audio,

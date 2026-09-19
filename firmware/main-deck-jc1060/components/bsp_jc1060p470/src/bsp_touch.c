@@ -9,6 +9,7 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_lcd_touch.h"
+#include "esp_check.h"
 #include "esp_lcd_touch_gt911.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
@@ -26,21 +27,13 @@ esp_err_t bsp_touch_new(const bsp_touch_config_t* config,
     ESP_RETURN_ON_FALSE(config != NULL, ESP_ERR_INVALID_ARG, TAG, "Config is NULL");
     ESP_RETURN_ON_FALSE(ret_touch != NULL, ESP_ERR_INVALID_ARG, TAG, "Ret touch is NULL");
 
-    // Initialize I2C for touch (software bit-banged to avoid GPIO conflict)
+    // Use the shared software-I2C bus initialised by bsp_board_init().
+    g_touch_i2c_handle = bsp_i2c_get_shared();
     if (g_touch_i2c_handle == NULL) {
-        ESP_LOGI(TAG, "Initializing I2C for touch on GPIO%d/%d",
-                 BSP_I2C_SW_SDA_GPIO, BSP_I2C_SW_SCL_GPIO);
-        
-        ret = bsp_i2c_init_sw(BSP_TOUCH_I2C_PORT,
-                              BSP_I2C_SW_SDA_GPIO,
-                              BSP_I2C_SW_SCL_GPIO,
-                              BSP_TOUCH_I2C_CLK_SPEED_HZ,
-                              &g_touch_i2c_handle);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to initialize I2C for touch");
-            return ret;
-        }
+        ESP_LOGE(TAG, "Shared I2C bus not initialised (bsp_board_init missing?)");
+        return ESP_ERR_INVALID_STATE;
     }
+    ESP_LOGI(TAG, "Using shared software I2C bus for touch");
 
     // Configure GT911
     const esp_lcd_touch_config_t tp_config = {
@@ -134,22 +127,17 @@ bool bsp_touch_read_coordinates(esp_lcd_touch_handle_t tp,
         return false;
     }
 
-    // Get coordinates
-    uint16_t touch_x[1] = {0};
-    uint16_t touch_y[1] = {0};
-    uint16_t touch_strength[1] = {0};
+    // Get touch points
+    esp_lcd_touch_point_data_t touch_data[1] = {0};
     uint8_t touch_cnt = 0;
 
-    bool touched = esp_lcd_touch_get_coordinates(tp,
-                                                  touch_x, touch_y, touch_strength,
-                                                  &touch_cnt, max_count);
-    
-    if (touched && touch_cnt > 0) {
-        *x = touch_x[0];
-        *y = touch_y[0];
-        if (strength) *strength = touch_strength[0];
+    esp_err_t get_ret = esp_lcd_touch_get_data(tp, touch_data, &touch_cnt, max_count);
+    if ((get_ret == ESP_OK) && (touch_cnt > 0)) {
+        *x = touch_data[0].x;
+        *y = touch_data[0].y;
+        if (strength) *strength = touch_data[0].strength;
         *count = touch_cnt;
-        
+
         ESP_LOGD(TAG, "Touch detected: (%d, %d)", *x, *y);
         return true;
     }
@@ -167,7 +155,7 @@ esp_err_t bsp_touch_del(esp_lcd_touch_handle_t tp)
     ESP_LOGI(TAG, "Deleting touch");
 
     // Delete touch panel
-    esp_lcd_touch_delete(tp);
+    esp_lcd_touch_del(tp);
     g_touch_handle = NULL;
 
     // I2C bus deleted in bsp_board_deinit()

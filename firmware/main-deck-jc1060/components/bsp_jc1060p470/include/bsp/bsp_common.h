@@ -62,6 +62,13 @@ esp_err_t bsp_i2c_init_sw(i2c_port_t port, int sda_gpio, int scl_gpio,
 esp_err_t bsp_i2c_deinit(i2c_master_bus_handle_t i2c_handle);
 
 /**
+ * @brief Get the shared software-I2C master bus used by touch and audio.
+ *
+ * @return Shared I2C bus handle (owned by bsp_board).
+ */
+i2c_master_bus_handle_t bsp_i2c_get_shared(void);
+
+/**
  * @brief Configure backlight PWM
  * 
  * @param duty_percent Brightness in percent (0-100)

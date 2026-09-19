@@ -30,58 +30,58 @@ static const char* TAG = "bsp_display";
 /** @brief JD9165 initialization sequence (from Guition demo) */
 static const jd9165_lcd_init_cmd_t jd9165_init_cmds[] = {
     // {command, {data}, data_size, delay_ms}
-    {0x30, {0x00}, 1, 0},
-    {0xF7, {0x49, 0x61, 0x02, 0x00}, 4, 0},
-    {0x30, {0x01}, 1, 0},
-    {0x04, {0x0C}, 1, 0},
-    {0x05, {0x00}, 1, 0},  // HBP adjustment
-    {0x06, {0x00}, 1, 0},  // VBP adjustment
-    {0x0B, {0x11}, 1, 0},  // 2 lanes (0x11), 1 lane would be 0x10
-    {0x17, {0x00}, 1, 0},
-    {0x20, {0x04}, 1, 0},  // Lane select
-    {0x1F, {0x05}, 1, 0},  // HS settle time
-    {0x23, {0x00}, 1, 0},  // Close GAS
-    {0x25, {0x19}, 1, 0},
-    {0x28, {0x18}, 1, 0},
-    {0x29, {0x04}, 1, 0},  // VCOM
-    {0x2A, {0x01}, 1, 0},  // VCOM
-    {0x2B, {0x04}, 1, 0},  // VCOM
-    {0x2C, {0x01}, 1, 0},  // VCOM
-    {0x30, {0x02}, 1, 0},
-    {0x01, {0x22}, 1, 0},
-    {0x03, {0x12}, 1, 0},
-    {0x04, {0x00}, 1, 0},
-    {0x05, {0x64}, 1, 0},
-    {0x0A, {0x08}, 1, 0},
-    {0x0B, {0x0A, 0x1A, 0x0B, 0x0D, 0x0D, 0x11, 0x10, 0x06, 0x08, 0x1F, 0x1D}, 11, 0},
-    {0x0C, {0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D}, 11, 0},
-    {0x0D, {0x16, 0x1B, 0x0B, 0x0D, 0x0D, 0x11, 0x10, 0x07, 0x09, 0x1E, 0x1C}, 11, 0},
-    {0x0E, {0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D}, 11, 0},
-    {0x0F, {0x16, 0x1B, 0x0D, 0x0B, 0x0D, 0x11, 0x10, 0x1C, 0x1E, 0x09, 0x07}, 11, 0},
-    {0x10, {0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D}, 11, 0},
-    {0x11, {0x0A, 0x1A, 0x0D, 0x0B, 0x0D, 0x11, 0x10, 0x1D, 0x1F, 0x08, 0x06}, 11, 0},
-    {0x12, {0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D}, 11, 0},
-    {0x14, {0x00, 0x00, 0x11, 0x11}, 4, 0},  // CKV_OFF timing
-    {0x18, {0x99}, 1, 0},
-    {0x30, {0x06}, 1, 0},
-    {0x12, {0x36, 0x2C, 0x2E, 0x3C, 0x38, 0x35, 0x35, 0x32, 0x2E, 0x1D, 0x2B, 0x21, 0x16, 0x29}, 14, 0},
-    {0x13, {0x36, 0x2C, 0x2E, 0x3C, 0x38, 0x35, 0x35, 0x32, 0x2E, 0x1D, 0x2B, 0x21, 0x16, 0x29}, 14, 0},
-    {0x30, {0x0A}, 1, 0},
-    {0x02, {0x4F}, 1, 0},
-    {0x0B, {0x40}, 1, 0},
-    {0x12, {0x3E}, 1, 0},
-    {0x13, {0x78}, 1, 0},
-    {0x30, {0x0D}, 1, 0},
-    {0x0D, {0x04}, 1, 0},
-    {0x10, {0x0C}, 1, 0},
-    {0x11, {0x0C}, 1, 0},
-    {0x12, {0x0C}, 1, 0},
-    {0x13, {0x0C}, 1, 0},
-    {0x30, {0x00}, 1, 0},
-    {0x11, {0}, 0, 120},  // SLPOUT with 120ms delay
-    {0x29, {0}, 0, 20},   // DISPON with 20ms delay
-    {REGFLAG_END_OF_TABLE, {0}, 0, 0}
+    {0x30, (const uint8_t[]){0x00}, 1, 0},
+    {0xF7, (const uint8_t[]){0x49, 0x61, 0x02, 0x00}, 4, 0},
+    {0x30, (const uint8_t[]){0x01}, 1, 0},
+    {0x04, (const uint8_t[]){0x0C}, 1, 0},
+    {0x05, (const uint8_t[]){0x00}, 1, 0},     // HBP adjustment
+    {0x06, (const uint8_t[]){0x00}, 1, 0},     // VBP adjustment
+    {0x0B, (const uint8_t[]){0x11}, 1, 0},     // 2 lanes (0x11), 1 lane would be 0x10
+    {0x17, (const uint8_t[]){0x00}, 1, 0},
+    {0x20, (const uint8_t[]){0x04}, 1, 0},     // Lane select
+    {0x1F, (const uint8_t[]){0x05}, 1, 0},     // HS settle time
+    {0x23, (const uint8_t[]){0x00}, 1, 0},     // Close GAS
+    {0x25, (const uint8_t[]){0x19}, 1, 0},
+    {0x28, (const uint8_t[]){0x18}, 1, 0},
+    {0x29, (const uint8_t[]){0x04}, 1, 0},     // VCOM
+    {0x2A, (const uint8_t[]){0x01}, 1, 0},     // VCOM
+    {0x2B, (const uint8_t[]){0x04}, 1, 0},     // VCOM
+    {0x2C, (const uint8_t[]){0x01}, 1, 0},     // VCOM
+    {0x30, (const uint8_t[]){0x02}, 1, 0},
+    {0x01, (const uint8_t[]){0x22}, 1, 0},
+    {0x03, (const uint8_t[]){0x12}, 1, 0},
+    {0x04, (const uint8_t[]){0x00}, 1, 0},
+    {0x05, (const uint8_t[]){0x64}, 1, 0},
+    {0x0A, (const uint8_t[]){0x08}, 1, 0},
+    {0x0B, (const uint8_t[]){0x0A, 0x1A, 0x0B, 0x0D, 0x0D, 0x11, 0x10, 0x06, 0x08, 0x1F, 0x1D}, 11, 0},
+    {0x0C, (const uint8_t[]){0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D}, 11, 0},
+    {0x0D, (const uint8_t[]){0x16, 0x1B, 0x0B, 0x0D, 0x0D, 0x11, 0x10, 0x07, 0x09, 0x1E, 0x1C}, 11, 0},
+    {0x0E, (const uint8_t[]){0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D}, 11, 0},
+    {0x0F, (const uint8_t[]){0x16, 0x1B, 0x0D, 0x0B, 0x0D, 0x11, 0x10, 0x1C, 0x1E, 0x09, 0x07}, 11, 0},
+    {0x10, (const uint8_t[]){0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D}, 11, 0},
+    {0x11, (const uint8_t[]){0x0A, 0x1A, 0x0D, 0x0B, 0x0D, 0x11, 0x10, 0x1D, 0x1F, 0x08, 0x06}, 11, 0},
+    {0x12, (const uint8_t[]){0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D}, 11, 0},
+    {0x14, (const uint8_t[]){0x00, 0x00, 0x11, 0x11}, 4, 0}, // CKV_OFF timing
+    {0x18, (const uint8_t[]){0x99}, 1, 0},
+    {0x30, (const uint8_t[]){0x06}, 1, 0},
+    {0x12, (const uint8_t[]){0x36, 0x2C, 0x2E, 0x3C, 0x38, 0x35, 0x35, 0x32, 0x2E, 0x1D, 0x2B, 0x21, 0x16, 0x29}, 14, 0},
+    {0x13, (const uint8_t[]){0x36, 0x2C, 0x2E, 0x3C, 0x38, 0x35, 0x35, 0x32, 0x2E, 0x1D, 0x2B, 0x21, 0x16, 0x29}, 14, 0},
+    {0x30, (const uint8_t[]){0x0A}, 1, 0},
+    {0x02, (const uint8_t[]){0x4F}, 1, 0},
+    {0x0B, (const uint8_t[]){0x40}, 1, 0},
+    {0x12, (const uint8_t[]){0x3E}, 1, 0},
+    {0x13, (const uint8_t[]){0x78}, 1, 0},
+    {0x30, (const uint8_t[]){0x0D}, 1, 0},
+    {0x0D, (const uint8_t[]){0x04}, 1, 0},
+    {0x10, (const uint8_t[]){0x0C}, 1, 0},
+    {0x11, (const uint8_t[]){0x0C}, 1, 0},
+    {0x12, (const uint8_t[]){0x0C}, 1, 0},
+    {0x13, (const uint8_t[]){0x0C}, 1, 0},
+    {0x30, (const uint8_t[]){0x00}, 1, 0},
+    {0x11, (const uint8_t[]){0}, 0, 120},     // SLPOUT with 120ms delay
+    {0x29, (const uint8_t[]){0}, 0, 20},      // DISPON with 20ms delay
 };
+
 
 static lv_display_t* g_disp = NULL;
 static lv_indev_t* g_indev = NULL;
@@ -142,50 +142,42 @@ static esp_err_t bsp_lcd_io_init(esp_lcd_dsi_bus_handle_t mipi_dsi_bus,
 /**
  * @brief Initialize JD9165 panel
  */
-static esp_err_t bsp_lcd_panel_init(esp_lcd_panel_io_handle_t io,
+static esp_err_t bsp_lcd_panel_init(esp_lcd_dsi_bus_handle_t dsi_bus,
+                                     esp_lcd_panel_io_handle_t io,
                                      esp_lcd_panel_handle_t* panel)
 {
-    // MIPI DPI configuration
+    // MIPI DPI configuration (ESP-IDF 6.0.2 API)
     esp_lcd_dpi_panel_config_t dpi_config = {
-        .pixel_clock_hz = BSP_LCD_PIXEL_CLOCK_HZ,
-        .timing = {
-            .pclk_hz = BSP_LCD_PIXEL_CLOCK_HZ,
-            .h_res = BSP_LCD_H_RES,
-            .v_res = BSP_LCD_V_RES,
-            .hsync_pulse_width_cycles = BSP_LCD_H_SYNC,
-            .hback_porch = BSP_LCD_H_BACK_PORCH,
-            .hfront_porch = BSP_LCD_H_FRONT_PORCH,
-            .vsync_pulse_width_lines = BSP_LCD_V_SYNC,
-            .vback_porch = BSP_LCD_V_BACK_PORCH,
-            .vfront_porch = BSP_LCD_V_FRONT_PORCH,
-            .flags = {
-                .hsync_idle_low = false,
-                .vsync_idle_low = false,
-                .de_idle_low = false,
-                .pclk_active_neg = false,
-                .pclk_idle_high = false,
-            },
-        },
+        .dpi_clk_src = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
+        .dpi_clock_freq_mhz = BSP_LCD_PIXEL_CLOCK_HZ / 1000000.0f,
+        .virtual_channel = 0,
+        .in_color_format = LCD_COLOR_FMT_RGB565,
         .num_fbs = BSP_LCD_FRAMEBUFFER_COUNT,
-        .flags.fb_in_psram = true,  // Allocate framebuffers in PSRAM
+        .video_timing = {
+            .h_size = BSP_LCD_H_RES,
+            .v_size = BSP_LCD_V_RES,
+            .hsync_pulse_width = BSP_LCD_H_SYNC,
+            .hsync_back_porch = BSP_LCD_H_BACK_PORCH,
+            .hsync_front_porch = BSP_LCD_H_FRONT_PORCH,
+            .vsync_pulse_width = BSP_LCD_V_SYNC,
+            .vsync_back_porch = BSP_LCD_V_BACK_PORCH,
+            .vsync_front_porch = BSP_LCD_V_FRONT_PORCH,
+        },
     };
 
     // Vendor-specific configuration
     jd9165_vendor_config_t vendor_config = {
         .mipi_config = {
-            .dsi_bus = NULL,  // Will be set by panel driver
+            .dsi_bus = dsi_bus,
             .dpi_config = &dpi_config,
         },
         .init_cmds = jd9165_init_cmds,
         .init_cmds_size = sizeof(jd9165_init_cmds) / sizeof(jd9165_lcd_init_cmd_t),
-        .flags = {
-            .use_mipi_interface = 1,
-        },
     };
 
     esp_lcd_panel_dev_config_t lcd_dev_config = {
         .reset_gpio_num = BSP_LCD_RST_GPIO,
-        .rgb_ele_order = BSP_LCD_COLOR_SPACE,
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
         .bits_per_pixel = BSP_LCD_COLOR_BITS,
         .vendor_config = &vendor_config,
     };
@@ -223,7 +215,7 @@ esp_err_t bsp_display_new(const bsp_display_cfg_t* config,
     ESP_RETURN_ON_ERROR(bsp_enable_dsi_phy_power(), TAG, "DSI PHY power failed");
     ESP_RETURN_ON_ERROR(bsp_dsi_bus_init(&mipi_dsi_bus), TAG, "DSI bus init failed");
     ESP_RETURN_ON_ERROR(bsp_lcd_io_init(mipi_dsi_bus, &io), TAG, "LCD IO init failed");
-    ESP_RETURN_ON_ERROR(bsp_lcd_panel_init(io, &panel), TAG, "LCD panel init failed");
+    ESP_RETURN_ON_ERROR(bsp_lcd_panel_init(mipi_dsi_bus, io, &panel), TAG, "LCD panel init failed");
 
     if (ret_panel) *ret_panel = panel;
     if (ret_io) *ret_io = io;
@@ -269,11 +261,7 @@ esp_err_t bsp_display_backlight_off(void)
     return bsp_backlight_off();
 }
 
-#if LVGL_VERSION_MAJOR >= 9
 static void lvgl_flush_cb(lv_display_t* disp, const lv_area_t* area, uint8_t* px_map)
-#else
-static void lvgl_flush_cb(lv_disp_drv_t* drv, const lv_area_t* area, lv_color_t* px_map)
-#endif
 {
     if (g_panel == NULL) {
         return;
@@ -283,18 +271,12 @@ static void lvgl_flush_cb(lv_disp_drv_t* drv, const lv_area_t* area, lv_color_t*
     int x2 = area->x2;
     int y1 = area->y1;
     int y2 = area->y2;
-    int w = x2 - x1 + 1;
-    int h = y2 - y1 + 1;
 
     // Draw bitmap to display
     esp_lcd_panel_draw_bitmap(g_panel, x1, y1, x2 + 1, y2 + 1, px_map);
 
     // Notify LVGL that flushing is done
-#if LVGL_VERSION_MAJOR >= 9
     lv_display_flush_ready(disp);
-#else
-    lv_disp_flush_ready(drv);
-#endif
 }
 
 lv_display_t* bsp_display_start_with_config(const bsp_display_cfg_t* cfg)
@@ -379,8 +361,6 @@ lv_display_t* bsp_display_start(void)
         .h_res = BSP_LCD_H_RES,
         .v_res = BSP_LCD_V_RES,
         .bits_per_pixel = BSP_LCD_COLOR_BITS,
-        .color_format = BSP_LCD_COLOR_FORMAT,
-        .color_space = BSP_LCD_COLOR_SPACE,
         .double_buffer = BSP_LCD_DRAW_BUFF_DOUBLE,
         .buffer_size = BSP_LCD_DRAW_BUFF_SIZE,
         .flags = {
@@ -393,10 +373,10 @@ lv_display_t* bsp_display_start(void)
     return bsp_display_start_with_config(&default_cfg);
 }
 
-void bsp_display_rotate(lv_display_t* disp, lv_disp_rotation_t rotation)
+void bsp_display_rotate(lv_display_t* disp, lv_display_rotation_t rotation)
 {
     if (disp) {
-        lv_disp_set_rotation(disp, rotation);
+        lv_display_set_rotation(disp, rotation);
     }
 }
 

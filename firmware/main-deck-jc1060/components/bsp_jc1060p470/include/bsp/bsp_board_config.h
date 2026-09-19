@@ -58,8 +58,6 @@ extern "C" {
 
 /** @brief Display color format */
 #define BSP_LCD_COLOR_BITS        (16)            // RGB565
-#define BSP_LCD_COLOR_FORMAT      ESP_LCD_COLOR_FORMAT_RGB565
-#define BSP_LCD_COLOR_SPACE       ESP_LCD_COLOR_SPACE_RGB
 
 /** @brief Buffer configuration */
 #define BSP_LCD_DRAW_BUFF_DOUBLE  (1)             // Double buffering

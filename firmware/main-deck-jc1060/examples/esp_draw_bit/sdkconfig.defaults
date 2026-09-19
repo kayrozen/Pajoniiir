@@ -1,0 +1,24 @@
+# SDK Configuration defaults for JC1060P470C_I_W_Y draw-bit bring-up example
+
+# Target ESP32-P4
+CONFIG_IDF_TARGET="esp32p4"
+
+# Production board uses pre-v3 silicon
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+CONFIG_ESP32P4_REV_MIN_FULL=100
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+
+# 16MB octal PSRAM in HEX mode (needed for the DPI framebuffer ~1.2 MB)
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MODE_HEX=y
+CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_SPIRAM_SIZE_OVERRIDE=16
+
+# Audio codec support (includes ES8311 device in esp_codec_dev)
+CONFIG_CODEC_ES8311_SUPPORT=y
+
+# Log level INFO for bring-up diagnostics
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_DEFAULT_LEVEL=3

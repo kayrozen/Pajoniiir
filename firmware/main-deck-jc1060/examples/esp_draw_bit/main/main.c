@@ -17,8 +17,8 @@
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_err.h"
-#include "esp_lcd_panel_ops.h"
 #include "esp_heap_caps.h"
+#include "esp_lcd_panel_ops.h"
 
 #include "bsp/board.h"
 #include "bsp/display.h"
@@ -37,22 +37,6 @@ static const char* TAG = "draw_bit";
 #define COLOR_MAGENTA   0xF81F
 
 static esp_lcd_panel_handle_t g_panel = NULL;
-static SemaphoreHandle_t g_refresh_sem = NULL;
-
-/**
- * @brief Callback for frame refresh completion
- */
-static bool on_refresh_complete(esp_lcd_panel_handle_t panel, 
-                                 esp_lcd_panel_event_data_t* edata,
-                                 void* user_ctx)
-{
-    SemaphoreHandle_t sem = (SemaphoreHandle_t)user_ctx;
-    BaseType_t need_yield = pdFALSE;
-    
-    xSemaphoreGiveFromISR(sem, &need_yield);
-    return (need_yield == pdTRUE);
-}
-
 /**
  * @brief Fill rectangle with color
  */
@@ -237,10 +221,6 @@ void app_main(void)
     // Turn on backlight
     bsp_display_backlight_on();
     ESP_LOGI(TAG, "Backlight on");
-
-    // Create semaphore for refresh sync
-    g_refresh_sem = xSemaphoreCreateBinary();
-    xSemaphoreGive(g_refresh_sem);
 
     // Main test loop
     int test_pattern = 0;

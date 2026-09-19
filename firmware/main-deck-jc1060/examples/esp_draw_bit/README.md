@@ -13,11 +13,38 @@ Test application for validating hardware bring-up of the Guition JC1060P470C_I_W
 
 ## Building
 
+Prérequis : **ESP-IDF v6.0.2** est obligatoire (les composants managés pinent
+`idf: >=6.0` et le code utilise l'API `esp_lcd_mipi_dsi.h` d'IDF 6.x).
+
+Sous Linux/macOS (recommandé, via le conteneur officiel) :
+
 ```bash
 cd firmware/main-deck-jc1060/examples/esp_draw_bit
+rm -rf build sdkconfig sdkconfig.old managed_components   # une seule fois
+docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp \
+  -v "$(git rev-parse --show-toplevel):/host" -w /host/firmware/main-deck-jc1060/examples/esp_draw_bit \
+  espressif/idf:v6.0.2 bash -lc 'source /opt/esp/idf/export.sh >/dev/null \
+    && idf.py set-target esp32p4 && idf.py build'
+```
+
+Sous Windows, avec le profil ESP-IDF 6.0.2 :
+
+```powershell
+. C:\Espressif\tools\Microsoft.v6.0.2.PowerShell_profile.ps1
+$repoRoot = git rev-parse --show-toplevel
+Set-Location "$repoRoot\firmware\main-deck-jc1060\examples\esp_draw_bit"
 idf.py set-target esp32p4
 idf.py build
 ```
+
+Notes :
+
+- `sdkconfig.defaults` configure le target ESP32-P4, le PSRAM octal 16MB (HEX)
+  nécessaire au framebuffer DPI (1024×600 RGB565 ≈ 1,2 Mo) et le support
+  codec ES8311.
+- LVGL 9 est fourni via le composant managé `lvgl/lvgl ^9` (le `sdkconfig`
+  résultat le rapporte en `CONFIG_LVGL_VERSION_MAJOR=9`). Ne pas réactiver les
+  options LVGL8 (`CONFIG_LVGL_VERSION_8`) : elles sont obsolètes.
 
 ## Flashing
 

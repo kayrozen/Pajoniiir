@@ -19,9 +19,8 @@ static const char* TAG = "bsp_board";
 #define BACKLIGHT_FREQ_HZ      (5000)
 #define BACKLIGHT_DUTY_MAX     (1023)
 
-/** @brief Software I2C handles */
-static i2c_master_bus_handle_t g_i2c_touch_handle = NULL;
-static i2c_master_bus_handle_t g_i2c_audio_handle = NULL;
+/** @brief Shared software-I2C master bus (touch + audio codec) */
+static i2c_master_bus_handle_t g_i2c_shared_handle = NULL;
 
 static bool g_board_initialized = false;
 
@@ -71,11 +70,11 @@ esp_err_t bsp_board_init(void)
 #if BSP_USE_SW_I2C_FOR_TOUCH
     ESP_LOGI(TAG, "Initializing software I2C for touch on GPIO%d/%d", 
              BSP_I2C_SW_SDA_GPIO, BSP_I2C_SW_SCL_GPIO);
-    ESP_ERROR_CHECK(bsp_i2c_init_sw(BSP_TOUCH_I2C_PORT, 
-                                     BSP_I2C_SW_SDA_GPIO, 
+    ESP_ERROR_CHECK(bsp_i2c_init_sw(BSP_TOUCH_I2C_PORT,
+                                     BSP_I2C_SW_SDA_GPIO,
                                      BSP_I2C_SW_SCL_GPIO,
                                      BSP_TOUCH_I2C_CLK_SPEED_HZ,
-                                     &g_i2c_touch_handle));
+                                     &g_i2c_shared_handle));
 #else
     // Hardware I2C (will conflict with I2S LRCK)
     ESP_LOGW(TAG, "Using hardware I2C - potential GPIO12 conflict!");
@@ -83,11 +82,8 @@ esp_err_t bsp_board_init(void)
 
     // Initialize software I2C for audio codec
 #if BSP_USE_SW_I2C_FOR_AUDIO
-    ESP_LOGI(TAG, "Initializing software I2C for audio on GPIO%d/%d",
-             BSP_I2C_SW_SDA_GPIO, BSP_I2C_SW_SCL_GPIO);
-    // Note: Could use same bus as touch if devices have different addresses
-    // For now, using same bus (GT911=0x5D, ES8311=0x18)
-    g_i2c_audio_handle = g_i2c_touch_handle;
+    // The audio codec shares the software-I2C bus used by touch.
+    ESP_LOGI(TAG, "Audio codec will share software I2C bus (GT911=0x5D, ES8311=0x18)");
 #endif
 
     // Configure UART TX/RX pins for control link (done in control_link component)
@@ -140,11 +136,10 @@ esp_err_t bsp_board_deinit(void)
     bsp_backlight_off();
 
     // Deinitialize I2C
-    if (g_i2c_touch_handle != NULL) {
-        bsp_i2c_deinit(g_i2c_touch_handle);
-        g_i2c_touch_handle = NULL;
+    if (g_i2c_shared_handle != NULL) {
+        bsp_i2c_deinit(g_i2c_shared_handle);
+        g_i2c_shared_handle = NULL;
     }
-    g_i2c_audio_handle = NULL;
 
     // Reset GPIOs
     gpio_reset_pin(BSP_LCD_BL_GPIO);
@@ -173,7 +168,6 @@ esp_err_t bsp_i2c_init_sw(i2c_port_t port, int sda_gpio, int scl_gpio,
         .i2c_port = port,
         .scl_io_num = scl_gpio,
         .sda_io_num = sda_gpio,
-        .clk_speed_hz = clk_speed_hz,
         .glitch_ignore_cnt = 7,
         .flags.enable_internal_pullup = true,
     };
@@ -227,4 +221,9 @@ const char* bsp_board_get_revision(void)
 {
     // TODO: Read from EEPROM or GPIO strapping if available
     return "1.0";
+}
+
+i2c_master_bus_handle_t bsp_i2c_get_shared(void)
+{
+    return g_i2c_shared_handle;
 }

@@ -6,9 +6,10 @@
 #pragma once
 
 #include "esp_err.h"
-#include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_mipi_dsi.h"
+#include "esp_lcd_types.h"
 #include "driver/gpio.h"
+#include "lvgl.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -21,8 +22,6 @@ typedef struct {
     uint32_t h_res;                  ///< Horizontal resolution
     uint32_t v_res;                  ///< Vertical resolution
     uint8_t bits_per_pixel;          ///< Color depth (16 for RGB565)
-    esp_lcd_color_format_t color_format;
-    esp_lcd_color_space_t color_space;
     bool double_buffer;              ///< Enable double buffering
     uint32_t buffer_size;            ///< Draw buffer size in pixels
     struct {
@@ -114,7 +113,7 @@ esp_err_t bsp_display_backlight_off(void);
  * @param disp LVGL display handle
  * @param rotation Rotation angle (0, 90, 180, 270)
  */
-void bsp_display_rotate(lv_display_t* disp, lv_disp_rotation_t rotation);
+void bsp_display_rotate(lv_display_t* disp, lv_display_rotation_t rotation);
 
 /**
  * @brief Lock LVGL display for rendering

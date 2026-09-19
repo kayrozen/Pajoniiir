@@ -314,4 +314,4 @@ En cas de problème bloquant :
 
 ---
 
-**Statut Phase 1** : ✅ **Terminée** - Prêt pour test hardware
+**Statut Phase 1** : 🔶 **Logiciel prêt** - Build ESP-IDF 6.0.2 validé (example `esp_draw_bit`), en attente du flash et de la validation physique (patterns, tactile, audio).
