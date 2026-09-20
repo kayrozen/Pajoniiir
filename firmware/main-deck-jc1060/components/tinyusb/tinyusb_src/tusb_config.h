@@ -33,7 +33,7 @@ extern "C" {
 #define CFG_TUH_AUDIO_MAX_AS        4
 #define CFG_TUH_AUDIO_EPIN_BUFSIZE  512
 #define CFG_TUH_AUDIO_EPOUT_BUFSIZE 1024
-#define CFG_TUH_AUDIO_STREAM_BUFSIZE (48 * 1024)  /* ~27 ms at 4ch 24-bit 44.1k */
+#define CFG_TUH_AUDIO_STREAM_BUFSIZE (32 * 1024)  /* 32768 = hard limit of tu_fifo (depth > 0x8000 fails); ~61 ms at 4ch/24-bit 44.1k */
 
 #define CFG_TUH_MIDI              1
 #define CFG_TUH_MIDI_MAX          1

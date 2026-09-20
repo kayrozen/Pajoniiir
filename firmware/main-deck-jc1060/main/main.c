@@ -16,6 +16,7 @@
 
 #include "bsp/board.h"
 #include "bsp/display.h"
+#include "log_screen.h"
 #include "bsp/touch.h"
 #include "bsp/audio.h"
 #include "bsp/sd.h"
@@ -54,6 +55,10 @@ void app_main(void)
         ESP_LOGE(TAG, "Display init failed");
     }
 
+    /* On-screen verbose log (teed, console keeps working). */
+    log_screen_start();
+    ESP_LOGI(TAG, "log screen test line");
+
     esp_lcd_touch_handle_t tp = bsp_touch_start();
     ESP_LOGI(TAG, "Touch %s", tp != NULL ? "initialized" : "unavailable");
 
@@ -84,6 +89,8 @@ void app_main(void)
     if (!wifi_console_start()) {
         ESP_LOGW(TAG, "Wi-Fi console not available");
     }
+    /* The Wi-Fi console installs its own log vprintf and drops ours - rehook. */
+    log_screen_rehook();
     ota_update_start();
 
     /* SD card (music library). */
@@ -100,8 +107,10 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Bring-up complete - entering UI loop");
 
-    /* UI loop placeholder: full LVGL deck UI replaces this. */
+    /* UI loop placeholder: log screen refreshes here (full deck UI replaces
+     * this). Rendering itself is done by esp_lvgl_port's task. */
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        log_screen_task();
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
 }

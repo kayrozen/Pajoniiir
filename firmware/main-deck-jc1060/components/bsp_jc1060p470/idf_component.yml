@@ -7,6 +7,9 @@ dependencies:
   lvgl/lvgl:
     version: "^9.0.0"
     public: true
+  espressif/esp_lvgl_port:
+    version: "^2"
+    public: true
   espressif/esp_lcd_jd9165:
     version: "2.0.2"
     public: true

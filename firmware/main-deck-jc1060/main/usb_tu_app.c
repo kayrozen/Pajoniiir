@@ -34,10 +34,14 @@ static uint8_t s_audio_idx = TUSB_INDEX_INVALID_8;
 static uint8_t s_spk_stream = TUSB_INDEX_INVALID_8;
 static uint8_t s_midi_idx = TUSB_INDEX_INVALID_8;
 static volatile bool s_audio_streaming;
+static volatile uint32_t s_pb_cb_count;   /* completed playback transfers */
+static volatile uint32_t s_pb_bytes;      /* playback bytes submitted */
+static volatile uint32_t s_frame_bytes;   /* active frame size: 8 (S16) / 12 (S24_3) */
 
 static void audio_try_start(void);
+static void tuh_task_loop(void *arg);
 
-static uint8_t s_frame_scratch[48 * 12]; /* up to 48 frames of 4ch x 3B */
+static uint8_t s_frame_scratch[96 * 12]; /* up to 96 frames of 4ch x 3B */
 
 /* ------------------------------------------------------------------ */
 /* MIDI callbacks                                                      */
@@ -126,11 +130,20 @@ bool tuh_audio_control_done_cb(uint8_t idx, uint8_t stream_idx,
     return true;
 }
 
-void tuh_audio_stream_done_cb(uint8_t idx, uint8_t stream_idx,
-                              tuh_audio_event_t event, uint32_t xferred_bytes)
+void tuh_audio_playback_cb(uint8_t idx, uint8_t stream_idx, uint16_t xferred_bytes)
 {
-    ESP_LOGI(TU_TAG, "stream event: idx=%u stream=%u event=%d bytes=%lu",
-             idx, stream_idx, event, (unsigned long)xferred_bytes);
+    s_pb_cb_count++;
+    s_pb_bytes += xferred_bytes;
+}
+
+void tuh_audio_event_cb(uint8_t idx, uint8_t stream_idx,
+                        tuh_audio_event_t event, tusb_xfer_result_t result)
+{
+    ESP_LOGI(TU_TAG, "audio event: idx=%u stream=%u event=%d result=%d",
+             idx, stream_idx, (int)event, (int)result);
+    if (event == TUH_AUDIO_EVENT_START_COMPLETE && result != XFER_RESULT_SUCCESS) {
+        s_audio_streaming = false;
+    }
 }
 
 #endif /* CFG_TUH_AUDIO */
@@ -142,7 +155,7 @@ void tuh_audio_stream_done_cb(uint8_t idx, uint8_t stream_idx,
 #if CFG_TUH_AUDIO
 static void tone_writer_task(void *arg)
 {
-    /* 1 s sine table at 44.1 kHz, amplitude -12 dBFS, 24-bit. */
+    /* 1 s sine table at 44.1 kHz, amplitude -12 dBFS. */
     const size_t N = 44100;
     int32_t *tbl = heap_caps_malloc(N * sizeof(int32_t), MALLOC_CAP_8BIT);
     if (tbl == NULL) {
@@ -159,7 +172,7 @@ static void tone_writer_task(void *arg)
     uint32_t stats_cb = 0;
     uint32_t stats_written = 0;
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(2));
+        vTaskDelay(pdMS_TO_TICKS(1));
         if (s_audio_idx == TUSB_INDEX_INVALID_8 || s_spk_stream == TUSB_INDEX_INVALID_8) {
             continue;
         }
@@ -167,33 +180,53 @@ static void tone_writer_task(void *arg)
             audio_try_start();
             continue;
         }
-        uint32_t avail = tuh_audio_write_available(s_audio_idx, s_spk_stream);
-        if (avail == 0) {
+        const uint32_t fb = s_frame_bytes;   /* 8 (S16) or 12 (S24_3), 4 ch */
+        if (fb == 0) {
             continue;
         }
-        /* Write whole 4ch 24-bit frames. Frame = 12 bytes: encode on the fly. */
-        uint32_t frames = avail / 12;
+        uint32_t avail = tuh_audio_write_available(s_audio_idx, s_spk_stream);
+        if (avail == 0) {
+            /* FIFO full: driver is consuming - healthy. If the stream is not
+             * actually active, log it once per second so we can see it. */
+            if ((stats_cb % 1000) == 0) {
+                ESP_LOGW(TU_TAG, "tone: avail=0, wrote_total=%lu pb_cbs=%lu",
+                         (unsigned long)stats_written, (unsigned long)s_pb_cb_count);
+            }
+            stats_cb++;
+            continue;
+        }
+        /* avail is already in whole frames (write_available divides by
+         * frame_bytes) - do not divide again. */
+        uint32_t frames = avail;
         if (frames == 0) {
             continue;
         }
-        if (frames > 48) {
-            frames = 48;
+        if (frames > 96) {
+            frames = 96;
         }
         uint8_t *frame_buf = s_frame_scratch;
         for (uint32_t f = 0; f < frames; f++) {
             int32_t v = tbl[pos];
             pos = (pos + 1) % N;
-            uint8_t *p = frame_buf + f * 12;
-            for (int c = 0; c < 4; c++) {
-                p[c * 3 + 0] = (uint8_t)(v & 0xFF);
-                p[c * 3 + 1] = (uint8_t)((v >> 8) & 0xFF);
-                p[c * 3 + 2] = (uint8_t)((v >> 16) & 0xFF);
+            uint8_t *p = frame_buf + f * fb;
+            if (fb == 8) {
+                int16_t s = (int16_t)(v >> 8);
+                for (int c = 0; c < 4; c++) {
+                    p[c * 2 + 0] = (uint8_t)(s & 0xFF);
+                    p[c * 2 + 1] = (uint8_t)((s >> 8) & 0xFF);
+                }
+            } else {
+                for (int c = 0; c < 4; c++) {
+                    p[c * 3 + 0] = (uint8_t)(v & 0xFF);
+                    p[c * 3 + 1] = (uint8_t)((v >> 8) & 0xFF);
+                    p[c * 3 + 2] = (uint8_t)((v >> 16) & 0xFF);
+                }
             }
         }
         uint32_t wrote = tuh_audio_write(s_audio_idx, s_spk_stream, frame_buf, frames);
         stats_written += wrote;
         stats_cb++;
-        if ((stats_cb % 100) == 0) {
+        if ((stats_cb % 1000) == 0) {
             ESP_LOGI(TU_TAG, "tone: wrote=%lu frames total", (unsigned long)stats_written);
         }
         midi_poll();
@@ -260,12 +293,22 @@ esp_err_t usb_tu_start(void)
     }
 #endif
 
-    /* tuh task */
-    if (xTaskCreate((TaskFunction_t)tuh_task, "tuh_task", 4096, NULL, 5,
+    /* tuh task: tuh_task() processes pending events and RETURNS - it must
+     * be wrapped in an infinite loop (FreeRTOS aborts returning tasks). */
+    if (xTaskCreate(tuh_task_loop, "tuh_task", 4096, NULL, 5,
                     &s_tuh_task) != pdPASS) {
         return ESP_FAIL;
     }
     return ESP_OK;
+}
+
+static void tuh_task_loop(void *arg)
+{
+    (void)arg;
+    while (1) {
+        tuh_task();
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -287,11 +330,13 @@ static void audio_try_start(void)
         if (!tuh_audio_config_get(s_audio_idx, s_spk_stream, c, &cfg)) {
             continue;
         }
-        ESP_LOGI(TU_TAG, "config %u: %lu Hz %u ch", c,
-                 (unsigned long)cfg.sample_rate, cfg.channels);
-        if (cfg.sample_rate == 44100 && cfg.channels == 4) {
+        ESP_LOGI(TU_TAG, "config %u: %lu Hz %u ch fmt=%d", c,
+                 (unsigned long)cfg.sample_rate, cfg.channels, (int)cfg.format);
+        if (cfg.sample_rate == 44100 && cfg.channels == 4 &&
+            cfg.format == TUH_AUDIO_FORMAT_S16_LE) {
             if (tuh_audio_configure(s_audio_idx, s_spk_stream, c)) {
-                ESP_LOGI(TU_TAG, "configured 44.1 kHz 4ch, starting stream");
+                s_frame_bytes = 4u * tuh_audio_format_bytes(cfg.format);
+                ESP_LOGI(TU_TAG, "configured 44.1 kHz 4ch fmt=%d, starting stream", (int)cfg.format);
                 if (tuh_audio_start(s_audio_idx, s_spk_stream)) {
                     s_audio_streaming = true;
                     ESP_LOGI(TU_TAG, ">>> Audio streaming started (tone 440 Hz)");

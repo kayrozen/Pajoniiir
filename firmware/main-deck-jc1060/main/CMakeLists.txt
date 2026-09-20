@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.c" "usb_tu_app.c" "eth_bringup.c" "wifi_console.c" "ota_update.c"
+idf_component_register(SRCS "main.c" "usb_tu_app.c" "eth_bringup.c" "wifi_console.c" "ota_update.c" "log_screen.c"
                     INCLUDE_DIRS "."
                     REQUIRES
                         bsp_jc1060p470

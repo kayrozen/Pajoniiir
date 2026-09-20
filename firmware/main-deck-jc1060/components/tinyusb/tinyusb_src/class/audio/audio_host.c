@@ -102,6 +102,7 @@
 // clang-format on
 
 #include "tusb_option.h"
+#include "esp_log.h"
 
 #if (CFG_TUH_ENABLED && CFG_TUH_AUDIO)
 
@@ -583,12 +584,28 @@ static bool audioh_stream_playback_xfer(tuh_audio_stream_t *s) {
   }
 
   const uint16_t bytes = (uint16_t)(frames * s->frame_bytes);
+  {
+    static uint32_t diag;
+    if ((diag++ % 500) == 0) {
+      ESP_LOGI("audioh", "poll: ff=%p interval_frames=%lu bytes=%u fifo_count=%lu frame_bytes=%u",
+               (void *)&s->edpt.ff, (unsigned long)frames, (unsigned)bytes,
+               (unsigned long)tu_fifo_count(&s->edpt.ff), s->frame_bytes);
+    }
+  }
   if (tu_fifo_count(&s->edpt.ff) < bytes) {
     // Isochronous OUT must continue at every interval. Send silence until a
     // complete packet is queued, leaving any partial packet in the FIFO.
     tu_memclr(s->edpt.ep_buf, bytes);
   } else {
     tu_fifo_read_n(&s->edpt.ff, s->edpt.ep_buf, bytes);
+    /* One-shot dump of the first real packet contents (debug tone path). */
+    static bool dumped;
+    if (!dumped && bytes > 0) {
+      dumped = true;
+      ESP_LOGI("audioh", "first OUT packet: %u bytes, head:",
+               (unsigned)bytes);
+      ESP_LOG_BUFFER_HEX("audioh", s->edpt.ep_buf, bytes > 32 ? 32 : bytes);
+    }
   }
 
   if (!usbh_edpt_xfer(s->daddr, as->ep_addr, s->edpt.ep_buf, bytes)) {
@@ -2249,8 +2266,24 @@ uint32_t tuh_audio_write_available(uint8_t dev_idx, uint8_t stream_idx) {
   TU_VERIFY(p_audio->daddr != 0, 0);
 
   tuh_audio_stream_t *s = audioh_get_stream_by_idx(p_audio, stream_idx);
-  TU_VERIFY(s && s->dir == TUSB_DIR_OUT, 0);
-  TU_VERIFY(s->state == STREAM_STATE_READY && s->running, 0);
+  if (!(s && s->dir == TUSB_DIR_OUT)) {
+    ESP_LOGW("audioh", "write_avail: stream %u not OUT (s=%p)", stream_idx, (void*)s);
+    return 0;
+  }
+  if (!(s->state == STREAM_STATE_READY && s->running)) {
+    static uint32_t diag;
+    if ((diag++ % 2000) == 0) {
+      ESP_LOGW("audioh", "write_avail: stream %u state=%d running=%d",
+               stream_idx, (int)s->state, (int)s->running);
+    }
+    return 0;
+  }
+  static uint32_t diag2;
+  if ((diag2++ % 2000) == 0) {
+    ESP_LOGI("audioh", "write_avail: ff=%p count=%lu remaining=%lu fb=%u",
+             (void *)&s->edpt.ff, (unsigned long)tu_fifo_count(&s->edpt.ff),
+             (unsigned long)tu_fifo_remaining(&s->edpt.ff), s->frame_bytes);
+  }
   return tu_edpt_stream_write_available(&s->edpt) / s->frame_bytes;
 }
 

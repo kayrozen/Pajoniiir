@@ -19,6 +19,7 @@
 #include "esp_ldo_regulator.h"
 #include "esp_private/esp_clk.h"
 #include "esp_heap_caps.h"
+#include "esp_lvgl_port.h"
 
 #if LVGL_VERSION_MAJOR >= 9
 #include "lvgl.h"
@@ -162,7 +163,7 @@ static esp_err_t bsp_lcd_panel_init(esp_lcd_dsi_bus_handle_t dsi_bus,
         .dpi_clk_src = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
         .dpi_clock_freq_mhz = BSP_LCD_PIXEL_CLOCK_HZ / 1000000.0f,
         .virtual_channel = 0,
-        .in_color_format = LCD_COLOR_FMT_RGB888,  // Factory demo: PIXEL_RGB888 / COLOR_FORMAT_RGB888
+        .in_color_format = LCD_COLOR_FMT_RGB565,  /* JD9165 flush path is RGB565 (vendor baseline) */
         .num_fbs = BSP_LCD_FRAMEBUFFER_COUNT,
         .video_timing = {
             .h_size = BSP_LCD_H_RES,
@@ -188,7 +189,7 @@ static esp_err_t bsp_lcd_panel_init(esp_lcd_dsi_bus_handle_t dsi_bus,
 
     esp_lcd_panel_dev_config_t lcd_dev_config = {
         .reset_gpio_num = BSP_LCD_RST_GPIO,
-        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR,
         .bits_per_pixel = BSP_LCD_COLOR_BITS,
         .vendor_config = &vendor_config,
     };
@@ -310,59 +311,47 @@ lv_display_t* bsp_display_start_with_config(const bsp_display_cfg_t* cfg)
 
     g_panel = lcd_handles.panel;
 
-    // Initialize LVGL
-    lv_init();
+    /* esp_lvgl_port: validated LVGL driver task (matches the Guition demo).
+     * It owns lv_init, the task, timer handling and locks. */
+    lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
+    port_cfg.task_priority = 4;
+    port_cfg.task_stack = 8192;
+    port_cfg.task_affinity = -1;
+    port_cfg.timer_period_ms = 10;
+    ESP_ERROR_CHECK(lvgl_port_init(&port_cfg));
 
-    // Create LVGL display
-    g_disp = lv_display_create(cfg->h_res, cfg->v_res);
+    lvgl_port_display_cfg_t lvgl_disp_cfg = {
+        .panel_handle = g_panel,
+        .buffer_size = cfg->buffer_size,
+        .double_buffer = cfg->double_buffer,
+        .hres = cfg->h_res,
+        .vres = cfg->v_res,
+        .monochrome = false,
+        .color_format = LV_COLOR_FORMAT_RGB565,
+        .rotation = {
+            .swap_xy = false,
+            .mirror_x = false,
+            .mirror_y = false,
+        },
+        .flags = {
+            .buff_dma = cfg->flags.buff_dma,
+            .buff_spiram = cfg->flags.buff_spiram,
+            .sw_rotate = cfg->flags.sw_rotate,
+            .swap_bytes = false,  /* vendor baseline: no byte swap */
+        },
+    };
+    lvgl_port_display_dsi_cfg_t dsi_cfg = {
+        .flags = {
+            .avoid_tearing = false,
+        },
+    };
+    g_disp = lvgl_port_add_disp_dsi(&lvgl_disp_cfg, &dsi_cfg);
     if (g_disp == NULL) {
-        ESP_LOGE(TAG, "Failed to create LVGL display");
+        ESP_LOGE(TAG, "Failed to register LVGL display");
         return NULL;
     }
 
-    // Allocate draw buffers
-    void* buf1 = NULL;
-    void* buf2 = cfg->double_buffer ? NULL : NULL;
-    size_t buffer_bytes = cfg->buffer_size * sizeof(lv_color_t);
-
-    uint32_t caps = MALLOC_CAP_SPIRAM;
-    if (cfg->flags.buff_dma) {
-        caps |= MALLOC_CAP_DMA;
-    }
-
-    buf1 = heap_caps_malloc(buffer_bytes, caps);
-    if (buf1 == NULL) {
-        ESP_LOGW(TAG, "Failed to allocate buffer in SPIRAM, trying DMA");
-        buf1 = heap_caps_malloc(buffer_bytes, MALLOC_CAP_DMA);
-    }
-    if (buf1 == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate draw buffer");
-        lv_display_delete(g_disp);
-        return NULL;
-    }
-
-    ESP_LOGI(TAG, "Draw buffer allocated: %d bytes @ %p", buffer_bytes, buf1);
-
-    if (cfg->double_buffer) {
-        buf2 = heap_caps_malloc(buffer_bytes, caps);
-        if (buf2 == NULL) {
-            ESP_LOGW(TAG, "Double buffer allocation failed, using single buffer");
-        }
-    }
-
-    lv_display_set_buffers(g_disp, buf1, buf2, buffer_bytes,
-                           cfg->double_buffer && buf2 ? 
-                               LV_DISPLAY_RENDER_MODE_FULL : 
-                               LV_DISPLAY_RENDER_MODE_PARTIAL);
-
-    lv_display_set_flush_cb(g_disp, lvgl_flush_cb);
-    lv_display_set_user_data(g_disp, g_panel);
-
-    // No rotation needed (native landscape)
-    // lv_display_set_rotation(g_disp, LV_DISPLAY_ROTATION_0);
-
-    ESP_LOGI(TAG, "LVGL display initialized");
-
+    ESP_LOGI(TAG, "LVGL display initialized (esp_lvgl_port)");
     return g_disp;
 }
 
@@ -393,14 +382,12 @@ void bsp_display_rotate(lv_display_t* disp, lv_display_rotation_t rotation)
 
 bool bsp_display_lock(uint32_t timeout_ms)
 {
-    // LVGL thread safety (if using mutex)
-    // For now, assume single-threaded LVGL
-    return true;
+    return lvgl_port_lock(timeout_ms);
 }
 
 void bsp_display_unlock(void)
 {
-    // No-op for now
+    lvgl_port_unlock();
 }
 
 lv_indev_t* bsp_display_get_input_dev(void)

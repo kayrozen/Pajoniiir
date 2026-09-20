@@ -57,7 +57,7 @@ extern "C" {
 #define BSP_LCD_TE_GPIO           (GPIO_NUM_NC)   // Tearing Effect signal (not connected)
 
 /** @brief Display color format */
-#define BSP_LCD_COLOR_BITS        (24)            // RGB888 - JD9165 factory config (COLOR_FORMAT_RGB888)
+#define BSP_LCD_COLOR_BITS        (16)            // RGB565 - vendor LVGL9 baseline (guition-esp32p4-lvgl9)
 
 /** @brief Buffer configuration */
 #define BSP_LCD_DRAW_BUFF_DOUBLE  (1)             // Double buffering

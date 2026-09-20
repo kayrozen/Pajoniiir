@@ -16,6 +16,7 @@ idf_component_register(
         esp_lcd_touch_gt911
         esp_codec_dev
         lvgl
+        esp_lvgl_port
         esp_timer
         heap
         esp_driver_i2s
