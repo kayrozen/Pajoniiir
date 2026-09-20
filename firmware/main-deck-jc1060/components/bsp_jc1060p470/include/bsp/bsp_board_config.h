@@ -35,15 +35,16 @@ extern "C" {
 
 /** @brief MIPI-DSI configuration */
 #define BSP_LCD_MIPI_DSI_LANE_NUM        (2)           // 2 data lanes
-#define BSP_LCD_MIPI_DSI_LANE_BITRATE_MBPS (1000)      // 1.0 Gbps per lane (proven value for this panel)
-#define BSP_LCD_PIXEL_CLOCK_HZ           (51200000)    // 51.2 MHz
+#define BSP_LCD_MIPI_DSI_LANE_BITRATE_MBPS (750)      // v69: 750 Mbps = ESPHome/EspControl V1 proven value
+#define BSP_LCD_PIXEL_CLOCK_HZ           (54000000)    // v69: 54 MHz = ESPHome/EspControl V1
 
 /** @brief Display timing parameters (from JD9165 datasheet) */
-#define BSP_LCD_H_SYNC            (24)     // HSYNC pulse width
-#define BSP_LCD_H_BACK_PORCH      (136)    // Horizontal back porch
+// v69: timings from ESPHome mipi_dsi model JC1060P470 (V1)
+#define BSP_LCD_H_SYNC            (40)     // HSYNC pulse width (was 24)
+#define BSP_LCD_H_BACK_PORCH      (160)    // Horizontal back porch (was 136)
 #define BSP_LCD_H_FRONT_PORCH     (160)    // Horizontal front porch
-#define BSP_LCD_V_SYNC            (2)      // VSYNC pulse width
-#define BSP_LCD_V_BACK_PORCH      (21)     // Vertical back porch
+#define BSP_LCD_V_SYNC            (10)     // VSYNC pulse width (was 2)
+#define BSP_LCD_V_BACK_PORCH      (23)     // Vertical back porch (was 21)
 #define BSP_LCD_V_FRONT_PORCH     (12)     // Vertical front porch
 
 /** @brief Total frame timing (for refresh rate calculation) */
@@ -57,7 +58,7 @@ extern "C" {
 #define BSP_LCD_TE_GPIO           (GPIO_NUM_NC)   // Tearing Effect signal (not connected)
 
 /** @brief Display color format */
-#define BSP_LCD_COLOR_BITS        (16)            // RGB565 - vendor LVGL9 baseline (guition-esp32p4-lvgl9)
+#define BSP_LCD_COLOR_BITS        (24)            /* RGB888 - panel input is 24-bit; proven correct in examples/esp_draw_bit (LV_COLOR_DEPTH 16 + bits_per_pixel 24 gave right colors). RGB565 produced magenta text. */
 
 /** @brief Buffer configuration */
 #define BSP_LCD_DRAW_BUFF_DOUBLE  (1)             // Double buffering

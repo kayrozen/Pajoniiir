@@ -26,7 +26,35 @@ pas ré-armé dans sa fenêtre SOF → paquet iso perdu SANS aucune trace
 côté host (pas d'erreur, complétions suivantes stables — cohérent avec
 l'instrumentation qui ne voit rien).
 
-## FIX TROUVÉ (v57) : flush par 2D-DMA
+### FIX COULEURS (v69) + état Wi-Fi (v71)
+
+**Couleurs CORRECTES depuis v69.** Chaîne de corrections :
+- Table d'init vendor = déjà correcte (identique à la table ESPHome
+  `JC1060P470` V1 — vérifié ligne à ligne contre
+  espcontrol/components/mipi_dsi/models/guition.py)
+- Timings ESPHome appliqués (v69) : HSYNC 40/160/160, VSYNC 10/23/12,
+  pclk 54 MHz, lane 750 Mbps
+- **Le fix décisif : `esp_lcd_panel_invert_color(panel, false)` = INVOFF
+  explicite.** Le panel sort de reset en mode bit-inversé (rouge→cyan,
+  vert→magenta, bleu→jaune : prouvé par le test de couleurs primaires
+  v68). ESPHome envoie INVOFF après sa table ; le driver espressif
+  esp_lcd_jd9165 ne le fait pas automatiquement.
+- RGB888 (v66/v67) : fausse piste — noir/corrompu, le panel reste en 565.
+- rgb_ele_order = RGB (v57) : appliqué et conservé.
+
+**Wi-Fi : TOUJOURS EN ÉCHEC (reasons 203/205), LAISSÉ DE CÔTÉ (v71).**
+- C6 mis à jour 2.3.0 → 2.12.12 via recovery EspControl (l'outil
+  github.com/lboshuizen/crowpanel-p4-c6-sdio-ota a échoué de notre côté :
+  RPC 0x110 timeout — la procédure browser EspControl a fonctionné).
+- Host esp_hosted 2.12.0 (IDF 6.0.2) vs C6 2.12.12 : versions quasi
+  alignées, transport sain (plus de drops), mais ASSOC_FAIL persiste.
+- v71 : SDIO ramené à 20 MHz (réglage EspControl V1 pour cette board
+  exacte) — sans changement.
+- Hypothèses restantes : authmode/WPA3 de la box, country code/canal,
+  ou autre différence de stack entre EspControl (ESPHome/ESP-IDF 5.5.x)
+  et notre IDF 6.0.2.
+- État v71 : couleurs ✓, son ✓ (audio USB iso propre), Wi-Fi ✗.
+
 
 `esp_lcd_dpi_panel_enable_dma2d(panel)` (chemin `use_dma2d=true` de la
 démo fabricant / config standard ESPHome) remplace le memcpy CPU par un

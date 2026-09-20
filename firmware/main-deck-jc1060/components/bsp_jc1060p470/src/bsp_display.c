@@ -163,7 +163,7 @@ static esp_err_t bsp_lcd_panel_init(esp_lcd_dsi_bus_handle_t dsi_bus,
         .dpi_clk_src = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
         .dpi_clock_freq_mhz = BSP_LCD_PIXEL_CLOCK_HZ / 1000000.0f,
         .virtual_channel = 0,
-        .in_color_format = LCD_COLOR_FMT_RGB565,  /* JD9165 flush path is RGB565 (vendor baseline) */
+        .in_color_format = LCD_COLOR_FMT_RGB565,  /* v68: back to RGB565 - panel COLMOD is 0x55 (565) per vendor init; RGB888 gave black/corrupt screen */
         .num_fbs = BSP_LCD_FRAMEBUFFER_COUNT,
         .video_timing = {
             .h_size = BSP_LCD_H_RES,
@@ -219,6 +219,12 @@ static esp_err_t bsp_lcd_panel_init(esp_lcd_dsi_bus_handle_t dsi_bus,
      * (power draw too high on this supply) and did not fully fix the
      * colors. Proper fix = correct vendor init table for this panel
      * revision (SKU V2 = New_Panel table). */
+
+    /* v69: ESPHome's mipi_dsi sends INVOFF explicitly after the init table.
+     * Without it this panel comes up bit-inverted (red->cyan, green->magenta,
+     * proven by the v68 primary-color test). invert_color(false) = INVOFF. */
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_invert_color(*panel, false), TAG,
+                        "Failed to send INVOFF");
 
     // Turn on display
     ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(*panel, true), 
@@ -342,6 +348,7 @@ lv_display_t* bsp_display_start_with_config(const bsp_display_cfg_t* cfg)
         .hres = cfg->h_res,
         .vres = cfg->v_res,
         .monochrome = false,
+        /* v68: must match the DPI panel input (RGB565, see above). */
         .color_format = LV_COLOR_FORMAT_RGB565,
         .rotation = {
             .swap_xy = false,

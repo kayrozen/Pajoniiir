@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "bsp/display.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -21,6 +22,8 @@
 #define LS_MAX_LINES  30
 #define LS_LINE_MAX   160
 #define LS_COLOR_MAX  512   /* total bytes kept */
+
+static const char* TAG = "log_screen";
 
 static vprintf_like_t s_prev_vprintf;
 static SemaphoreHandle_t s_lock;
@@ -136,6 +139,8 @@ void log_screen_task(void)
     if (s_lock == NULL) {
         return;
     }
+    /* v68 color test removed (v70): diagnostic complete — the panel needs
+     * INVOFF (fixed in v69). Resume normal log rendering. */
     /* esp_lvgl_port owns the render task; take its lock to touch widgets. */
     if (!bsp_display_lock(50)) {
         return;
