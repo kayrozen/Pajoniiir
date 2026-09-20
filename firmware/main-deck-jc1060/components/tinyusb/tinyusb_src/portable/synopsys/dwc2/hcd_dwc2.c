@@ -614,16 +614,6 @@ bool hcd_edpt_open(uint8_t rhport, uint8_t dev_addr, const tusb_desc_endpoint_t*
 
   dwc2_channel_char_t* hcchar_bm = &edpt->hcchar_bm;
   hcchar_bm->ep_size         = tu_edpt_packet_size(desc_ep);
-  /* High-speed isochronous OUT: match the Linux ehci/dwc2 behavior of
-   * splitting the per-interval payload across several 88-byte microframe
-   * transactions instead of one large burst. A single >300-byte burst
-   * overruns small device-side iso FIFOs (DDJ-400) causing drops. */
-  if (hcchar_bm->ep_type == TUSB_XFER_ISOCHRONOUS &&
-      hcchar_bm->ep_dir == TUSB_DIR_OUT &&
-      rh_speed == TUSB_SPEED_HIGH && bus_info.speed == TUSB_SPEED_HIGH &&
-      hcchar_bm->ep_size > 88) {
-    hcchar_bm->ep_size = 88;
-  }
   hcchar_bm->ep_num          = tu_edpt_number(desc_ep->bEndpointAddress);
   hcchar_bm->ep_dir          = tu_edpt_dir(desc_ep->bEndpointAddress);
   hcchar_bm->low_speed_dev   = (bus_info.speed == TUSB_SPEED_LOW) ? 1 : 0;

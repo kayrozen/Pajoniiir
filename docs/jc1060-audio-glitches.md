@@ -1,7 +1,30 @@
 # JC1060 — DDJ-400 USB audio glitches: investigation log
 
-Status: **OPEN — root cause NOT determined** (as of v51, 2026-09-20).
-Branch `codex/ddj400-jc1060-integration`.
+Status: **CAUSE ISOLÉE (v52-v54) — le flush DSI récurrent (LVGL) fait
+glitcher l'USB iso.** Root cause du conflit bus en cours d'analyse
+(recherche web dédiée). Branch `codex/ddj400-jc1060-integration`.
+
+## Bissection décisive (2026-09-20, session 2)
+
+| v   | config USB (clamp 88B) | écran/log            | résultat |
+|-----|------------------------|----------------------|----------|
+| 52  | reverté (paquet plein) | log figé (pas de refresh DSI) | **PROPRE** |
+| 53  | reverté                | log fullscreen défilant | glitchs |
+| 54  | reverté                | log bandeau 200px défilant | glitchs |
+
+- Le clamp 88 B (v49) était **inocent** : revert sans effet.
+- Le facteur qui fait apparaître/disparaître les glitchs = **le refresh DSI
+  récurrent** (lv_label_set_text → invalidation LVGL → flush DMA framebuffer
+  PSRAM). Pas la surface (bandeau 200 px suffit à glitcher) → c'est la
+  PRÉSENCE de bursts DSI/PSRAM, pas leur taille totale.
+- Le Wi-Fi était un **faux coupable** (v53 wifi OFF + log actif = glitchs
+  quand même ; v36/v37 « propres » n'avaient pas de log défilant).
+
+Modèle physique probable : chaque flush LVGL = gros memcpy/ DMA
+SRAM↔PSRAM saturant le bus quelques ms → le canal périodique DWC2 n'est
+pas ré-armé dans sa fenêtre SOF → paquet iso perdu SANS aucune trace
+côté host (pas d'erreur, complétions suivantes stables — cohérent avec
+l'instrumentation qui ne voit rien).
 
 ## Symptom
 

@@ -113,6 +113,8 @@ void app_main(void)
     /* UI loop placeholder: log screen refreshes here (full deck UI replaces
      * this). Rendering itself is done by esp_lvgl_port's task. */
     while (1) {
+        /* v53 bisect: DSI refresh back ON (clamp stays reverted). If this
+         * re-introduces glitches, the DSI log flush is the root cause. */
         log_screen_task();
         vTaskDelay(pdMS_TO_TICKS(200));
     }

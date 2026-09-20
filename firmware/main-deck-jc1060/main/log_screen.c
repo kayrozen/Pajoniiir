@@ -115,7 +115,11 @@ void log_screen_start(void)
         lv_obj_set_style_border_width(s_screen, 0, 0);
 
         s_label = lv_label_create(s_screen);
-        lv_obj_set_size(s_label, LV_PCT(100), LV_PCT(100));
+        /* v54: flush-surface test - bandeau instead of fullscreen. Fullscreen
+         * label (1024x600) flushes ~1.5 MB from PSRAM per invalidation and
+         * was proven to break USB iso (v53). Small surface = small DSI
+         * burst. */
+        lv_obj_set_size(s_label, LV_PCT(100), 200);
         lv_obj_set_style_text_color(s_label, lv_color_hex(0x30d060), 0);
         lv_obj_set_style_text_font(s_label, &lv_font_montserrat_14, 0);
         lv_label_set_long_mode(s_label, LV_LABEL_LONG_WRAP);
