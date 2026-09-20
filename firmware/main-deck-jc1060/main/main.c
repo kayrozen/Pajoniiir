@@ -19,11 +19,10 @@
 #include "bsp/touch.h"
 #include "bsp/audio.h"
 #include "bsp/sd.h"
-#include "usb_host_bringup.h"
+#include "usb_tu_app.h"
 #include "eth_bringup.h"
 #include "wifi_console.h"
 #include "ota_update.h"
-#include "midi_host.h"
 #include "esp_app_desc.h"
 
 static const char* TAG = "deck";
@@ -96,7 +95,7 @@ void app_main(void)
     }
 
     /* Controller surface (DDJ) + Ethernet (DJ Link path). */
-    usb_host_bringup_start();
+    usb_tu_start();
     eth_bringup_start();
 
     ESP_LOGI(TAG, "Bring-up complete - entering UI loop");
