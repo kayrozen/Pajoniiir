@@ -7,6 +7,6 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 set(EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_LIST_DIR}/components")
 
 # Bump on every OTA-worthy change (same-version images are skipped by OTA).
-set(PROJECT_VER "6")
+set(PROJECT_VER "7")
 
 project(pajoniiir_deck)
