@@ -77,8 +77,9 @@ static void midi_poll(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* Audio callbacks                                                     */
+/* Audio callbacks (only compiled with the audio class driver enabled) */
 /* ------------------------------------------------------------------ */
+#if CFG_TUH_AUDIO
 
 void tuh_audio_mount_cb(uint8_t idx)
 {
@@ -132,10 +133,13 @@ void tuh_audio_stream_done_cb(uint8_t idx, uint8_t stream_idx,
              idx, stream_idx, event, (unsigned long)xferred_bytes);
 }
 
+#endif /* CFG_TUH_AUDIO */
+
 /* ------------------------------------------------------------------ */
 /* Tone writer task: feeds the TinyUSB stream FIFO continuously        */
 /* ------------------------------------------------------------------ */
 
+#if CFG_TUH_AUDIO
 static void tone_writer_task(void *arg)
 {
     /* 1 s sine table at 44.1 kHz, amplitude -12 dBFS, 24-bit. */
@@ -195,6 +199,7 @@ static void tone_writer_task(void *arg)
         midi_poll();
     }
 }
+#endif /* CFG_TUH_AUDIO */
 
 /* ------------------------------------------------------------------ */
 /* MIDI driver resolution: only keep the interface with MIDI streaming */
@@ -249,9 +254,11 @@ esp_err_t usb_tu_start(void)
     }
     ESP_LOGI(TU_TAG, "TinyUSB host started on HS rhport %d", TU_HS_RHPORT);
 
+#if CFG_TUH_AUDIO
     if (xTaskCreate(tone_writer_task, "tone_wr", 4096, NULL, 5, NULL) != pdPASS) {
         return ESP_FAIL;
     }
+#endif
 
     /* tuh task */
     if (xTaskCreate((TaskFunction_t)tuh_task, "tuh_task", 4096, NULL, 5,
@@ -267,6 +274,7 @@ esp_err_t usb_tu_start(void)
 
 /* Poll from the tone writer: when the DDJ stream is found and not started,
  * configure 44.1 kHz and start. */
+#if CFG_TUH_AUDIO
 static void audio_try_start(void)
 {
     if (s_audio_idx == TUSB_INDEX_INVALID_8 || s_spk_stream == TUSB_INDEX_INVALID_8 ||
@@ -292,3 +300,4 @@ static void audio_try_start(void)
         }
     }
 }
+#endif /* CFG_TUH_AUDIO */
