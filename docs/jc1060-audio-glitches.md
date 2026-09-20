@@ -26,6 +26,39 @@ pas ré-armé dans sa fenêtre SOF → paquet iso perdu SANS aucune trace
 côté host (pas d'erreur, complétions suivantes stables — cohérent avec
 l'instrumentation qui ne voit rien).
 
+## FIX TROUVÉ (v57) : flush par 2D-DMA
+
+`esp_lcd_dpi_panel_enable_dma2d(panel)` (chemin `use_dma2d=true` de la
+démo fabricant / config standard ESPHome) remplace le memcpy CPU par un
+copieur 2D-DMA → **son PROPRE avec log défilant ET Wi-Fi actif**.
+Le Wi-Fi n'était jamais coupable : en v38 on avait réactivé Wi-Fi et le
+log défilant (memcpy CPU) en même temps — confondant parfait.
+
+### État couleurs (v57-v65)
+- `rgb_ele_order = RGB` (démo fabricant + ESPHome + EspControl) : appliqué
+  v57 — n'a PAS corrigé le magenta seul.
+- `invert_color(true)` (v61) : compense l'inversion globale (texte devient
+  cyan-vert = le 0x30d060 d'origine) mais fond devient clair → conso trop
+  élevée, retiré en v64.
+- Reste à faire : utiliser la table d'init du BON panel (SKU étiquette
+  10153004-V2 = New_Panel) ; nos cmds actuelles = Old_Panel.
+- Rapports recherche : docs/research/, docs-research-guition-jc1060p470-esphome.md
+
+### État Wi-Fi (v58-v65)
+- v58 : Wi-Fi réactivé → transport C6 muet/drop H_SDIO, scan bloquant
+  figeait TOUT le boot (RPC C6 mort) → v62 : wifi_console_start 100 %
+  asynchrone (plus de scan bloquant ni d'attente IP dans le boot).
+- v63 : WIFI_PS_NONE retiré (héritage de la théorie invalidée).
+- v65 : retry immédiat + watchdog 10 s.
+- Reste : association échoue avec reasons 2 (AUTH_EXPIRE) / 203
+  (ASSOC_FAIL) / 205 (CONNECTION_FAIL), puis transport muet. Le mismatch
+  esp-hosted host 2.12.0 vs co-proc 2.3.0 (issue #215, officiellement non
+  supporté) est le suspect principal : l'auth passe par des RPC.
+  Options : (A) downgrade composant host esp_hosted vers la release
+  alignée 2.3.0, ou (B) upgrade firmware C6 via UART header 2x10
+  (CHIP_PU/IO9) vers l'image slave 2.12.x.
+
+
 ## Symptom
 
 DDJ-400 (USB audio OUT, 4ch 44.1 kHz) plays audible audio from the P4 host
