@@ -50,7 +50,7 @@ CONFIG_FREERTOS_HZ=1000
 # OTA: dual-slot with rollback - new image must prove itself (30 s uptime)
 # before being marked valid, else bootloader falls back to the other slot.
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
-# LAN bring-up: plain HTTP OTA (production uses signed HTTPS OTA)
+# OTA LAN bring-up: allow plain HTTP (production uses signed HTTPS)
 CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y
 
 # Log level INFO for bring-up diagnostics
