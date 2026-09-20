@@ -103,11 +103,9 @@ void app_main(void)
         ESP_LOGW(TAG, "SD card not available");
     }
 
-    /* Controller surface (DDJ) + Ethernet (DJ Link path). */
+    /* Controller surface (DDJ) + Ethernet (DJ Link path + debug console). */
     usb_tu_start();
-#if 0 /* v36 audio isolation: Ethernet OFF */
     eth_bringup_start();
-#endif
 
     ESP_LOGI(TAG, "Bring-up complete - entering UI loop");
 

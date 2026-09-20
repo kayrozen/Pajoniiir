@@ -55,6 +55,27 @@ l'instrumentation qui ne voit rien).
   et notre IDF 6.0.2.
 - État v71 : couleurs ✓, son ✓ (audio USB iso propre), Wi-Fi ✗.
 
+### CONSOLE ETH + BOOT LOOP (v72-v75)
+
+Console debug Ethernet implémentée (v72-73) : RMII IP101 + netif + DHCP,
+console TCP :2333 démarre dès qu'une interface (ETH **ou** Wi-Fi) a une IP,
+logs dupliqués via `esp_log_set_vprintf(console_vprintf)` dans
+`wifi_console_start` (perdu au refactor v62, restauré).
+Correction v73 : `esp_eth_new_netif_glue(s_eth_handle)` — le handle, pas son
+adresse (ESP_ERROR_CHECK abortait).
+
+**BOOT LOOP ACTIF (v74-v75)** : après la mise à jour C6 2.3.0 → 2.12.12
+(recovery EspControl), le transport SDIO ne s'initialise plus :
+`sdmmc_io_rw_extended 0x107` en boucle, `H_SDIO_DRV: card init failed even
+after slave reset`, `transport: Init event not received within timeout,
+Resetting myself`, puis `esp_wifi_init` abort (wifi_console.c:224).
+Le timeout 5 s porté à 20 s (v75, HOST_RESTART_NO_COMMUNICATION_...)
+supprime le reset immédiat mais le C6 ne répond toujours pas au bus SDIO.
+AVANT la maj C6 (v70) : boot complet ✓. Donc le firmware C6 2.12.12 ne
+parle plus le protocole attendu par notre host esp_hosted 2.12.0 —
+recherche web en cours sur la compat 2.3.0/2.12.12.
+
+
 
 `esp_lcd_dpi_panel_enable_dma2d(panel)` (chemin `use_dma2d=true` de la
 démo fabricant / config standard ESPHome) remplace le memcpy CPU par un

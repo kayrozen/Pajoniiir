@@ -11,6 +11,7 @@
 
 #include "wifi_console.h"
 #include "usb_tu_app.h"
+#include "eth_bringup.h"
 
 #include <stdarg.h>
 #include <string.h>
@@ -76,14 +77,18 @@ static int console_vprintf(const char* fmt, va_list args)
 
 static void console_server_task(void* arg)
 {
-    /* v62: wait for the IP here (background) instead of blocking the boot. */
-    for (int i = 0; i < 1200 && !s_got_ip; i++) {
+    /* v72: wait for an IP on ANY interface (Ethernet preferred path, Wi-Fi
+     * fallback) instead of blocking the boot. */
+    for (int i = 0; i < 1200 && !s_got_ip && !eth_bringup_got_ip(); i++) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-    if (!s_got_ip) {
-        ESP_LOGE(TAG, "No IP after 120 s - console disabled");
+    if (!s_got_ip && !eth_bringup_got_ip()) {
+        ESP_LOGE(TAG, "No IP after 120 s on any interface - console disabled");
         vTaskDelete(NULL);
         return;
+    }
+    if (eth_bringup_got_ip()) {
+        s_ip_info = eth_bringup_ip_info();
     }
 
     int listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
@@ -248,6 +253,11 @@ bool wifi_console_start(void)
      * scan or IP wait stalled the whole boot. The event handler retries
      * association on its own; the console server installs itself from a
      * background task once the IP arrives. */
+
+    /* v72: tee logs to the TCP console from now on (the server task below
+     * accepts connections as soon as ANY interface has an IP). */
+    esp_log_set_vprintf(console_vprintf);
+
     if (xTaskCreate(console_server_task, "wifi_console", 4096, NULL, 4, NULL)
         != pdPASS) {
         return false;

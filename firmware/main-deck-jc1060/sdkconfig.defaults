@@ -24,9 +24,12 @@ CONFIG_SPIRAM_SIZE_OVERRIDE=16
 CONFIG_ESP_MM_CACHE_MSYNC_C2M_CHUNKED_OPS=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
-# v71: EspControl V1 runs SDIO at 20 MHz on this exact board ("reliable
-# ESP32-C6 communication across production panels"); 40 MHz assoc fails.
-CONFIG_ESP_HOSTED_SDIO_CLOCK_FREQ_KHZ=20000
+# v71 tried 20 MHz (EspControl value) - C6 SDIO timeouts 0x107 -> boot loop.
+# 40 MHz is the stable value on this board.
+CONFIG_ESP_HOSTED_SDIO_CLOCK_FREQ_KHZ=40000
+# v75: C6 2.12.12 firmware boots slower than 2.3.0 - 5 s init timeout made
+# esp_hosted abort ("Resetting myself") and boot-loop the board.
+CONFIG_ESP_HOSTED_HOST_RESTART_NO_COMMUNICATION_WITH_SLAVE_TIMEOUT=20
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 
