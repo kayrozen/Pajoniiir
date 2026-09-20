@@ -8,7 +8,9 @@ dependencies:
     version: "^9.0.0"
     public: true
   espressif/esp_lvgl_port:
-    version: "^2"
+    # v76: ==2.8.0 - 2.9.0 requires esp_lcd on_frame_buf_complete (newer
+    # than IDF 6.0.2). Pin exact; the project manifest alone didn't hold.
+    version: "==2.8.0"
     public: true
   espressif/esp_lcd_jd9165:
     version: "2.0.2"
