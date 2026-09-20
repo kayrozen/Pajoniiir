@@ -16,9 +16,12 @@ CONFIG_SPIRAM_MODE_HEX=y
 CONFIG_SPIRAM_SPEED_200M=y
 CONFIG_SPIRAM_SIZE_OVERRIDE=16
 
-# 40 MHz SDIO bursts stall the AXI bus long enough to miss USB iso
-# deadlines (audio glitches). 20 MHz halves each burst length.
-CONFIG_ESP_HOSTED_SDIO_CLOCK_FREQ_KHZ=20000
+# Cache-writeback C2M ops (DSI framebuffer flush) run inside a critical
+# section with interrupts disabled - for 400KB..1.2MB that is 0.6..2.5 ms
+# with the USB DWC2 ISR masked, which makes the periodic channel miss its
+# SOF window (silent iso interval skip = audible glitch). Chunking lets
+# interrupts breathe between chunks.
+CONFIG_ESP_MM_CACHE_MSYNC_C2M_CHUNKED_OPS=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y

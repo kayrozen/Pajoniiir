@@ -189,7 +189,10 @@ static esp_err_t bsp_lcd_panel_init(esp_lcd_dsi_bus_handle_t dsi_bus,
 
     esp_lcd_panel_dev_config_t lcd_dev_config = {
         .reset_gpio_num = BSP_LCD_RST_GPIO,
-        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR,
+        /* v57: RGB order per vendor demo + ESPHome model JC1060P470 +
+         * EspControl V1/V2 profiles. BGR (v25) swapped R/B -> green text
+         * rendered magenta. */
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
         .bits_per_pixel = BSP_LCD_COLOR_BITS,
         .vendor_config = &vendor_config,
     };
@@ -204,7 +207,19 @@ static esp_err_t bsp_lcd_panel_init(esp_lcd_dsi_bus_handle_t dsi_bus,
     
     // Initialize panel
     ESP_RETURN_ON_ERROR(esp_lcd_panel_init(*panel), TAG, "Panel init failed");
-    
+
+    /* v57: flush via 2D-DMA (esp_async_fbcpy) instead of CPU memcpy into
+     * the PSRAM framebuffer. Vendor demo sets use_dma2d=true; ESPHome's
+     * standard mipi_dsi path also uses DMA2D. Cuts the CPU/bus time of
+     * every LVGL flush - required for USB iso audio coexistence. */
+    ESP_RETURN_ON_ERROR(esp_lcd_dpi_panel_enable_dma2d(*panel), TAG,
+                        "Failed to enable DPI DMA2D flush");
+
+    /* v61 color probe removed (v64): inversion made the background light
+     * (power draw too high on this supply) and did not fully fix the
+     * colors. Proper fix = correct vendor init table for this panel
+     * revision (SKU V2 = New_Panel table). */
+
     // Turn on display
     ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(*panel, true), 
                         TAG, "Failed to turn on display");

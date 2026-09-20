@@ -76,6 +76,16 @@ static int console_vprintf(const char* fmt, va_list args)
 
 static void console_server_task(void* arg)
 {
+    /* v62: wait for the IP here (background) instead of blocking the boot. */
+    for (int i = 0; i < 1200 && !s_got_ip; i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    if (!s_got_ip) {
+        ESP_LOGE(TAG, "No IP after 120 s - console disabled");
+        vTaskDelete(NULL);
+        return;
+    }
+
     int listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
     if (listen_sock < 0) {
         ESP_LOGE(TAG, "socket failed");
@@ -142,10 +152,15 @@ static void wifi_event_cb(void* arg, esp_event_base_t base,
             return;
         }
         wifi_event_sta_disconnected_t* evt = (wifi_event_sta_disconnected_t*)data;
-        ESP_LOGW(TAG, "Wi-Fi disconnected, reason=%d, retrying in 3 s...",
-                 evt->reason);
-        vTaskDelay(pdMS_TO_TICKS(3000));
-        esp_wifi_connect();
+        ESP_LOGW(TAG, "Wi-Fi disconnected, reason=%d", evt->reason);
+        /* v65: retry immediately - do NOT block the event loop task (the
+         * old 3 s vTaskDelay inside the handler stopped further events
+         * from being delivered, killing the retry cycle). */
+        esp_err_t err = esp_wifi_connect();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_wifi_connect: %s (watchdog task will retry)",
+                     esp_err_to_name(err));
+        }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* evt = (ip_event_got_ip_t*)data;
         s_ip_info = evt->ip_info;
@@ -154,8 +169,39 @@ static void wifi_event_cb(void* arg, esp_event_base_t base,
     }
 }
 
+/* v65: reconnect watchdog - independent of event delivery, retries every
+ * 10 s as long as the station is down. */
+static void wifi_reconnect_task(void* arg)
+{
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
+        if (usb_audio_wifi_suspended()) {
+            continue;
+        }
+        wifi_mode_t mode = WIFI_MODE_NULL;
+        if (esp_wifi_get_mode(&mode) != ESP_OK || mode != WIFI_MODE_STA) {
+            continue;
+        }
+        static bool was_connected;
+        bool connected = s_got_ip;
+        if (!connected && was_connected) {
+            was_connected = false;
+        }
+        if (!connected) {
+            esp_err_t err = esp_wifi_connect();
+            ESP_LOGI(TAG, "watchdog: esp_wifi_connect -> %s",
+                     esp_err_to_name(err));
+        } else {
+            was_connected = true;
+        }
+    }
+}
+
 bool wifi_console_start(void)
 {
+    /* v59: scan results (AP list + RSSI) are ESP_LOGI - raise this tag so
+     * the on-screen log shows what the C6 radio actually sees. */
+    esp_log_level_set(TAG, ESP_LOG_INFO);
     s_sock_mutex = xSemaphoreCreateMutex();
 
     if (esp_netif_init() != ESP_OK) {
@@ -187,36 +233,9 @@ bool wifi_console_start(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
-    /* No power-save: PS bursts monopolize the SDIO bus and glitch USB audio. */
-    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
-
-    /* RPC health probe: scan and check the target AP is visible. */
-    {
-        wifi_scan_config_t scan = { .show_hidden = true };
-        if (esp_wifi_scan_start(&scan, true) == ESP_OK) {
-            uint16_t n = 0;
-            esp_wifi_scan_get_ap_num(&n);
-            wifi_ap_record_t* aps = malloc(sizeof(wifi_ap_record_t) * (n ? n : 1));
-            if (aps) {
-                esp_wifi_scan_get_ap_records(&n, aps);
-                ESP_LOGI(TAG, "Scan: %u AP(s) visibles", n);
-                bool found = false;
-                for (int i = 0; i < n; i++) {
-                    ESP_LOGI(TAG, "  %2d: %s ch=%d rssi=%d", i, aps[i].ssid,
-                             aps[i].primary, aps[i].rssi);
-                    if (strcmp((char*)aps[i].ssid, WIFI_SSID) == 0) {
-                        found = true;
-                    }
-                }
-                if (!found) {
-                    ESP_LOGW(TAG, "SSID '%s' non visible au scan !", WIFI_SSID);
-                }
-                free(aps);
-            }
-        } else {
-            ESP_LOGE(TAG, "esp_wifi_scan_start failed (RPC vers C6 ?)");
-        }
-    }
+    /* v63: PS_NONE (v39) removed - it was added under the invalidated
+     * "Wi-Fi steals the bus" theory and can break association with the
+     * co-proc version mismatch. Default MIN_MODEM power-save is back. */
 
     /* Association: without this the STA starts but never associates. */
     esp_err_t conn_ret = esp_wifi_connect();
@@ -224,23 +243,20 @@ bool wifi_console_start(void)
         ESP_LOGE(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(conn_ret));
     }
 
-    /* Wait for IP (up to 60 s - first association can be slow). */
-    for (int i = 0; i < 600 && !s_got_ip; i++) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    if (!s_got_ip) {
-        ESP_LOGE(TAG, "No IP address obtained");
-        return false;
-    }
-
-    /* Duplicate logs to the TCP console. */
-    esp_log_set_vprintf(console_vprintf);
-
+    /* v62: NEVER block the boot path here. The C6 RPC can hang (version
+     * mismatch + SDIO stream corruption during display init) - a blocking
+     * scan or IP wait stalled the whole boot. The event handler retries
+     * association on its own; the console server installs itself from a
+     * background task once the IP arrives. */
     if (xTaskCreate(console_server_task, "wifi_console", 4096, NULL, 4, NULL)
         != pdPASS) {
         return false;
     }
+    if (xTaskCreate(wifi_reconnect_task, "wifi_reconn", 3072, NULL, 4, NULL)
+        != pdPASS) {
+        return false;
+    }
 
-    ESP_LOGI(TAG, "Wi-Fi console ready");
+    ESP_LOGI(TAG, "Wi-Fi connecting (async)...");
     return true;
 }

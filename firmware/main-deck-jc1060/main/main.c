@@ -85,7 +85,8 @@ void app_main(void)
     if (nvs_ret != ESP_OK) {
         ESP_LOGE(TAG, "NVS init failed: %s", esp_err_to_name(nvs_ret));
     }
-#if 0 /* v51: back to v37 audio-clean config (Wi-Fi/OTA OFF) */
+#if 1 /* v58: Wi-Fi/OTA back ON - audio is clean now (DMA2D flush), the
+           * earlier Wi-Fi "guilt" was the CPU memcpy flush running with it */
     if (!wifi_console_start()) {
         ESP_LOGW(TAG, "Wi-Fi console not available");
     }

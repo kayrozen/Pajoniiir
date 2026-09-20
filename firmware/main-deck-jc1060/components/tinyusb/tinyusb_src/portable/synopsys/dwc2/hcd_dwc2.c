@@ -6,6 +6,8 @@
  */
 
 #include "tusb_option.h"
+#include "esp_log.h"
+#include "esp_timer.h"
 
 #if CFG_TUH_ENABLED && defined(TUP_USBIP_DWC2) && !CFG_TUH_MAX3421
 
@@ -854,6 +856,17 @@ static uint32_t periodic_xfer_countdown(dwc2_regs_t* dwc2, hcd_endpoint_t const*
 
   // The service opportunity was missed. Keep the established phase and use
   // the next interval rather than starting a new interval from this request.
+  /* v55: count missed SOF windows - these silent skips ARE the audible
+   * glitches (dropped 1 ms wire interval, no error/callback). Spikes here
+   * must correlate with LVGL/DSI flush cache writeback critical sections. */
+  {
+    static uint32_t missed_count, missed_recent;
+    missed_count++; missed_recent++;
+    if ((missed_recent % 100) == 0) {
+      ESP_LOGW("dwc2", "iso SOF windows missed: total=%lu recent=%lu",
+               missed_count, missed_recent);
+    }
+  }
   return edpt->uframe_interval - (elapsed_uframes % edpt->uframe_interval) - ucount;
 }
 
@@ -1652,6 +1665,24 @@ static bool handle_sof_irq(uint8_t rhport, bool in_isr) {
   (void) in_isr;
   dwc2_regs_t* dwc2 = DWC2_REG(rhport);
   dwc2->gintsts = GINTSTS_SOF; // Clear the SOF interrupt flag
+
+  /* v55: SOF ISR latency probe. Consecutive SOF IRQs are 1 ms apart; a
+   * delta > 1.3 ms means the ISR was masked/delayed (cache writeback
+   * critical section, higher-prio IRQ, etc.) - the wire interval in that
+   * window is unserviced. */
+  {
+    static int64_t last_sof_us;
+    static uint32_t late_count;
+    int64_t now = esp_timer_get_time();
+    if (last_sof_us != 0) {
+      int64_t delta = now - last_sof_us;
+      if (delta > 1300 && ++late_count % 20 == 1) {
+        ESP_LOGW("dwc2", "SOF IRQ late: delta=%lld us (late_count=%lu)",
+                 (long long)delta, late_count);
+      }
+    }
+    last_sof_us = now;
+  }
 
   bool more_isr = false;
 

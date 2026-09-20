@@ -1,0 +1,223 @@
+esphome:
+  name: esp32-p4-tab7
+  friendly_name: 7inch-tab
+  platformio_options:
+    board_build.flash_mode: dio
+
+esp32:
+  variant: ESP32P4
+  flash_size: 16MB
+  cpu_frequency: 400MHz
+  framework:
+    type: esp-idf
+    advanced:
+      enable_idf_experimental_features: yes
+
+logger:
+  level: DEBUG
+  hardware_uart: USB_SERIAL_JTAG
+  baud_rate: 115200
+
+psram:
+  mode: hex
+  speed: 200MHz
+
+debug:
+
+esp32_hosted:
+  variant: ESP32C6
+  reset_pin: GPIO54
+  cmd_pin: GPIO19
+  clk_pin: GPIO18
+  d0_pin: GPIO14
+  d1_pin: GPIO15
+  d2_pin: GPIO16
+  d3_pin: GPIO17
+  active_high: true
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Berlin
+    on_time_sync:
+      then:
+        # Write time to RTC
+        - rx8130.write_time:
+            id: rx8130_time
+
+#wifi: !include wifi.yaml // disabled for wifi config
+
+ethernet:
+  type: IP101
+  mdc_pin: GPIO31
+  mdio_pin: GPIO52
+  clk: 
+    pin: GPIO50
+    mode: CLK_EXT_IN
+  phy_addr: 1
+  power_pin: GPIO51
+
+api:
+  reboot_timeout: 0s
+  homeassistant_services: true
+  encryption:
+    key: !secret esphome_encryption_key
+
+ota:
+  - platform: esphome
+
+output:
+  - id: backlight_output
+    platform: ledc
+    pin: GPIO23
+
+light:
+  - platform: monochromatic
+    output: backlight_output
+    name: LCD Backlight
+    id: lcd_backlight
+    restore_mode: ALWAYS_ON
+    default_transition_length: 0s
+    gamma_correct: 1.0
+
+esp_ldo:
+  - channel: 3
+    id: dsi_phy_enable
+    voltage: 2.5V
+    adjustable: True
+  - channel: 4
+    id: sd_card_power
+    voltage: 2.7V
+    adjustable: True
+
+display:
+  - platform: mipi_dsi
+    model: JC1060P470
+    reset_pin: GPIO0
+    update_interval: 17ms
+
+i2c:
+  - id: i2c_bus_a
+    sda: GPIO7
+    scl: GPIO8
+    scan: true
+    frequency: 400kHz
+    sda_pullup_enabled: False
+    scl_pullup_enabled: False
+
+touchscreen:
+  - platform: gt911
+    id: touchscreen_
+    on_touch:
+      - logger.log:
+          format: "Touch at %d/%d"
+          args: [touch.x, touch.y]
+
+lvgl:
+  byte_order: little_endian
+
+switch:
+  - platform: gpio
+    pin: GPIO11 #PA-CTRL
+    name: "Speaker enable"
+    restore_mode: ALWAYS_ON
+    id: speaker_enable_switch
+    inverted: False
+  - platform: template
+    name: "Ring Timer"
+    id: timer_ringing
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    on_turn_off:
+        # Stop playing the alarm
+        - media_player.stop:
+            announcement: true
+    on_turn_on:
+        - while:
+            condition:
+                switch.is_on: timer_ringing
+            then:
+                # Play the alarm sound as an announcement
+                - media_player.speaker.play_on_device_media_file:
+                    media_file: alarm_sound
+                    announcement: true
+                # Wait until the alarm sound starts playing
+                - wait_until:
+                    media_player.is_announcing:
+                # Wait until the alarm sound stops playing
+                - wait_until:
+                    not:
+                      media_player.is_announcing:
+
+
+audio_dac:
+  - platform: es8311
+    id: es8311_codec
+    i2c_id: i2c_bus_a
+    address: 0x18
+    bits_per_sample: 16bit
+    sample_rate: 44100
+    use_mclk: True
+    use_microphone: True
+    mic_gain: 24DB
+
+i2s_audio:
+  - id: i2s_output
+    i2s_lrclk_pin: GPIO10
+    i2s_bclk_pin: GPIO12
+    i2s_mclk_pin: GPIO13
+
+microphone:
+  - platform: i2s_audio
+    id: external_mic
+    i2s_audio_id: i2s_output
+    i2s_mode: primary
+    adc_type: external
+    i2s_din_pin: GPIO48
+    sample_rate: 16000
+    bits_per_channel: 16bit
+    channel: stereo
+
+speaker:
+  - platform: i2s_audio
+    i2s_audio_id: i2s_output
+    id: speaker_id
+    i2s_dout_pin: GPIO09
+    dac_type: external
+    sample_rate: 44100
+    bits_per_sample: 16bit
+    channel: left
+    audio_dac: es8311_codec
+    buffer_duration: 1000ms
+    i2s_mode: primary
+  - platform: mixer
+    id: mixer_speaker_id
+    output_speaker: speaker_id
+    num_channels: 1
+    task_stack_in_psram: True
+    source_speakers:
+      - id: announcement_spk_mixer_input
+      - id: media_spk_mixer_input
+  - platform: resampler
+    id: media_spk_resampling_input
+    output_speaker: media_spk_mixer_input
+  - platform: resampler
+    id: announcement_spk_resampling_input
+    output_speaker: announcement_spk_mixer_input
+
+media_player:
+  - platform: speaker
+    name: "Speaker Media Player"
+    id: speaker_media_player_id
+    task_stack_in_psram: True
+    buffer_size: 1000000
+    codec_support_enabled: True
+    volume_initial: 70%
+    volume_max: 70%
+    announcement_pipeline:
+        speaker: announcement_spk_resampling_input
+        sample_rate: 44100
+        num_channels: 1
+    files:
+      - id: alarm_sound
+        file: testsound.flac
