@@ -12,6 +12,8 @@
 #include <string.h>
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_wifi.h"
+#include "esp_hosted.h"
 #include "esp_private/usb_phy.h"   /* IDF6: public usb/usb_phy.h moved to esp_hw_support */
 #include "hal/usb_utmi_hal.h"
 #include "soc/usb_utmi_struct.h"
@@ -40,8 +42,10 @@ static volatile uint32_t s_frame_bytes;   /* active frame size: 8 (S16) / 12 (S2
 
 static void audio_try_start(void);
 static void tuh_task_loop(void *arg);
+static void audio_wifi_suspend(void);
+static void audio_wifi_resume(void);
 
-static uint8_t s_frame_scratch[96 * 12]; /* up to 96 frames of 4ch x 3B */
+static uint8_t s_frame_scratch[192 * 12]; /* up to 192 frames of 4ch x 3B */
 
 /* ------------------------------------------------------------------ */
 /* MIDI callbacks                                                      */
@@ -112,6 +116,7 @@ void tuh_audio_umount_cb(uint8_t idx)
         s_audio_idx = TUSB_INDEX_INVALID_8;
         s_spk_stream = TUSB_INDEX_INVALID_8;
         s_audio_streaming = false;
+        audio_wifi_resume();
     }
 }
 
@@ -153,22 +158,73 @@ void tuh_audio_event_cb(uint8_t idx, uint8_t stream_idx,
 /* ------------------------------------------------------------------ */
 
 #if CFG_TUH_AUDIO
+/* Embedded WAV: 2 s, 4ch, 24-bit, 44.1 kHz sine (tone4ch.wav, EMBED_FILES).
+ * Samples live in flash (memory-mapped) - the writer loop is a pure memcpy
+ * from rodata, eliminating PSRAM latency from the audio path. */
+extern const uint8_t _binary_tone4ch_wav_start[] asm("_binary_tone4ch_wav_start");
+extern const uint8_t _binary_tone4ch_wav_end[]   asm("_binary_tone4ch_wav_end");
+
+static const uint8_t *s_wav;      /* first sample frame */
+static size_t   s_wav_frames;     /* total frames (12 B each, S24_3LE 4ch) */
+static size_t   s_wav_pos;        /* read position, in frames */
+
+static void tone_build_table(void)
+{
+    const size_t total = (size_t)(_binary_tone4ch_wav_end - _binary_tone4ch_wav_start);
+    /* Find the data chunk: header is a canonical 44-byte PCM wave header. */
+    size_t off = 12; /* skip RIFF/WAVE */
+    while (off + 8 <= total) {
+        uint32_t sz;
+        memcpy(&sz, _binary_tone4ch_wav_start + off + 4, 4);
+        if (memcmp(_binary_tone4ch_wav_start + off, "data", 4) == 0) {
+            s_wav = _binary_tone4ch_wav_start + off + 8;
+            s_wav_frames = sz / 12;
+            s_wav_pos = 0;
+            ESP_LOGI(TU_TAG, "wav: %u frames of 4ch S24", (unsigned)s_wav_frames);
+            return;
+        }
+        off += 8 + sz + (sz & 1);
+    }
+    ESP_LOGE(TU_TAG, "wav: no data chunk");
+}
+
+/* Copy `frames` frames from the packed table into dst (fb bytes/frame).
+ * fb==8 converts S24->S16 on the fly (cheap int16 pack, no sinf). */
+static void tone_fill(uint8_t *dst, uint32_t frames, uint32_t fb)
+{
+    if (fb == 12) {
+        size_t tail = s_wav_frames - s_wav_pos;
+        if (frames <= tail) {
+            memcpy(dst, s_wav + s_wav_pos * 12, frames * 12);
+        } else {
+            memcpy(dst, s_wav + s_wav_pos * 12, tail * 12);
+            memcpy(dst + tail * 12, s_wav, (frames - tail) * 12);
+        }
+        s_wav_pos = (s_wav_pos + frames) % s_wav_frames;
+    } else {
+        for (uint32_t f = 0; f < frames; f++) {
+            const uint8_t *q = s_wav + ((s_wav_pos + f) % s_wav_frames) * 12;
+            int32_t v = (int32_t)q[0] | ((int32_t)q[1] << 8) | ((int32_t)q[2] << 16);
+            int16_t s16 = (int16_t)(v >> 8);
+            uint8_t *p = dst + f * 8;
+            for (int c = 0; c < 4; c++) {
+                p[c * 2 + 0] = (uint8_t)(s16 & 0xFF);
+                p[c * 2 + 1] = (uint8_t)((s16 >> 8) & 0xFF);
+            }
+        }
+        s_wav_pos = (s_wav_pos + frames) % s_wav_frames;
+    }
+}
+
 static void tone_writer_task(void *arg)
 {
-    /* 1 s sine table at 44.1 kHz, amplitude -12 dBFS. */
-    const size_t N = 44100;
-    int32_t *tbl = heap_caps_malloc(N * sizeof(int32_t), MALLOC_CAP_8BIT);
-    if (tbl == NULL) {
-        ESP_LOGE(TU_TAG, "tone table alloc failed");
+    tone_build_table();
+    if (s_wav == NULL) {
+        ESP_LOGE(TU_TAG, "wav embed failed");
         vTaskDelete(NULL);
         return;
     }
-    for (size_t i = 0; i < N; i++) {
-        tbl[i] = (int32_t)(sinf(2.0f * (float)M_PI * TONE_FREQ_HZ
-                                * (float)i / (float)N) * 0.25f * 8388607.0f);
-    }
 
-    size_t pos = 0;
     uint32_t stats_cb = 0;
     uint32_t stats_written = 0;
     while (1) {
@@ -201,28 +257,11 @@ static void tone_writer_task(void *arg)
         if (frames == 0) {
             continue;
         }
-        if (frames > 96) {
-            frames = 96;
+        if (frames > 192) {
+            frames = 192;
         }
         uint8_t *frame_buf = s_frame_scratch;
-        for (uint32_t f = 0; f < frames; f++) {
-            int32_t v = tbl[pos];
-            pos = (pos + 1) % N;
-            uint8_t *p = frame_buf + f * fb;
-            if (fb == 8) {
-                int16_t s = (int16_t)(v >> 8);
-                for (int c = 0; c < 4; c++) {
-                    p[c * 2 + 0] = (uint8_t)(s & 0xFF);
-                    p[c * 2 + 1] = (uint8_t)((s >> 8) & 0xFF);
-                }
-            } else {
-                for (int c = 0; c < 4; c++) {
-                    p[c * 3 + 0] = (uint8_t)(v & 0xFF);
-                    p[c * 3 + 1] = (uint8_t)((v >> 8) & 0xFF);
-                    p[c * 3 + 2] = (uint8_t)((v >> 16) & 0xFF);
-                }
-            }
-        }
+        tone_fill(frame_buf, frames, fb);
         uint32_t wrote = tuh_audio_write(s_audio_idx, s_spk_stream, frame_buf, frames);
         stats_written += wrote;
         stats_cb++;
@@ -288,15 +327,18 @@ esp_err_t usb_tu_start(void)
     ESP_LOGI(TU_TAG, "TinyUSB host started on HS rhport %d", TU_HS_RHPORT);
 
 #if CFG_TUH_AUDIO
-    if (xTaskCreate(tone_writer_task, "tone_wr", 4096, NULL, 5, NULL) != pdPASS) {
+    if (xTaskCreatePinnedToCore(tone_writer_task, "tone_wr", 6144, NULL,
+                                24, NULL, 0) != pdPASS) {
         return ESP_FAIL;
     }
 #endif
 
     /* tuh task: tuh_task() processes pending events and RETURNS - it must
-     * be wrapped in an infinite loop (FreeRTOS aborts returning tasks). */
-    if (xTaskCreate(tuh_task_loop, "tuh_task", 4096, NULL, 5,
-                    &s_tuh_task) != pdPASS) {
+     * be wrapped in an infinite loop (FreeRTOS aborts returning tasks).
+     * Priority 24: ABOVE the Wi-Fi/ESP-Hosted tasks (~23) - during SDIO
+     * bursts they otherwise preempt this task past the 1 ms iso deadline. */
+    if (xTaskCreatePinnedToCore(tuh_task_loop, "tuh_task", 6144, NULL,
+                                24, &s_tuh_task, 1) != pdPASS) {
         return ESP_FAIL;
     }
     return ESP_OK;
@@ -307,7 +349,7 @@ static void tuh_task_loop(void *arg)
     (void)arg;
     while (1) {
         tuh_task();
-        vTaskDelay(pdMS_TO_TICKS(1));
+        taskYIELD();
     }
 }
 
@@ -318,6 +360,39 @@ static void tuh_task_loop(void *arg)
 /* Poll from the tone writer: when the DDJ stream is found and not started,
  * configure 44.1 kHz and start. */
 #if CFG_TUH_AUDIO
+/* Wi-Fi (ESP-Hosted over SDIO) bursts steal bus cycles from the USB iso
+ * stream and cause audible glitches. Audio is king while playing: suspend
+ * the radio for the duration of the stream, resume on unmount. */
+static bool s_wifi_suspended;
+
+static void audio_wifi_suspend(void)
+{
+    if (s_wifi_suspended) return;
+    s_wifi_suspended = true;
+    /* esp_wifi_stop() alone keeps the SDIO transport alive - the SDIO DMA
+     * bursts keep stealing bus cycles from the USB iso stream. Tear the
+     * whole ESP-Hosted transport down (same as the prod wifi_link). */
+    esp_wifi_stop();
+    esp_hosted_deinit();
+    ESP_LOGW(TU_TAG, "Wi-Fi/SDIO transport suspended (audio active)");
+}
+
+static void audio_wifi_resume(void)
+{
+    if (!s_wifi_suspended) return;
+    s_wifi_suspended = false;
+    /* Full transport re-init, then hand the radio back to wifi_console. */
+    esp_hosted_init();
+    esp_wifi_start();
+    esp_wifi_connect();
+    ESP_LOGW(TU_TAG, "Wi-Fi/SDIO transport resumed (audio idle)");
+}
+
+bool usb_audio_wifi_suspended(void)
+{
+    return s_wifi_suspended;
+}
+
 static void audio_try_start(void)
 {
     if (s_audio_idx == TUSB_INDEX_INVALID_8 || s_spk_stream == TUSB_INDEX_INVALID_8 ||

@@ -103,6 +103,7 @@
 
 #include "tusb_option.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #if (CFG_TUH_ENABLED && CFG_TUH_AUDIO)
 
@@ -584,28 +585,21 @@ static bool audioh_stream_playback_xfer(tuh_audio_stream_t *s) {
   }
 
   const uint16_t bytes = (uint16_t)(frames * s->frame_bytes);
-  {
-    static uint32_t diag;
-    if ((diag++ % 500) == 0) {
-      ESP_LOGI("audioh", "poll: ff=%p interval_frames=%lu bytes=%u fifo_count=%lu frame_bytes=%u",
-               (void *)&s->edpt.ff, (unsigned long)frames, (unsigned)bytes,
-               (unsigned long)tu_fifo_count(&s->edpt.ff), s->frame_bytes);
-    }
-  }
   if (tu_fifo_count(&s->edpt.ff) < bytes) {
     // Isochronous OUT must continue at every interval. Send silence until a
     // complete packet is queued, leaving any partial packet in the FIFO.
     tu_memclr(s->edpt.ep_buf, bytes);
+    /* Count silence insertions: any nonzero count means the producer could
+     * not keep the FIFO fed (underrun = audible glitch). */
+    static uint32_t silence_count, silence_since_log;
+    silence_count++; silence_since_log++;
+    if ((silence_since_log % 441) == 0) {  /* ~every 441 ms */
+      ESP_LOGW("audioh", "SILENCE injected: total=%lu recent=%lu fifo=%lu",
+               silence_count, silence_since_log, (unsigned long)tu_fifo_count(&s->edpt.ff));
+      silence_since_log = 0;
+    }
   } else {
     tu_fifo_read_n(&s->edpt.ff, s->edpt.ep_buf, bytes);
-    /* One-shot dump of the first real packet contents (debug tone path). */
-    static bool dumped;
-    if (!dumped && bytes > 0) {
-      dumped = true;
-      ESP_LOGI("audioh", "first OUT packet: %u bytes, head:",
-               (unsigned)bytes);
-      ESP_LOG_BUFFER_HEX("audioh", s->edpt.ep_buf, bytes > 32 ? 32 : bytes);
-    }
   }
 
   if (!usbh_edpt_xfer(s->daddr, as->ep_addr, s->edpt.ep_buf, bytes)) {
@@ -912,6 +906,29 @@ bool audioh_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t result, uin
     }
   } else {
     // Notify the application before requesting the next playback packet.
+
+    /* Latency instrumentation: measure the gap between consecutive
+     * playback completions (periodicity) and the service time from
+     * completion to re-submission. Any gap > 2 ms means the host missed
+     * an iso deadline (bus contention); a stable ~1 ms periodicity means
+     * the host timing is fine and glitches come from elsewhere. */
+    {
+      static int64_t last_cb_us;
+      static int64_t max_service_us;
+      int64_t now = esp_timer_get_time();
+      static int64_t cb_start;
+      int64_t service = 0;
+      cb_start = now;
+      if (last_cb_us != 0) {
+        int64_t period = now - last_cb_us;
+        if (period > 2500) {  /* 2.5x the 1 ms deadline */
+          ESP_LOGW("audioh", "iso period %lld us (>2.5ms) - deadline missed", period);
+        }
+      }
+      last_cb_us = now;
+      (void)service; (void)max_service_us;
+    }
+
     tuh_audio_playback_cb(s->idx, s->stream_idx, (uint16_t)xferred_bytes);
     if (s->running && !audioh_stream_playback_xfer(s)) {
       audioh_stream_xfer_failed(s, XFER_RESULT_FAILED);

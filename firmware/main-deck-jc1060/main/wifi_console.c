@@ -10,6 +10,7 @@
  */
 
 #include "wifi_console.h"
+#include "usb_tu_app.h"
 
 #include <stdarg.h>
 #include <string.h>
@@ -133,6 +134,13 @@ static void wifi_event_cb(void* arg, esp_event_base_t base,
                           int32_t id, void* data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (usb_audio_wifi_suspended()) {
+            /* Audio owns the radio right now (Wi-Fi suspended to protect the
+             * USB iso stream from SDIO bus bursts). Do not reconnect until
+             * audio_wifi_resume() hands it back. */
+            ESP_LOGW(TAG, "Wi-Fi disconnected: audio owns the radio, not reconnecting");
+            return;
+        }
         wifi_event_sta_disconnected_t* evt = (wifi_event_sta_disconnected_t*)data;
         ESP_LOGW(TAG, "Wi-Fi disconnected, reason=%d, retrying in 3 s...",
                  evt->reason);
@@ -179,6 +187,8 @@ bool wifi_console_start(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    /* No power-save: PS bursts monopolize the SDIO bus and glitch USB audio. */
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
     /* RPC health probe: scan and check the target AP is visible. */
     {

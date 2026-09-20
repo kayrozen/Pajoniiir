@@ -16,7 +16,9 @@ CONFIG_SPIRAM_MODE_HEX=y
 CONFIG_SPIRAM_SPEED_200M=y
 CONFIG_SPIRAM_SIZE_OVERRIDE=16
 
-# Custom partition table: 4MB factory app (Wi-Fi + USB + LVGL stack is big)
+# 40 MHz SDIO bursts stall the AXI bus long enough to miss USB iso
+# deadlines (audio glitches). 20 MHz halves each burst length.
+CONFIG_ESP_HOSTED_SDIO_CLOCK_FREQ_KHZ=20000
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
@@ -53,9 +55,13 @@ CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 # OTA LAN bring-up: allow plain HTTP (production uses signed HTTPS)
 CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y
 
-# Log level INFO for bring-up diagnostics
-CONFIG_LOG_DEFAULT_LEVEL_INFO=y
-CONFIG_LOG_DEFAULT_LEVEL=3
+# Compiler: PERF like the production deck firmware (real-time audio + LVGL
+# concurrently; debug optimization leaves too little headroom).
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# Log level WARN: ESP_LOGI in the audio/USB path costs latency.
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+CONFIG_LOG_DEFAULT_LEVEL=2
 
 # Route the ROM/build console to USB-Serial-JTAG (same connector as flashing)
 # so the bring-up log is visible on the host USB port.

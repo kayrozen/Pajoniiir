@@ -36,6 +36,7 @@ void app_main(void)
     ESP_LOGI(TAG, "Board: %s", bsp_board_get_name());
 
     /* Display + LVGL. */
+#if 1 /* v37: display back ON (Wi-Fi/OTA/Eth stay OFF) */
     bsp_display_cfg_t disp_cfg = {
         .h_res = BSP_LCD_H_RES,
         .v_res = BSP_LCD_V_RES,
@@ -54,13 +55,11 @@ void app_main(void)
     } else {
         ESP_LOGE(TAG, "Display init failed");
     }
+#endif /* v37 display ON */
 
-    /* On-screen verbose log (teed, console keeps working). */
+    /* On-screen verbose log (teed). */
     log_screen_start();
     ESP_LOGI(TAG, "log screen test line");
-
-    esp_lcd_touch_handle_t tp = bsp_touch_start();
-    ESP_LOGI(TAG, "Touch %s", tp != NULL ? "initialized" : "unavailable");
 
     /* Audio codec (internal outs; DDJ audio route comes next). */
     bsp_audio_config_t audio_cfg = {
@@ -86,12 +85,14 @@ void app_main(void)
     if (nvs_ret != ESP_OK) {
         ESP_LOGE(TAG, "NVS init failed: %s", esp_err_to_name(nvs_ret));
     }
+#if 0 /* v51: back to v37 audio-clean config (Wi-Fi/OTA OFF) */
     if (!wifi_console_start()) {
         ESP_LOGW(TAG, "Wi-Fi console not available");
     }
     /* The Wi-Fi console installs its own log vprintf and drops ours - rehook. */
     log_screen_rehook();
     ota_update_start();
+#endif
 
     /* SD card (music library). */
     sdmmc_card_t* card = NULL;
@@ -103,7 +104,9 @@ void app_main(void)
 
     /* Controller surface (DDJ) + Ethernet (DJ Link path). */
     usb_tu_start();
+#if 0 /* v36 audio isolation: Ethernet OFF */
     eth_bringup_start();
+#endif
 
     ESP_LOGI(TAG, "Bring-up complete - entering UI loop");
 
