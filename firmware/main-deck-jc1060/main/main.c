@@ -95,8 +95,10 @@ void app_main(void)
     }
     /* The Wi-Fi console installs its own log vprintf and drops ours - rehook. */
     log_screen_rehook();
-    ota_update_start();
 #endif
+    /* v121: OTA pull over Ethernet - the console TCP client (:2333) IP becomes
+     * the OTA host (ota_update_set_host), serving <project>.bin on :8080. */
+    ota_update_start();
 
     /* v97: TCP console over Ethernet only (Wi-Fi parked). NOTE: do NOT call
      * log_screen_rehook() after console_tcp_start() - console chains into

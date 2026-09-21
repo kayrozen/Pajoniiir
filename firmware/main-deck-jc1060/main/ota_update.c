@@ -55,11 +55,13 @@ static void ota_task(void* arg)
             continue;
         }
 
-        char url[96];
-        snprintf(url, sizeof(url), "http://%s:%d/esp_draw_bit.bin",
-                 s_ota_host, OTA_HTTP_PORT);
-
         const esp_app_desc_t* cur = esp_app_get_description();
+        char url[96];
+        /* v121: serve the RUNNING project's image name (pajoniiir_deck.bin),
+         * not the old esp_draw_bit bring-up project. */
+        snprintf(url, sizeof(url), "http://%s:%d/%s.bin",
+                 s_ota_host, OTA_HTTP_PORT, cur->project_name);
+
         ESP_LOGI(TAG, "OTA check: %s (running '%s' %s)", url, cur->project_name,
                  cur->version);
 
