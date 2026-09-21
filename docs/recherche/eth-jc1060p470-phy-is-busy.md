@@ -300,3 +300,34 @@ lvgl) dans un projet hybride qui COMPILE (le test hybride audio a échoué sur
 un include, à reprendre avec les bons includes: board.h/audio.h).
 Alternative rapide : désactiver les composants dans main-deck-jc1060
 (idf_component.yml / CMakeLists) un par un et mesurer.
+
+## Fin de session nocturne — bilan et plan de reprise
+
+Tests réalisés cette nuit (tous flashés + vérifiés sur hardware) :
+| Version | Config | Résultat ETH |
+|---|---|---|
+| v97/v98 | USB OFF + chaîne vprintf réparée | crash (récursion tees, corrigé) puis Load fault |
+| v99/v100 | stack main 16 KB + scan MDIO (bon handle) | **MDIO scan OK : IP101GR @ addr 1, ID 0x02430c54** |
+| v101/v103 | + display OFF, + audio OFF | scan OK, toujours pas de link event |
+| v104 | + FREERTOS_HZ=100 | idem |
+| v105 | + DEBUG logs eth | idem — aucun log du stack eth après start |
+
+Constats fermes :
+- PHY IP101GR vivant, bus MDIO OK, adresse 1 confirmée (ID 0x02430c54).
+- IDF 6.0.2 est capable de faire l'ETH sur cette board (exemple vendor :
+  Link Up + IP 192.168.100.132, y compris avec PSRAM 200M HEX+XIP).
+- Donc le blocage est spécifique au build Pajoniiir : différence dans le
+  sdkconfig global ou un composant LIÉ (non démarré) qui interfère.
+
+Plan de reprise (dans l'ordre) :
+1. A/B sdkconfig : compiler l'exemple vendor avec le sdkconfig.defaults
+   complet de Pajoniiir (PKT_STATS, cache L2, C2M chunked, etc.). Le diff
+   sdkconfig initial n'a rien montré côté ETH — approfondir (ISR, prio).
+2. Retirer de Pajoniiir les composants LIÉS un par un : esp_hosted,
+   tinyusb (usb_tu_app lié), lvgl — mesurer à chaque retrait.
+3. Si tout échoue : comparer le comportement GPIO50 (REF_CLK) à l'oscillo.
+4. Considérer la voie espcontrol : compiler le variant ethernet ESPHome
+   (network_transport: ethernet) comme référence croisée matérielle.
+
+Ne pas oublier : le test croisé vendor IDP 5.5.4 = Link Up + IP CONFIRMÉ
+(capture dans l'historique session) — le hardware est sain.
