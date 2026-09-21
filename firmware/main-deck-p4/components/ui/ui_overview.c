@@ -134,40 +134,122 @@ static void ui_obj_set_x_if_changed(lv_obj_t *obj, int32_t x)
     lv_obj_set_x(obj, x);
 }
 
-// Waveform visualizer definitions
+// Waveform visualizer definitions.
+// Two authored layouts: 800x480 (P4 JC4880 panel) and 1024x600 (JC1060P470).
+// Derived macros below (strip width, centres, beat-strip origin) stay shared.
+#ifdef UI_TARGET_JC1060
+/* 1024x600: +224 px width goes to the waveform and deck-info column; the FX
+ * rail keeps its 64 px width and slides to the right edge. +112 px height is
+ * split between taller waveform lanes (141→175), a taller mini waveform and a
+ * proportionally taller FX depth meter. */
+#define OVERVIEW_CV_W 860
+#define OVERVIEW_CV_H 175
+#define OVERVIEW_MINI_CV_W 502
+#define OVERVIEW_MINI_CV_H 59
+#define OVERVIEW_WAVE_X 82
+#define OVERVIEW_DECK_BADGE_Y_OFFSET 16
+#define OVERVIEW_TRANSPORT_PLAY_Y_OFFSET 74
+#define OVERVIEW_TRANSPORT_CUE_Y_OFFSET 126
+#define OVERVIEW_VU_Y_OFFSET 4
+#define OVERVIEW_VU_SEGMENT_H 14
+#define OVERVIEW_DECK_INFO_W 520
+#define OVERVIEW_TITLE_Y 404
+#define OVERVIEW_TITLE_H 36
+#define OVERVIEW_TITLE_TEXT_W 512
+#define OVERVIEW_INFO_DIVIDER_Y 442
+#define OVERVIEW_INFO_ROW_Y 444
+#define OVERVIEW_TIME_Y 452
+#define OVERVIEW_MIX_ROW_Y 468
+#define OVERVIEW_BPM_X 224
+#define OVERVIEW_BPM_Y 446
+#define OVERVIEW_BPM_TAG_X 334
+#define OVERVIEW_TIME_X 10
+#define OVERVIEW_ELAPSED_W 94
+#define OVERVIEW_REMAIN_X 118
+#define OVERVIEW_REMAIN_W 104
+#define OVERVIEW_PITCH_X 380
+#define OVERVIEW_MT_X 480
+#define OVERVIEW_MINI_WAVE_Y 484
+#define OVERVIEW_BEAT_STRIP_DOT_SIZE_PX 14
+#define OVERVIEW_BEAT_STRIP_STEP_PX 30
+#define OVERVIEW_BEAT_STRIP_CENTER_GAP_PX 22
+#define OVERVIEW_BEAT_STRIP_ROW_GAP_PX 14
+#define OVERVIEW_FX_CHIP_Y 36
+#define OVERVIEW_FX_TARGET_CAPTION_Y 86
+#define OVERVIEW_FX_PILL_Y 104
+#define OVERVIEW_FX_BEAT_CAPTION_Y 140
+#define OVERVIEW_FX_BEAT_CHIP_Y 152
+#define OVERVIEW_FX_DEPTH_CAPTION_Y 190
+#define OVERVIEW_FX_DEPTH_BAR_Y 204
+#define OVERVIEW_FX_DEPTH_BAR_H 150
+#define OVERVIEW_FX_DEPTH_VALUE_Y 360
+#define OVERVIEW_FX_PANEL_X 950
+#define OVERVIEW_FX_PANEL_H 400
+#else
+/* 800x480 reference layout (unchanged). */
 #define OVERVIEW_CV_W 648
 #define OVERVIEW_CV_H 141
-#define OVERVIEW_WAVE_STRIP_MARGIN_PX UI_OVERVIEW_WAVE_CACHE_MARGIN_PX
-#define OVERVIEW_WAVE_STRIP_W (OVERVIEW_CV_W + (OVERVIEW_WAVE_STRIP_MARGIN_PX * 2))
-_Static_assert(OVERVIEW_WAVE_STRIP_W > OVERVIEW_CV_W, "wave strip must be wider than visible canvas");
 #define OVERVIEW_MINI_CV_W 392
 #define OVERVIEW_MINI_CV_H 45
 #define OVERVIEW_WAVE_X 82
-#define OVERVIEW_WAVE_INSET_X 0
-#define OVERVIEW_WAVE_INSET_Y 0
-#define OVERVIEW_DECK1_WAVE_Y 0
-#define OVERVIEW_DECK2_WAVE_Y 142
-#define OVERVIEW_WAVE_CENTER_X (OVERVIEW_WAVE_X + OVERVIEW_WAVE_INSET_X + (OVERVIEW_CV_W / 2))
+#define OVERVIEW_DECK_BADGE_Y_OFFSET 12
+#define OVERVIEW_TRANSPORT_PLAY_Y_OFFSET 60
+#define OVERVIEW_TRANSPORT_CUE_Y_OFFSET 102
+#define OVERVIEW_VU_Y_OFFSET 3
+#define OVERVIEW_VU_SEGMENT_H 11
+#define OVERVIEW_DECK_INFO_W 400
+#define OVERVIEW_TITLE_Y 312
+#define OVERVIEW_TITLE_H 30
+#define OVERVIEW_TITLE_TEXT_W 392
+#define OVERVIEW_INFO_DIVIDER_Y 344
+#define OVERVIEW_INFO_ROW_Y 346
+#define OVERVIEW_TIME_Y 354
+#define OVERVIEW_MIX_ROW_Y 370
+#define OVERVIEW_BPM_X 170
+#define OVERVIEW_BPM_Y 348
+#define OVERVIEW_BPM_TAG_X 252
+#define OVERVIEW_TIME_X 8
+#define OVERVIEW_ELAPSED_W 72
+#define OVERVIEW_REMAIN_X 90
+#define OVERVIEW_REMAIN_W 80
+#define OVERVIEW_PITCH_X 286
+#define OVERVIEW_MT_X 360
+#define OVERVIEW_MINI_WAVE_Y 386
 #define OVERVIEW_BEAT_STRIP_DOT_SIZE_PX 12
 #define OVERVIEW_BEAT_STRIP_STEP_PX 24
 #define OVERVIEW_BEAT_STRIP_CENTER_GAP_PX 18
-#define OVERVIEW_BEAT_STRIP_TOP_Y (OVERVIEW_DECK2_WAVE_Y + OVERVIEW_CV_H + 5)
 #define OVERVIEW_BEAT_STRIP_ROW_GAP_PX 12
+#define OVERVIEW_FX_CHIP_Y 28
+#define OVERVIEW_FX_TARGET_CAPTION_Y 68
+#define OVERVIEW_FX_PILL_Y 82
+#define OVERVIEW_FX_BEAT_CAPTION_Y 110
+#define OVERVIEW_FX_BEAT_CHIP_Y 122
+#define OVERVIEW_FX_DEPTH_CAPTION_Y 150
+#define OVERVIEW_FX_DEPTH_BAR_Y 164
+#define OVERVIEW_FX_DEPTH_BAR_H 112
+#define OVERVIEW_FX_DEPTH_VALUE_Y 282
+#define OVERVIEW_FX_PANEL_X 736
+#define OVERVIEW_FX_PANEL_H 308
+#endif
+#define OVERVIEW_WAVE_STRIP_MARGIN_PX UI_OVERVIEW_WAVE_CACHE_MARGIN_PX
+#define OVERVIEW_BPM_W 80
+#define OVERVIEW_FX_PANEL_W 64
+#define OVERVIEW_WAVE_STRIP_W (OVERVIEW_CV_W + (OVERVIEW_WAVE_STRIP_MARGIN_PX * 2))
+_Static_assert(OVERVIEW_WAVE_STRIP_W > OVERVIEW_CV_W, "wave strip must be wider than visible canvas");
+#define OVERVIEW_WAVE_INSET_X 0
+#define OVERVIEW_WAVE_INSET_Y 0
+/* Deck 2 lane starts one pixel below deck 1 so the lane border stays visible. */
+#define OVERVIEW_DECK1_WAVE_Y 0
+#define OVERVIEW_DECK2_WAVE_Y (OVERVIEW_CV_H + 1)
+#define OVERVIEW_WAVE_CENTER_X (OVERVIEW_WAVE_X + OVERVIEW_WAVE_INSET_X + (OVERVIEW_CV_W / 2))
+#define OVERVIEW_BEAT_STRIP_TOP_Y (OVERVIEW_DECK2_WAVE_Y + OVERVIEW_CV_H + 5)
 #define OVERVIEW_DECK_BADGE_X 4
 #define OVERVIEW_DECK_BADGE_W 58
 #define OVERVIEW_DECK_BADGE_H 38
-#define OVERVIEW_DECK_BADGE_Y_OFFSET 12
 #define OVERVIEW_TRANSPORT_X 4
 #define OVERVIEW_TRANSPORT_W 58
-#define OVERVIEW_TRANSPORT_PLAY_Y_OFFSET 60
-#define OVERVIEW_TRANSPORT_CUE_Y_OFFSET 102
 #define OVERVIEW_VU_X 68
-/* 10 segments: the middle 8 keep their old positions; one segment is added at
- * the top and one at the bottom (Y_OFFSET moved up by one segment pitch, 17→3,
- * so the meter stays centred in the deck lane). */
-#define OVERVIEW_VU_Y_OFFSET 3
 #define OVERVIEW_VU_SEGMENT_W 10
-#define OVERVIEW_VU_SEGMENT_H 11
 #define OVERVIEW_VU_SEGMENT_GAP 3
 #define OVERVIEW_VU_SEGMENT_COUNT 10
 #define OVERVIEW_VU_H ((OVERVIEW_VU_SEGMENT_COUNT * OVERVIEW_VU_SEGMENT_H) + \
@@ -182,78 +264,40 @@ _Static_assert(OVERVIEW_VU_Y_OFFSET + OVERVIEW_VU_H <= OVERVIEW_CV_H,
                "VU meter must fit within the deck waveform lane height");
 #define OVERVIEW_PLAYHEAD_W 3
 #define OVERVIEW_OUTLINE_W 1
-#define OVERVIEW_DECK_INFO_W 400
-#define OVERVIEW_TITLE_Y 312
-#define OVERVIEW_TITLE_H 30
-#define OVERVIEW_TITLE_TEXT_W 392
-#define OVERVIEW_INFO_DIVIDER_Y 344
-#define OVERVIEW_INFO_ROW_Y 346
-#define OVERVIEW_TIME_Y 354
-#define OVERVIEW_MIX_ROW_Y 370
-#define OVERVIEW_BPM_X 170
-#define OVERVIEW_BPM_Y 348
-#define OVERVIEW_BPM_W 80
-#define OVERVIEW_BPM_TAG_X 252
-/* Per-deck time counters on the BPM row (out of the blue title strip, which is
- * now title-only), at the BPM font size: elapsed at the title-aligned start, then
- * a gap, then remaining. Widths hold a full "MM:SS" / "-MM:SS" at montserrat_24
- * (worst-case ~69 / ~79 px) so neither clips into the other; both stay left of
- * the BPM value. */
-#define OVERVIEW_TIME_X 8
-#define OVERVIEW_ELAPSED_W 72
-#define OVERVIEW_REMAIN_X 90
-#define OVERVIEW_REMAIN_W 80
 _Static_assert(OVERVIEW_REMAIN_X + OVERVIEW_REMAIN_W <= OVERVIEW_BPM_X, "overview time counters must stay left of the BPM value");
 _Static_assert(OVERVIEW_TIME_X + OVERVIEW_ELAPSED_W <= OVERVIEW_REMAIN_X, "elapsed time must not overlap the remaining time");
-#define OVERVIEW_PITCH_X 286
-#define OVERVIEW_PITCH_Y 346
+#define OVERVIEW_PITCH_Y OVERVIEW_INFO_ROW_Y
 #define OVERVIEW_PITCH_CHIP_W 70
 #define OVERVIEW_PITCH_CHIP_H 28
 #define OVERVIEW_PITCH_W OVERVIEW_PITCH_CHIP_W
-#define OVERVIEW_MT_X 360
 #define OVERVIEW_MT_W 36
 _Static_assert(OVERVIEW_PITCH_X + OVERVIEW_PITCH_CHIP_W <= OVERVIEW_MT_X,
                "pitch chip must not overlap Master Tempo");
 _Static_assert(OVERVIEW_MT_X + OVERVIEW_MT_W <= OVERVIEW_DECK_INFO_W,
                "Master Tempo must fit in its deck info column");
-#define OVERVIEW_MINI_WAVE_Y 386
 #define OVERVIEW_SIDE_BTN_H 38
 /* The D1/D2 deck badges are sized to match the play/cue transport buttons. */
 _Static_assert(OVERVIEW_DECK_BADGE_W == OVERVIEW_TRANSPORT_W, "deck badge width must match the play/cue buttons");
 _Static_assert(OVERVIEW_DECK_BADGE_H == OVERVIEW_SIDE_BTN_H, "deck badge height must match the play/cue buttons");
-#define OVERVIEW_FX_PANEL_X 736
 #define OVERVIEW_FX_PANEL_Y 0
-#define OVERVIEW_FX_PANEL_W 64
-/* Panel runs from the top down to just above the blue title strip so the depth
- * meter fills the whole right rail with no dead space at the bottom. */
-#define OVERVIEW_FX_PANEL_H 308
 #define OVERVIEW_FX_ROW_X 4
 #define OVERVIEW_FX_ROW_W 56
 /* Effect identity chip (big, filled in the effect colour when FX is on). */
 #define OVERVIEW_FX_CHIP_X 4
-#define OVERVIEW_FX_CHIP_Y 28
 #define OVERVIEW_FX_CHIP_W 56
 #define OVERVIEW_FX_CHIP_H 36
 /* Target channel pills (CH1 / CH2), lit in the effect colour when routed. */
-#define OVERVIEW_FX_TARGET_CAPTION_Y 68
-#define OVERVIEW_FX_PILL_Y 82
 #define OVERVIEW_FX_PILL_W 25
 #define OVERVIEW_FX_PILL_H 22
 #define OVERVIEW_FX_PILL1_X 5
 #define OVERVIEW_FX_PILL2_X 34
 /* Beat-division chip. */
-#define OVERVIEW_FX_BEAT_CAPTION_Y 110
 #define OVERVIEW_FX_BEAT_CHIP_X 12
-#define OVERVIEW_FX_BEAT_CHIP_Y 122
 #define OVERVIEW_FX_BEAT_CHIP_W 40
 #define OVERVIEW_FX_BEAT_CHIP_H 22
 /* Depth is a vertical fill meter (fills bottom-up) — the live-ride element. */
-#define OVERVIEW_FX_DEPTH_CAPTION_Y 150
 #define OVERVIEW_FX_DEPTH_BAR_X 20
-#define OVERVIEW_FX_DEPTH_BAR_Y 164
 #define OVERVIEW_FX_DEPTH_BAR_W 24
-#define OVERVIEW_FX_DEPTH_BAR_H 112
-#define OVERVIEW_FX_DEPTH_VALUE_Y 282
 _Static_assert(OVERVIEW_FX_DEPTH_VALUE_Y + 22 <= OVERVIEW_FX_PANEL_H,
                "FX depth value must stay inside the FX panel");
 _Static_assert(OVERVIEW_FX_DEPTH_BAR_Y + OVERVIEW_FX_DEPTH_BAR_H <= OVERVIEW_FX_DEPTH_VALUE_Y,
@@ -262,6 +306,8 @@ _Static_assert(OVERVIEW_FX_PILL2_X + OVERVIEW_FX_PILL_W <= OVERVIEW_FX_PANEL_W,
                "FX target pills must stay inside the FX panel");
 _Static_assert(OVERVIEW_FX_PANEL_Y + OVERVIEW_FX_PANEL_H <= OVERVIEW_TITLE_Y,
                "FX panel must stay above the blue title strip");
+_Static_assert(OVERVIEW_MINI_WAVE_Y + OVERVIEW_MINI_CV_H + 3 <= UI_CONTENT_H,
+               "mini waveform must stay inside the overview panel");
 
 static int ui_overview_beat_strip_offset_x(int phase)
 {

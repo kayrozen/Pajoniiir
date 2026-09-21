@@ -612,7 +612,12 @@ lv_obj_t *ui_settings_create(lv_obj_t *parent)
 #endif
 
     const int left_x = 30;
-    const int left_w = 350;
+    /* Columns scale with the panel: 800-wide keeps the original 350/360 split,
+     * wider panels (JC1060 1024) stretch both columns proportionally. */
+    const int left_w = (s_config.hor_res >= 1000) ? 460 : 350;
+    const int right_x = left_x + left_w + 30;
+    const int right_w = s_config.hor_res - right_x - 30;
+    const int mixer_w = s_config.hor_res - 60;
 
     lv_obj_t *display_section = ui_settings_section(screen, left_x, 20, left_w, 86, "DISPLAY");
     lv_obj_t *slider_backlight = lv_slider_create(display_section);
@@ -711,7 +716,7 @@ lv_obj_t *ui_settings_create(lv_obj_t *parent)
 
 #endif  /* CONFIG_AUDIO_RECORDER_ENABLED */
 
-    lv_obj_t *status_section = ui_settings_section(screen, 410, 20, 360, 210, "SYSTEM STATUS");
+    lv_obj_t *status_section = ui_settings_section(screen, right_x, 20, right_w, 210, "SYSTEM STATUS");
 
     lv_obj_t *label_uart_status =
         ui_settings_value_label(status_section,
@@ -772,7 +777,7 @@ lv_obj_t *ui_settings_create(lv_obj_t *parent)
     }
 #endif
 
-    lv_obj_t *wifi_section = ui_settings_section(screen, 410, 240, 360, 108, "WIRELESS");
+    lv_obj_t *wifi_section = ui_settings_section(screen, right_x, 240, right_w, 108, "WIRELESS");
     lv_obj_t *sw_wifi = lv_switch_create(wifi_section);
     ui_settings_style_wireless_switch(sw_wifi, COL_GREEN);
     lv_obj_set_pos(sw_wifi, 16, 38);
@@ -801,7 +806,7 @@ lv_obj_t *ui_settings_create(lv_obj_t *parent)
     s_s3_debug_ap_displayed_token = UINT32_MAX;
     ui_settings_apply_s3_debug_ap_status();
 
-    lv_obj_t *mixer_section = ui_settings_section(screen, 30, 356, 740, 64, "MIXER STATUS");
+    lv_obj_t *mixer_section = ui_settings_section(screen, 30, 356, mixer_w, 64, "MIXER STATUS");
     ui_settings_static_tile(mixer_section, 18, 34, 110, 22,
                             "MIXER: FLX4", COL_TEXT_MUTED, COL_PANEL_DK, COL_BORDER);
     ui_settings_static_tile(mixer_section, 140, 34, 104, 22,
