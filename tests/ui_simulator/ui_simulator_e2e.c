@@ -8,6 +8,12 @@
 #include "ui.h"
 #include "splash_screen.h"
 
+#ifndef UI_HOR_RES
+#define UI_HOR_RES 800
+#endif
+#ifndef UI_VER_RES
+#define UI_VER_RES 480
+#endif
 #define DISPLAY_WIDTH  UI_HOR_RES
 #define DISPLAY_HEIGHT UI_VER_RES
 #define TICK_STEP_MS 16u
@@ -41,6 +47,27 @@ static void pump(uint32_t duration_ms)
     lv_refr_now(s_display);
 }
 
+static lv_obj_t *find_any_label(lv_obj_t *root, const char *text)
+{
+    if (!root || !text) {
+        return NULL;
+    }
+    if (lv_obj_check_type(root, &lv_label_class)) {
+        const char *value = lv_label_get_text(root);
+        if (value && strcmp(value, text) == 0) {
+            return root;
+        }
+    }
+    uint32_t count = lv_obj_get_child_count(root);
+    for (uint32_t i = 0; i < count; i++) {
+        lv_obj_t *found = find_any_label(lv_obj_get_child(root, (int32_t)i), text);
+        if (found) {
+            return found;
+        }
+    }
+    return NULL;
+}
+
 static lv_obj_t *find_visible_label(lv_obj_t *root, const char *text)
 {
     if (!root || !text) {
@@ -62,11 +89,56 @@ static lv_obj_t *find_visible_label(lv_obj_t *root, const char *text)
     return NULL;
 }
 
+static void dump_visible_labels(lv_obj_t *root, int depth)
+{
+    if (!root || depth > 8) {
+        return;
+    }
+    if (lv_obj_check_type(root, &lv_label_class)) {
+        const char *value = lv_label_get_text(root);
+        bool vis = lv_obj_is_visible(root);
+        fprintf(stderr, "  [label depth=%d %s] '%s'\n", depth, vis ? "vis" : "HID",
+                value ? value : "(null)");
+    }
+    uint32_t count = lv_obj_get_child_count(root);
+    for (uint32_t i = 0; i < count; i++) {
+        dump_visible_labels(lv_obj_get_child(root, (int32_t)i), depth + 1);
+    }
+}
+
+static void dump_label_ancestors(lv_obj_t *label)
+{
+    lv_obj_t *obj = label;
+    int depth = 0;
+    while (obj) {
+        bool hidden = lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN);
+        fprintf(stderr, "  [anc %d] hidden=%d pos=(%d,%d) size=(%dx%d)\n", depth,
+                hidden ? 1 : 0,
+                (int)lv_obj_get_x(obj), (int)lv_obj_get_y(obj),
+                (int)lv_obj_get_width(obj), (int)lv_obj_get_height(obj));
+        obj = lv_obj_get_parent(obj);
+        depth++;
+    }
+}
+
 static bool click_label(const char *text)
 {
     lv_obj_t *label = find_visible_label(lv_screen_active(), text);
     if (!label) {
         fprintf(stderr, "Missing visible label: %s\n", text);
+        if (getenv("UI_SIM_DEBUG")) {
+            fprintf(stderr, "Visible labels on active screen:\n");
+            dump_visible_labels(lv_screen_active(), 0);
+            lv_obj_t *dbg = find_visible_label(lv_screen_active(), text);
+            if (!dbg) {
+                /* label exists but hidden — find it ignoring visibility */
+                dbg = find_any_label(lv_screen_active(), text);
+            }
+            if (dbg) {
+                fprintf(stderr, "Ancestors of '%s':\n", text);
+                dump_label_ancestors(dbg);
+            }
+        }
         return false;
     }
     lv_obj_t *target = label;

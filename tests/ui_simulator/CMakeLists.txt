@@ -84,11 +84,6 @@ target_compile_definitions(ui_simulator_e2e PRIVATE
     CONFIG_AUDIO_SCRATCH_ENABLED=0
 )
 
-target_compile_options(ui_simulator_e2e PRIVATE
-    -DUI_HOR_RES=800
-    -DUI_VER_RES=480
-)
-
 target_include_directories(ui_simulator_e2e PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"
     "${REPO_ROOT}/tests/deck_core_dual/stubs"

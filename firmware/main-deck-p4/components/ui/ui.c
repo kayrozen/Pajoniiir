@@ -890,7 +890,7 @@ esp_err_t ui_init(void) {
     s_root_container = lv_obj_create(s_main_screen);
     lv_obj_remove_style_all(s_root_container);
     lv_obj_add_style(s_root_container, &s_style_root, LV_PART_MAIN);
-    lv_obj_set_size(s_root_container, 800, 480);
+    lv_obj_set_size(s_root_container, UI_HOR_RES, UI_VER_RES);
 
     // Initialize mock database system (if simulator)
 #ifdef WIN32
