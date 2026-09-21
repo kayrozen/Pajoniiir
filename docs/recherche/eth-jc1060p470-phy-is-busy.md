@@ -331,3 +331,22 @@ Plan de reprise (dans l'ordre) :
 
 Ne pas oublier : le test croisé vendor IDP 5.5.4 = Link Up + IP CONFIRMÉ
 (capture dans l'historique session) — le hardware est sain.
+
+## Test A/B n°1 (sdkconfig complet de Pajoniiir dans l'exemple vendor)
+
+Résultat : l'exemple ne boot PAS avec le sdkconfig complet de Pajoniiir
+(figé à ~1,2 s, avant app_main — mais test non concluant tel quel : la
+partition table custom + tous les composants absents de l'exemple rendent
+la comparaison invalide).
+
+Conclusion de la nuit : l'approche "config entière d'un coup" ne permet pas
+d'isoler. Reprendre par bissection de groupes d'options (PSRAM, PKT_STATS,
+cache, FREERTOS) DANS l'exemple vendor, ou par ajout progressif des
+composants Pajoniiir dans l'exemple (audio init d'abord — include BSP:
+board.h/audio.h, EXTRA_COMPONENT_DIRS /pajoniiir/... nécessite fullclean).
+
+## État hardware laissé en place
+- Tablette : dernier flash = exemple vendor avec sdkconfig Pajoniiir (boot
+  figé) → AU MATIN : reflasher Pajoniiir v104 (build/ prêt) avant tout test.
+- Exemple vendor fonctionnel validé : /tmp/jcy (IDF 5.5.4) et /tmp/eth_ab
+  (IDF 6.0.2, défauts propres) = Link Up + Got IP confirmés.
