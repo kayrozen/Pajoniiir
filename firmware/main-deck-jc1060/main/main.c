@@ -109,8 +109,9 @@ void app_main(void)
         ESP_LOGW(TAG, "SD card not available");
     }
 
-    /* Controller surface (DDJ) + Ethernet (v89: console debug par ETH). */
-    usb_tu_start();
+    /* v96 differential test: USB OFF - the TinyUSB UTMI PHY may share
+     * clock/power resources with the EMAC. */
+    /* usb_tu_start(); */
     eth_bringup_start();
 
     ESP_LOGI(TAG, "Bring-up complete - entering UI loop");
