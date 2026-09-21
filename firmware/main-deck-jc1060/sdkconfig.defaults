@@ -75,7 +75,8 @@ CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y
 CONFIG_ESP_HOSTED_PKT_STATS=y
 CONFIG_ESP_HOSTED_PKT_STATS_INTERVAL_SEC=2
 # v104 A/B: test with default 100 Hz tick (the working vendor example runs at
-# 100 Hz). CONFIG_FREERTOS_HZ=1000
+# 100 Hz tick during the v104 A/B test; restored to 1000 Hz in v106
+CONFIG_FREERTOS_HZ=1000
 # v99: 16 KB - the main task runs UI/log/console/ETH bring-up (main-deck-p4
 # documents the same 16 KB; 3584 overflowed with the vprintf tees + MDIO scan
 # and corrupted the EMAC handle -> Load access fault in esp_eth_driver_install).

@@ -83,22 +83,10 @@ bool eth_bringup_start(void)
      * they localize exactly where bring-up stalls (if it does). */
     ESP_LOGW(TAG, "step 1: event loop + netif init");
 
-    /* v90: ESPControl's ethernet config for this board sets power_pin GPIO51
-     * - the IP101 PHY supply rail. Without it the PHY never powers up fully.
-     * Drive it HIGH and give the PHY time to come out of reset. */
-    gpio_config_t pwr_cfg = {
-        .pin_bit_mask = 1ULL << 51,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&pwr_cfg);
-    /* v95: GPIO51 = PHY RESET_N (actif bas, cf. esp-p4-eth/Waveshare pin map
-     * et ESPHome ethernet power_pin->reset_gpio_num). Laissons le driver IDF
-     * faire sa séquence reset propre - PAS de pilotage manuel. */
-    vTaskDelay(pdMS_TO_TICKS(300)); /* ESPHome: "allow power to stabilise" */
-    ESP_LOGW(TAG, "step 2: power settle done");
+    /* v113: no manual GPIO51 handling, no power settle - the IDF driver
+     * owns the PHY reset (reset_gpio_num) exactly like the working vendor
+     * example. Every deviation from the example is a suspect. */
+    ESP_LOGW(TAG, "step 2: (defaults - no manual power settle)");
 
     /* ETH_EVENT needs a default event loop; nothing else created one yet. */
     esp_err_t loop_ret = esp_event_loop_create_default();
@@ -116,23 +104,16 @@ bool eth_bringup_start(void)
     }
 
     eth_esp32_emac_config_t mac_config = ETH_ESP32_EMAC_DEFAULT_CONFIG();
-    /* v93: explicit 2 MHz MDC - the auto divider may exceed the IP101 SMI
-     * limit and leave MDIO transactions hanging ("phy is busy"). */
-    mac_config.mdc_freq_hz = 2000000;
-    /* Defaults match the JC1060P470C board: MDC=31, MDIO=52,
-     * RMII REF_CLK input on GPIO50 (50 MHz from the IP101 PHY). */
+    /* v113: ALL defaults, exactly like the working vendor example
+     * (P4 defaults are already MDC=31, MDIO=52, CLK_EXT_IN GPIO50). */
     eth_mac_config_t mac_time_config = ETH_MAC_DEFAULT_CONFIG();
     ESP_LOGW(TAG, "step 3: creating MAC/PHY objects");
     esp_eth_mac_t* mac = esp_eth_mac_new_esp32(&mac_config, &mac_time_config);
 
     eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();
     phy_config.phy_addr = 1;              /* IP101 SMI address (EspControl) */
-    phy_config.autonego_timeout_ms = 4000;
-    /* v95: GPIO51 = PHY RESET_N - let the IDF driver own the reset, with a
-     * post-reset delay (default 0 is too short for the IP101; esp-p4-eth
-     * documents MDIO timeouts without it). */
+    /* v113: autonego/post-reset back to defaults (100 ms / 0). */
     phy_config.reset_gpio_num = 51;
-    phy_config.post_hw_reset_delay_ms = 300;
     esp_eth_phy_t* phy = esp_eth_phy_new_generic(&phy_config); /* IDF6: generic covers IP101 (802.3) */
 
     esp_eth_config_t eth_config = ETH_DEFAULT_CONFIG(mac, phy);
@@ -143,10 +124,12 @@ bool eth_bringup_start(void)
         return false;
     }
 
-    /* v94/v100: MDIO scan BEFORE esp_eth_start - the generic PHY's autonego
-     * polling collides with our raw reads once the driver runs ("phy is
-     * busy" was a self-inflicted MDIO collision, not a dead bus).
-     * NOTE: first arg is the MAC object itself (containerof). */
+    /* v112: MDIO scan DISABLED - with the scan enabled the eth stack stays
+     * silent after start AND the LVGL display flickers (eth task suspected
+     * of spinning on stuck-SMI reads). The vendor example (no pre-start
+     * scan) gets Link Up + IP on this board, so the driver must own the
+     * SMI bus from install onward. */
+#if 0
     for (int addr = 0; addr < 32; addr++) {
         uint32_t bmsr = 0;
         if (mac->read_phy_reg(mac, addr, 0x01, &bmsr) == ESP_OK &&
@@ -158,6 +141,7 @@ bool eth_bringup_start(void)
                      addr, bmsr, id1, id2);
         }
     }
+#endif
 
     ret = esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, eth_event_cb, NULL);
     if (ret != ESP_OK) {

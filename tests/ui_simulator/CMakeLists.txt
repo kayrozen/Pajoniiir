@@ -12,6 +12,11 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Default target: P4 (800x480)
+if(NOT UI_TARGET)
+    set(UI_TARGET P4)
+endif()
+
 set(LV_BUILD_CONF_PATH "${CMAKE_CURRENT_SOURCE_DIR}/lv_conf.h" CACHE FILEPATH "" FORCE)
 set(CONFIG_LV_BUILD_DEMOS OFF CACHE BOOL "" FORCE)
 set(CONFIG_LV_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -23,7 +28,8 @@ add_subdirectory("${LVGL_DIR}" "${CMAKE_BINARY_DIR}/lvgl" EXCLUDE_FROM_ALL)
 set(UI_DIR "${REPO_ROOT}/firmware/main-deck-p4/components/ui")
 set(LIBRARY_DIR "${REPO_ROOT}/firmware/main-deck-p4/components/library")
 
-add_executable(ui_simulator_e2e
+# Shared source files for both targets
+set(UI_SIM_SRC
     ui_simulator_e2e.c
     simulator_library.c
     simulator_mocks.c
@@ -67,6 +73,9 @@ add_executable(ui_simulator_e2e
     "${REPO_ROOT}/tests/deck_core_dual/hot_cue_store_stub.c"
 )
 
+# ── P4 target (800x480) ───────────────────────────────────────────────────────
+add_executable(ui_simulator_e2e ${UI_SIM_SRC})
+
 target_compile_definitions(ui_simulator_e2e PRIVATE
     WIN32=1
     DECK_CORE_PC_TEST=1
@@ -75,10 +84,13 @@ target_compile_definitions(ui_simulator_e2e PRIVATE
     CONFIG_AUDIO_SCRATCH_ENABLED=0
 )
 
+target_compile_options(ui_simulator_e2e PRIVATE
+    -DUI_HOR_RES=800
+    -DUI_VER_RES=480
+)
+
 target_include_directories(ui_simulator_e2e PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"
-    # deck_core_dual first for its wall-clock esp_timer.h and audio_engine.h
-    # component fake; shared platform stubs behind it.
     "${REPO_ROOT}/tests/deck_core_dual/stubs"
     "${REPO_ROOT}/tests/support/stubs"
     "${UI_DIR}/include"
@@ -97,4 +109,47 @@ target_link_libraries(ui_simulator_e2e PRIVATE lvgl m)
 
 if(MINGW)
     target_link_options(ui_simulator_e2e PRIVATE -static-libgcc -static-libstdc++)
+endif()
+
+# ── JC1060 target (1024x600) ──────────────────────────────────────────────────
+add_executable(ui_simulator_e2e_jc1060 ${UI_SIM_SRC})
+
+target_compile_definitions(ui_simulator_e2e_jc1060 PRIVATE
+    WIN32=1
+    DECK_CORE_PC_TEST=1
+    REKORDBOX_PDB_STANDALONE_TEST=1
+    CONFIG_AUDIO_RECORDER_ENABLED=0
+    CONFIG_AUDIO_SCRATCH_ENABLED=0
+    UI_TARGET_JC1060=1
+)
+
+target_compile_options(ui_simulator_e2e_jc1060 PRIVATE
+    -DUI_HOR_RES=1024
+    -DUI_VER_RES=600
+    -DUI_TOPBAR_H=54
+    -DUI_CONTENT_Y=54
+    -DUI_CONTENT_H=546
+    -DLV_CONF_INCLUDE="\"${CMAKE_CURRENT_SOURCE_DIR}/lv_conf_jc1060.h\""
+)
+
+target_include_directories(ui_simulator_e2e_jc1060 PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${REPO_ROOT}/tests/deck_core_dual/stubs"
+    "${REPO_ROOT}/tests/support/stubs"
+    "${UI_DIR}/include"
+    "${LIBRARY_DIR}/include"
+    "${REPO_ROOT}/firmware/main-deck-p4/components/deck_core/include"
+    "${REPO_ROOT}/firmware/main-deck-p4/components/beat_jump/include"
+    "${REPO_ROOT}/firmware/main-deck-p4/components/control_link/include"
+    "${REPO_ROOT}/firmware/main-deck-p4/components/hot_cue_store/include"
+    "${REPO_ROOT}/firmware/main-deck-p4/components/audio_engine/include"
+    "${REPO_ROOT}/firmware/main-deck-p4/components/audio_mixer/include"
+    "${REPO_ROOT}/firmware/main-deck-p4/components/app_settings/include"
+    "${REPO_ROOT}/firmware/main-deck-p4/components/media_io_gate/include"
+)
+
+target_link_libraries(ui_simulator_e2e_jc1060 PRIVATE lvgl m)
+
+if(MINGW)
+    target_link_options(ui_simulator_e2e_jc1060 PRIVATE -static-libgcc -static-libstdc++)
 endif()

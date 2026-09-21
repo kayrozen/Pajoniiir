@@ -8,8 +8,8 @@
 #include "ui.h"
 #include "splash_screen.h"
 
-#define DISPLAY_WIDTH 800
-#define DISPLAY_HEIGHT 480
+#define DISPLAY_WIDTH  UI_HOR_RES
+#define DISPLAY_HEIGHT UI_VER_RES
 #define TICK_STEP_MS 16u
 
 static uint32_t s_framebuffer[DISPLAY_WIDTH * DISPLAY_HEIGHT];

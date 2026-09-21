@@ -14,6 +14,7 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_netif.h"
 #include "bsp/display.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -151,16 +152,36 @@ void log_screen_task(void)
         return;
     }
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(10)) == pdTRUE) {
-        ls_render_locked();
+        /* v106: render only when new lines arrived - rebuilding the
+         * fullscreen label 5x/s (even unchanged) makes the panel visibly
+         * flicker. */
+        if (s_dirty) {
+            ls_render_locked();
+        }
         xSemaphoreGive(s_lock);
     }
     bsp_display_unlock();
 
     /* v91: alive marker every ~5 s (25 x 200 ms loop). */
     if (++s_alive_tick % 25 == 0) {
-        char line[64];
-        snprintf(line, sizeof(line), "[alive] uptime=%ds",
-                 (int)(esp_timer_get_time() / 1000000LL));
+        char line[96];
+        /* v115: ETH state in the heartbeat - bypasses the esp_log level
+         * system entirely, so "no link" can no longer be a log clipping
+         * artifact. */
+        ip_event_got_ip_t dummy = {0};
+        (void)dummy;
+        extern bool eth_bringup_got_ip(void);
+        extern esp_netif_ip_info_t eth_bringup_ip_info(void);
+        if (eth_bringup_got_ip()) {
+            esp_netif_ip_info_t ip = eth_bringup_ip_info();
+            snprintf(line, sizeof(line), "[alive] uptime=%ds ETH " IPSTR,
+                     (int)(esp_timer_get_time() / 1000000LL), IP2STR(&ip.ip));
+        } else {
+            snprintf(line, sizeof(line), "[alive] uptime=%ds ETH no-ip",
+                     (int)(esp_timer_get_time() / 1000000LL));
+        }
         ls_put_line(line);
+        /* v115: also WARN so the serial capture sees the ETH state. */
+        ESP_LOGW(TAG, "%s", line);
     }
 }

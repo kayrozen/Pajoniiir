@@ -21,12 +21,24 @@ under `.cache/ui_simulator/screenshots` for review.
 
 Run:
 
+```bash
+./tests/ui_simulator/run_ui_simulator_e2e.sh
+```
+
+ou sous Windows :
+
 ```powershell
 .\tests\ui_simulator\run_ui_simulator_e2e.ps1
 ```
 
 The first run downloads the pinned LVGL source into the ignored `.cache`
 directory. To use an already available exact checkout:
+
+```bash
+./tests/ui_simulator/run_ui_simulator_e2e.sh \
+    -LvglPath ./lv_port_pc_vscode/lvgl \
+    -KeepArtifacts
+```
 
 ```powershell
 .\tests\ui_simulator\run_ui_simulator_e2e.ps1 `
@@ -36,6 +48,10 @@ directory. To use an already available exact checkout:
 
 After an intentional and visually reviewed UI change, regenerate the hash
 manifest:
+
+```bash
+./tests/ui_simulator/run_ui_simulator_e2e.sh -UpdateBaselines -KeepArtifacts
+```
 
 ```powershell
 .\tests\ui_simulator\run_ui_simulator_e2e.ps1 -UpdateBaselines -KeepArtifacts

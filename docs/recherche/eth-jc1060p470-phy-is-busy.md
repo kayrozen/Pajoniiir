@@ -350,3 +350,30 @@ board.h/audio.h, EXTRA_COMPONENT_DIRS /pajoniiir/... nécessite fullclean).
   figé) → AU MATIN : reflasher Pajoniiir v104 (build/ prêt) avant tout test.
 - Exemple vendor fonctionnel validé : /tmp/jcy (IDF 5.5.4) et /tmp/eth_ab
   (IDF 6.0.2, défauts propres) = Link Up + Got IP confirmés.
+
+## RÉSOLU (v117, 2026-09-21) : ETH Got IP 192.168.100.131
+
+Le fix tient en deux changements :
+1. **Retirer le scan MDIO pré-start** (v112) - il causait en plus le
+   flicker écran (la tâche eth tournait en boucle sur le SMI après nos
+   lectures).
+2. **Revenir aux défauts exacts du driver IDF** (v113) : PAS de
+   mdc_freq_hz manuel, autonego_timeout défaut (100 ms), PAS de
+   post_hw_reset_delay, PAS de gpio_config/power settle sur GPIO51 avant
+   install. Les défauts P4 d'IDF 6.0.2 sont déjà corrects pour cette board
+   (MDC=31, MDIO=52, CLK_EXT_IN GPIO50, addr 1). Le reset du PHY (GPIO51)
+   appartient au driver seul.
+
+Enseignements :
+- "Aucun event ETH" était partiellement un artefact : les logs du handler
+  sont en INFO (visibles), mais le VRAI état se vérifie maintenant dans le
+  heartbeat écran ([alive] uptime=Ns ETH x.x.x.x) qui bypass complètement
+  esp_log.
+- La config exotique (MDC 2 MHz, délais 300 ms, scan MDIO) ajoutée pendant
+  le debug pour "aider" le driver empêchait le stack de fonctionner. Le
+  réflexe gagnant : répliquer EXACTEMENT l'exemple vendor, une variable à
+  la fois, et ne dévier que si une preuve l'exige.
+- L'exemple vendor ne fait AUCUN accès MDIO avant esp_eth_start.
+
+État v117 : écran OK (couleurs v69), son OK, USB/DDJ ON, ETH Got IP +
+console TCP :2333. Wi-Fi toujours parké (v89).

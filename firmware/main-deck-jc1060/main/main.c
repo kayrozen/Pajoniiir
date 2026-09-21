@@ -36,7 +36,7 @@ void app_main(void)
     ESP_LOGI(TAG, "Board: %s", bsp_board_get_name());
 
     /* Display + LVGL. */
-#if 0 /* v101 differential test: display OFF (DSI/LDO/MIPI-PLL vs EMAC) */
+#if 1 /* v106: display back ON (differential tests over) */
     bsp_display_cfg_t disp_cfg = {
         .h_res = BSP_LCD_H_RES,
         .v_res = BSP_LCD_V_RES,
@@ -55,14 +55,14 @@ void app_main(void)
     } else {
         ESP_LOGE(TAG, "Display init failed");
     }
-#endif /* v101 display OFF for differential test */
+#endif /* v106 display ON */
 
     /* On-screen verbose log (teed). */
     log_screen_start();
     ESP_LOGI(TAG, "log screen test line");
 
     /* Audio codec (internal outs; DDJ audio route comes next). */
-#if 0 /* v102 differential: audio OFF (I2S/ES8311 vs EMAC) */
+#if 1 /* v109 bisect: audio ON only */
     bsp_audio_config_t audio_cfg = {
         .sample_rate = 44100,
         .bit_width = I2S_DATA_BIT_WIDTH_16BIT,
@@ -74,7 +74,7 @@ void app_main(void)
     } else {
         ESP_LOGW(TAG, "Audio init failed");
     }
-#endif /* v102 audio OFF */
+#endif /* v109 audio ON */
 
     bsp_display_backlight_on();
 
@@ -115,8 +115,8 @@ void app_main(void)
 
     /* v96 differential test: USB OFF - the TinyUSB UTMI PHY may share
      * clock/power resources with the EMAC. */
-    /* usb_tu_start(); */
-    eth_bringup_start();
+    usb_tu_start(); /* v117: USB/DDJ back ON with working ETH */
+    eth_bringup_start(); /* v111 bisect: ETH ON - flicker suspect */
 
     ESP_LOGI(TAG, "Bring-up complete - entering UI loop");
 
