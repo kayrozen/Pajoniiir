@@ -12,6 +12,7 @@
 #include "esp_eth.h"
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "driver/gpio.h"
 
 static const char* TAG = "eth_bringup";
 
@@ -71,6 +72,30 @@ bool eth_bringup_start(void)
         return true;
     }
 
+    /* v90: make this component's INFO logs visible (screen log tee). */
+    esp_log_level_set(TAG, ESP_LOG_INFO);
+
+    /* v91: step markers in WARN level - always visible on the screen log,
+     * they localize exactly where bring-up stalls (if it does). */
+    ESP_LOGW(TAG, "step 1: event loop + netif init");
+
+    /* v90: ESPControl's ethernet config for this board sets power_pin GPIO51
+     * - the IP101 PHY supply rail. Without it the PHY never powers up fully.
+     * Drive it HIGH and give the PHY time to come out of reset. */
+    gpio_config_t pwr_cfg = {
+        .pin_bit_mask = 1ULL << 51,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&pwr_cfg);
+    /* v95: GPIO51 = PHY RESET_N (actif bas, cf. esp-p4-eth/Waveshare pin map
+     * et ESPHome ethernet power_pin->reset_gpio_num). Laissons le driver IDF
+     * faire sa séquence reset propre - PAS de pilotage manuel. */
+    vTaskDelay(pdMS_TO_TICKS(300)); /* ESPHome: "allow power to stabilise" */
+    ESP_LOGW(TAG, "step 2: power settle done");
+
     /* ETH_EVENT needs a default event loop; nothing else created one yet. */
     esp_err_t loop_ret = esp_event_loop_create_default();
     if (loop_ret != ESP_OK && loop_ret != ESP_ERR_INVALID_STATE) {
@@ -87,22 +112,46 @@ bool eth_bringup_start(void)
     }
 
     eth_esp32_emac_config_t mac_config = ETH_ESP32_EMAC_DEFAULT_CONFIG();
+    /* v93: explicit 2 MHz MDC - the auto divider may exceed the IP101 SMI
+     * limit and leave MDIO transactions hanging ("phy is busy"). */
+    mac_config.mdc_freq_hz = 2000000;
     /* Defaults match the JC1060P470C board: MDC=31, MDIO=52,
      * RMII REF_CLK input on GPIO50 (50 MHz from the IP101 PHY). */
     eth_mac_config_t mac_time_config = ETH_MAC_DEFAULT_CONFIG();
+    ESP_LOGW(TAG, "step 3: creating MAC/PHY objects");
     esp_eth_mac_t* mac = esp_eth_mac_new_esp32(&mac_config, &mac_time_config);
 
     eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();
-    phy_config.phy_addr = 1;              /* IP101 SMI address on this board */
-    phy_config.autonego_timeout_ms = 1000;
-    phy_config.reset_gpio_num = -1; /* PHY reset handled by board circuitry */
-    esp_eth_phy_t* phy = esp_eth_phy_new_generic(&phy_config); /* IP101 is 802.3 */
+    phy_config.phy_addr = 1;              /* IP101 SMI address (EspControl) */
+    phy_config.autonego_timeout_ms = 4000;
+    /* v95: GPIO51 = PHY RESET_N - let the IDF driver own the reset, with a
+     * post-reset delay (default 0 is too short for the IP101; esp-p4-eth
+     * documents MDIO timeouts without it). */
+    phy_config.reset_gpio_num = 51;
+    phy_config.post_hw_reset_delay_ms = 300;
+    esp_eth_phy_t* phy = esp_eth_phy_new_generic(&phy_config); /* IDF6: generic covers IP101 (802.3) */
 
     esp_eth_config_t eth_config = ETH_DEFAULT_CONFIG(mac, phy);
+    ESP_LOGW(TAG, "step 4: installing driver");
     esp_err_t ret = esp_eth_driver_install(&eth_config, &s_eth_handle);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "esp_eth_driver_install failed: %s", esp_err_to_name(ret));
         return false;
+    }
+
+    /* v94: MDIO scan BEFORE esp_eth_start - the generic PHY's autonego
+     * polling collides with our raw reads once the driver runs ("phy is
+     * busy" was a self-inflicted MDIO collision, not a dead bus). */
+    for (int addr = 0; addr < 32; addr++) {
+        uint32_t bmsr = 0;
+        if (mac->read_phy_reg(s_eth_handle, addr, 0x01, &bmsr) == ESP_OK &&
+            bmsr != 0x0000 && bmsr != 0xffff) {
+            uint32_t id1 = 0, id2 = 0;
+            mac->read_phy_reg(s_eth_handle, addr, 0x02, &id1);
+            mac->read_phy_reg(s_eth_handle, addr, 0x03, &id2);
+            ESP_LOGW(TAG, "MDIO scan: addr=%d BMSR=0x%04lx ID=0x%04lx%04lx",
+                     addr, bmsr, id1, id2);
+        }
     }
 
     ret = esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, eth_event_cb, NULL);
@@ -125,12 +174,14 @@ bool eth_bringup_start(void)
         return false;
     }
     ESP_ERROR_CHECK(esp_netif_attach(s_eth_netif, esp_eth_new_netif_glue(s_eth_handle)));
+    ESP_LOGW(TAG, "step 5: netif attached");
 
     ret = esp_eth_start(s_eth_handle);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "esp_eth_start failed: %s", esp_err_to_name(ret));
         return false;
     }
+    ESP_LOGW(TAG, "step 6: eth started, waiting for link/DHCP");
 
     s_started = true;
     ESP_LOGI(TAG, "Ethernet bring-up started (RMII, IP101 @ addr 1)");

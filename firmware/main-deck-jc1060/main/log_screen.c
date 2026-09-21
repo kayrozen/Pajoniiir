@@ -134,6 +134,10 @@ void log_screen_start(void)
     /* esp_lvgl_port renders the screen automatically - no local task needed. */
 }
 
+/* v91: heartbeat - proves the main loop + screen render are alive, and
+ * shows uptime so boot-time vs run-time is obvious. */
+static int s_alive_tick;
+
 void log_screen_task(void)
 {
     if (s_lock == NULL) {
@@ -150,4 +154,12 @@ void log_screen_task(void)
         xSemaphoreGive(s_lock);
     }
     bsp_display_unlock();
+
+    /* v91: alive marker every ~5 s (25 x 200 ms loop). */
+    if (++s_alive_tick % 25 == 0) {
+        char line[64];
+        snprintf(line, sizeof(line), "[alive] uptime=%ds",
+                 (int)(esp_timer_get_time() / 1000000LL));
+        ls_put_line(line);
+    }
 }
