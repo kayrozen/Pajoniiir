@@ -27,6 +27,12 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # v71 tried 20 MHz (EspControl value) - C6 SDIO timeouts 0x107 -> boot loop.
 # 40 MHz is the stable value on this board.
 CONFIG_ESP_HOSTED_SDIO_CLOCK_FREQ_KHZ=40000
+# v84: the ESPHome C6 slave (2.12.12) has the CustomRpc ESP-NOW overlay
+# compiled in and emits peer-data traffic; without these host options the
+# RX stream desyncs ("Dropping packet(s) from stream") and RPCs hang.
+# Exact values from esphome/components/esp32_hosted/__init__.py.
+CONFIG_ESP_HOSTED_ENABLE_PEER_DATA_TRANSFER=y
+CONFIG_ESP_HOSTED_MAX_CUSTOM_MSG_HANDLERS=8
 # v75: C6 2.12.12 firmware boots slower than 2.3.0 - 5 s init timeout made
 # esp_hosted abort ("Resetting myself") and boot-loop the board.
 CONFIG_ESP_HOSTED_HOST_RESTART_NO_COMMUNICATION_WITH_SLAVE_TIMEOUT=20
@@ -50,11 +56,17 @@ CONFIG_ESP_HOSTED_CP_TARGET_ESP32C6=y
 CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
 CONFIG_ESP_HOSTED_P4_DEV_BOARD_FUNC_BOARD=y
 CONFIG_ESP_HOSTED_SDIO_RESET_GPIO=54
-CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_LOW=y
+# v84: EspControl uses active_high: true for this board's reset (GPIO54) -
+# "High->Low->High triggers reset" (CHIP_PU ends HIGH = C6 enabled).
+CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_HIGH=y
 # C6 boots in parallel with the P4 (released from reset at board init) and is
 # ready well before esp_wifi_init - do not re-reset it there, or the 1.5 s
 # card-init window closes before the C6 finishes booting.
 CONFIG_ESP_HOSTED_SLAVE_RESET_ONLY_IF_NECESSARY=y
+# v81 tried RX_NONE (per-packet) -> boot loop. Streaming (default) is the
+# only mode that boots with the ESPHome C6 2.12.12 slave; the RX drops and
+# RPC hangs under it remain under investigation.
+CONFIG_ESP_HOSTED_SDIO_OPTIMIZATION_RX_STREAMING_MODE=y
 CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y
 CONFIG_FREERTOS_HZ=1000
 
@@ -69,8 +81,12 @@ CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 
 # Log level WARN: ESP_LOGI in the audio/USB path costs latency.
+# v78: MAXIMUM_LEVEL=3 (Info) so per-tag esp_log_level_set(TAG, INFO) can
+# raise wifi_console (scan diagnostics). DEFAULT stays Warn (2) - no global
+# log spam, audio performance unchanged (runtime per-tag level checks only).
 CONFIG_LOG_DEFAULT_LEVEL_WARN=y
 CONFIG_LOG_DEFAULT_LEVEL=2
+CONFIG_LOG_MAXIMUM_LEVEL=3
 
 # Route the ROM/build console to USB-Serial-JTAG (same connector as flashing)
 # so the bring-up log is visible on the host USB port.

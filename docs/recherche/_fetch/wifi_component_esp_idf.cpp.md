@@ -1,0 +1,845 @@
+#include "wifi_component.h"
+
+#ifdef USE_WIFI
+#ifdef USE_ESP32
+
+#include <esp_event.h>
+#include <esp_netif.h>
+#include <esp_system.h>
+#include <esp_wifi.h>
+#include <esp_wifi_types.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/event_groups.h>
+#include <freertos/task.h>
+
+#include <algorithm>
+#include <cinttypes>
+#include <memory>
+#include <utility>
+#ifdef USE_WIFI_WPA2_EAP
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0)
+#include <esp_eap_client.h>
+#else
+#include <esp_wpa2.h>
+#endif
+#endif
+
+#ifdef USE_WIFI_AP
+#include "dhcpserver/dhcpserver.h"
+#endif  // USE_WIFI_AP
+
+#ifdef USE_CAPTIVE_PORTAL
+#include "esphome/components/captive_portal/captive_portal.h"
+#endif
+
+#include "lwip/apps/sntp.h"
+#include "lwip/dns.h"
+#include "lwip/err.h"
+
+#include "esphome/core/application.h"
+#include "esphome/core/hal.h"
+#include "esphome/core/helpers.h"
+#include "esphome/core/log.h"
+#include "esphome/core/util.h"
+
+namespace esphome::wifi {
+
+static const char *const TAG = "wifi_esp32";
+
+static EventGroupHandle_t s_wifi_event_group;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+static esp_netif_t *s_sta_netif = nullptr;     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+#ifdef USE_WIFI_AP
+static esp_netif_t *s_ap_netif = nullptr;     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+#endif                                        // USE_WIFI_AP
+static bool s_sta_started = false;            // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+static bool s_sta_connected = false;          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+static bool s_sta_connect_not_found = false;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+static bool s_sta_connect_error = false;      // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+static bool s_sta_connecting = false;         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+static bool s_wifi_started = false;           // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+struct IDFWiFiEvent {
+  esp_event_base_t event_base;
+  int32_t event_id;
+  union {
+    wifi_event_sta_scan_done_t sta_scan_done;
+    wifi_event_sta_connected_t sta_connected;
+    wifi_event_sta_disconnected_t sta_disconnected;
+    wifi_event_sta_authmode_change_t sta_authmode_change;
+    wifi_event_ap_staconnected_t ap_staconnected;
+    wifi_event_ap_stadisconnected_t ap_stadisconnected;
+    wifi_event_ap_probe_req_rx_t ap_probe_req_rx;
+    wifi_event_bss_rssi_low_t bss_rssi_low;
+    ip_event_got_ip_t ip_got_ip;
+#if USE_NETWORK_IPV6
+    ip_event_got_ip6_t ip_got_ip6;
+#endif /* USE_NETWORK_IPV6 */
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
+    ip_event_assigned_ip_to_client_t ip_assigned_ip_to_client;
+#else
+    ip_event_ap_staipassigned_t ip_ap_staipassigned;
+#endif
+  } data;
+};
+
+// general design: event handler translates events and pushes them to a queue,
+// events get processed in the main loop
+void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+  IDFWiFiEvent event;
+  memset(&event, 0, sizeof(IDFWiFiEvent));
+  event.event_base = event_base;
+  event.event_id = event_id;
+  if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {  // NOLINT(bugprone-branch-clone)
+    // no data
+  } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_STOP) {  // NOLINT(bugprone-branch-clone)
+    // no data
+  } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_AUTHMODE_CHANGE) {
+    memcpy(&event.data.sta_authmode_change, event_data, sizeof(wifi_event_sta_authmode_change_t));
+  } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+    memcpy(&event.data.sta_connected, event_data, sizeof(wifi_event_sta_connected_t));
+  } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+    memcpy(&event.data.sta_disconnected, event_data, sizeof(wifi_event_sta_disconnected_t));
+  } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+    memcpy(&event.data.ip_got_ip, event_data, sizeof(ip_event_got_ip_t));
+#if USE_NETWORK_IPV6
+  } else if (event_base == IP_EVENT && event_id == IP_EVENT_GOT_IP6) {
+    memcpy(&event.data.ip_got_ip6, event_data, sizeof(ip_event_got_ip6_t));
+#endif
+  } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_LOST_IP) {  // NOLINT(bugprone-branch-clone)
+    // no data
+  } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE) {
+    memcpy(&event.data.sta_scan_done, event_data, sizeof(wifi_event_sta_scan_done_t));
+  } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_START) {  // NOLINT(bugprone-branch-clone)
+    // no data
+  } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STOP) {  // NOLINT(bugprone-branch-clone)
+    // no data
+  } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_PROBEREQRECVED) {
+    memcpy(&event.data.ap_probe_req_rx, event_data, sizeof(wifi_event_ap_probe_req_rx_t));
+  } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
+    memcpy(&event.data.ap_staconnected, event_data, sizeof(wifi_event_ap_staconnected_t));
+  } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+    memcpy(&event.data.ap_stadisconnected, event_data, sizeof(wifi_event_ap_stadisconnected_t));
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
+  } else if (event_base == IP_EVENT && event_id == IP_EVENT_ASSIGNED_IP_TO_CLIENT) {
+    memcpy(&event.data.ip_assigned_ip_to_client, event_data, sizeof(ip_event_assigned_ip_to_client_t));
+#else
+  } else if (event_base == IP_EVENT && event_id == IP_EVENT_AP_STAIPASSIGNED) {
+    memcpy(&event.data.ip_ap_staipassigned, event_data, sizeof(ip_event_ap_staipassigned_t));
+#endif
+  } else {
+    // did not match any event, don't send anything
+    return;
+  }
+
+  // copy to heap — WiFi events are rare so heap alloc is fine
+  auto *to_send = new IDFWiFiEvent;  // NOLINT(cppcoreguidelines-owning-memory)
+  memcpy(to_send, &event, sizeof(IDFWiFiEvent));
+  if (!global_wifi_component->event_queue_.push(to_send)) {
+    delete to_send;  // NOLINT(cppcoreguidelines-owning-memory)
+  }
+}
+
+void WiFiComponent::wifi_pre_setup_() {
+  // Network interface setup handled by network component
+  s_wifi_event_group = xEventGroupCreate();
+  if (s_wifi_event_group == nullptr) {
+    ESP_LOGE(TAG, "xEventGroupCreate failed");
+    return;
+  }
+  esp_event_handler_instance_t instance_wifi_id, instance_ip_id;
+  esp_err_t err =
+      esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, nullptr, &instance_wifi_id);
+  if (err != ERR_OK) {
+    ESP_LOGE(TAG, "esp_event_handler_instance_register failed: %s", esp_err_to_name(err));
+    return;
+  }
+  err = esp_event_handler_instance_register(IP_EVENT, ESP_EVENT_ANY_ID, &event_handler, nullptr, &instance_ip_id);
+  if (err != ERR_OK) {
+    ESP_LOGE(TAG, "esp_event_handler_instance_register failed: %s", esp_err_to_name(err));
+    return;
+  }
+  // NOTE: netif creation + esp_wifi_init() used to live here. They allocate ~15-30KB of
+  // DMA-capable internal SRAM, which competes with W5500 SPI DMA and I2S DMA on
+  // memory-tight devices. They are now deferred to wifi_lazy_init_(), called from
+  // setup() when enable_on_boot_ is true, or from enable() on first runtime enable.
+  // This makes enable_on_boot:false genuinely skip the wifi DMA allocation.
+}
+
+void WiFiComponent::wifi_lazy_init_() {
+  if (this->wifi_initialized_)
+    return;
+
+  // Guard each creation so partial init (e.g. a failed esp_wifi_init() below)
+  // followed by a retry via enable() does not leak the existing netif handle
+  // nor re-register the default WiFi handlers.
+  if (s_sta_netif == nullptr)
+    s_sta_netif = esp_netif_create_default_wifi_sta();
+  if (s_sta_netif == nullptr) {
+    // Allocation failed; leave wifi_initialized_ false so a later enable() retries.
+    ESP_LOGE(TAG, "esp_netif_create_default_wifi_sta failed");
+    return;
+  }
+
+#ifdef USE_WIFI_AP
+  if (s_ap_netif == nullptr)
+    s_ap_netif = esp_netif_create_default_wifi_ap();
+#endif  // USE_WIFI_AP
+
+  // The WiFi driver was started (e.g. by ESP-NOW with the wifi component disabled at
+  // boot) before our STA netif existed. The default WIFI_EVENT_STA_START handler
+  // therefore ran with no netif and never called esp_wifi_register_if_rxcb() -- the
+  // only thing that points the driver's RX path at a netif (it sets
+  // s_wifi_netifs[WIFI_IF_STA]). A bare esp_netif_action_start() would stop the
+  // immediate crash (#17232) but leaves RX unbound, so the first association
+  // associates at L2 yet never receives DHCP replies and times out (#17239). Restart
+  // the driver now that the netif exists so STA_START re-runs the default handler and
+  // wires RX correctly. ESP-NOW survives the stop/start (its peer state persists).
+  // This also matches a self-retry: if esp_wifi_set_storage() below failed on a
+  // previous wifi_lazy_init_() it returned without setting wifi_initialized_, and
+  // esp_wifi_init() has since run, so esp_wifi_get_mode() now succeeds here too.
+  wifi_mode_t mode;
+  if (esp_wifi_get_mode(&mode) == ESP_OK) {
+    ESP_LOGD(TAG, "WiFi driver already started without STA netif; restarting to bind it");
+    esp_err_t err = esp_wifi_stop();
+    if (err != ESP_OK) {
+      ESP_LOGW(TAG, "esp_wifi_stop failed: %s", esp_err_to_name(err));
+    }
+    // Re-apply RAM storage; the normal init path does this, but it is skipped on
+    // the self-retry case above, which would otherwise let the driver persist
+    // credentials to NVS for the rest of the boot.
+    err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    if (err != ESP_OK) {
+      ESP_LOGW(TAG, "esp_wifi_set_storage failed: %s", esp_err_to_name(err));
+    }
+    err = esp_wifi_start();
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(err));
+      return;
+    }
+    s_wifi_started = true;
+    this->wifi_initialized_ = true;
+    return;
+  }
+
+  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+  if (global_preferences->nvs_handle == 0) {
+    ESP_LOGW(TAG, "starting wifi without nvs");
+    cfg.nvs_enable = false;
+  }
+  esp_err_t err = esp_wifi_init(&cfg);
+  if (err != ERR_OK) {
+    ESP_LOGE(TAG, "esp_wifi_init failed: %s", esp_err_to_name(err));
+    return;
+  }
+  err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+  if (err != ERR_OK) {
+    ESP_LOGE(TAG, "esp_wifi_set_storage failed: %s", esp_err_to_name(err));
+    return;
+  }
+  this->wifi_initialized_ = true;
+}
+
+bool WiFiComponent::wifi_mode_(optional<bool> sta, optional<bool> ap) {
+  esp_err_t err;
+  wifi_mode_t current_mode = WIFI_MODE_NULL;
+  if (s_wifi_started) {
+    err = esp_wifi_get_mode(&current_mode);
+    if (err != ERR_OK) {
+      ESP_LOGW(TAG, "esp_wifi_get_mode failed: %s", esp_err_to_name(err));
+      return false;
+    }
+  }
+  bool current_sta = current_mode == WIFI_MODE_STA || current_mode == WIFI_MODE_APSTA;
+  bool current_ap = current_mode == WIFI_MODE_AP || current_mode == WIFI_MODE_APSTA;
+
+  bool set_sta = sta.value_or(current_sta);
+  bool set_ap = ap.value_or(current_ap);
+
+  wifi_mode_t set_mode;
+  if (set_sta && set_ap) {
+    set_mode = WIFI_MODE_APSTA;
+  } else if (set_sta && !set_ap) {
+    set_mode = WIFI_MODE_STA;
+  } else if (!set_sta && set_ap) {
+    set_mode = WIFI_MODE_AP;
+  } else {
+    set_mode = WIFI_MODE_NULL;
+  }
+
+  if (current_mode == set_mode)
+    return true;
+
+  if (set_sta && !current_sta) {
+    ESP_LOGV(TAG, "Enabling STA");
+  } else if (!set_sta && current_sta) {
+    ESP_LOGV(TAG, "Disabling STA");
+  }
+  if (set_ap && !current_ap) {
+    ESP_LOGV(TAG, "Enabling AP");
+  } else if (!set_ap && current_ap) {
+    ESP_LOGV(TAG, "Disabling AP");
+  }
+
+  if (set_mode == WIFI_MODE_NULL && s_wifi_started) {
+    err = esp_wifi_stop();
+    if (err != ESP_OK) {
+      ESP_LOGV(TAG, "esp_wifi_stop failed: %s", esp_err_to_name(err));
+      return false;
+    }
+    s_wifi_started = false;
+    return true;
+  }
+
+  err = esp_wifi_set_mode(set_mode);
+  if (err != ERR_OK) {
+    ESP_LOGW(TAG, "esp_wifi_set_mode failed: %s", esp_err_to_name(err));
+    return false;
+  }
+
+  if (set_mode != WIFI_MODE_NULL && !s_wifi_started) {
+    err = esp_wifi_start();
+    if (err != ESP_OK) {
+      ESP_LOGV(TAG, "esp_wifi_start failed: %s", esp_err_to_name(err));
+      return false;
+    }
+    s_wifi_started = true;
+  }
+
+  return true;
+}
+
+bool WiFiComponent::wifi_sta_pre_setup_() { return this->wifi_mode_(true, {}); }
+
+bool WiFiComponent::wifi_apply_output_power_(float output_power) {
+  int8_t val = static_cast<int8_t>(output_power * 4);
+  return esp_wifi_set_max_tx_power(val) == ESP_OK;
+}
+
+bool WiFiComponent::wifi_apply_power_save_() {
+  wifi_ps_type_t power_save;
+  switch (this->power_save_) {
+    case WIFI_POWER_SAVE_LIGHT:
+      power_save = WIFI_PS_MIN_MODEM;
+      break;
+    case WIFI_POWER_SAVE_HIGH:
+      power_save = WIFI_PS_MAX_MODEM;
+      break;
+    case WIFI_POWER_SAVE_NONE:
+    default:
+      power_save = WIFI_PS_NONE;
+      break;
+  }
+  bool success = esp_wifi_set_ps(power_save) == ESP_OK;
+#ifdef USE_WIFI_POWER_SAVE_LISTENERS
+  if (success) {
+    for (auto *listener : this->power_save_listeners_) {
+      listener->on_wifi_power_save(this->power_save_);
+    }
+  }
+#endif
+  return success;
+}
+
+#ifdef SOC_WIFI_SUPPORT_5G
+bool WiFiComponent::wifi_apply_band_mode_() { return esp_wifi_set_band_mode(this->band_mode_) == ESP_OK; }
+#endif
+
+bool WiFiComponent::wifi_sta_connect_(const WiFiAP &ap) {
+  // enable STA
+  if (!this->wifi_mode_(true, {}))
+    return false;
+
+  // https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/network/esp_wifi.html#_CPPv417wifi_sta_config_t
+  wifi_config_t conf;
+  memset(&conf, 0, sizeof(conf));
+  if (ap.ssid_.size() > sizeof(conf.sta.ssid)) {
+    ESP_LOGE(TAG, "SSID too long");
+    return false;
+  }
+  if (ap.password_.size() > sizeof(conf.sta.password)) {
+    ESP_LOGE(TAG, "Password too long");
+    return false;
+  }
+  memcpy(reinterpret_cast<char *>(conf.sta.ssid), ap.ssid_.c_str(), ap.ssid_.size());
+  memcpy(reinterpret_cast<char *>(conf.sta.password), ap.password_.c_str(), ap.password_.size());
+
+  // The weakest authmode to accept in the fast scan mode
+  if (ap.password_.empty()) {
+    conf.sta.threshold.authmode = WIFI_AUTH_OPEN;
+  } else {
+    // Set threshold based on configured minimum auth mode
+    switch (this->min_auth_mode_) {
+      case WIFI_MIN_AUTH_MODE_WPA:
+        conf.sta.threshold.authmode = WIFI_AUTH_WPA_PSK;
+        break;
+      case WIFI_MIN_AUTH_MODE_WPA2:
+        conf.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+        break;
+      case WIFI_MIN_AUTH_MODE_WPA3:
+        conf.sta.threshold.authmode = WIFI_AUTH_WPA3_PSK;
+        break;
+    }
+  }
+
+#ifdef USE_WIFI_WPA2_EAP
+  if (ap.get_eap().has_value()) {
+    conf.sta.threshold.authmode = WIFI_AUTH_WPA2_ENTERPRISE;
+  }
+#endif
+
+#ifdef USE_WIFI_11KV_SUPPORT
+  conf.sta.btm_enabled = this->btm_;
+  conf.sta.rm_enabled = this->rrm_;
+#endif
+
+  if (ap.has_bssid()) {
+    conf.sta.bssid_set = true;
+    memcpy(conf.sta.bssid, ap.get_bssid().data(), 6);
+  } else {
+    conf.sta.bssid_set = false;
+  }
+  if (ap.has_channel()) {
+    conf.sta.channel = ap.get_channel();
+    conf.sta.scan_method = WIFI_FAST_SCAN;
+  } else {
+    conf.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+  }
+  // Listen interval for ESP32 station to receive beacon when WIFI_PS_MAX_MODEM is set.
+  // Units: AP beacon intervals. Defaults to 3 if set to 0.
+  conf.sta.listen_interval = 0;
+
+  // Protected Management Frame
+  // Device will prefer to connect in PMF mode if other device also advertises PMF capability.
+  conf.sta.pmf_cfg.capable = true;
+  conf.sta.pmf_cfg.required = false;
+
+  // note, we do our own filtering
+  // The minimum rssi to accept in the fast scan mode
+  conf.sta.threshold.rssi = -127;
+
+  wifi_config_t current_conf;
+  esp_err_t err;
+  err = esp_wifi_get_config(WIFI_IF_STA, &current_conf);
+  if (err != ERR_OK) {
+    ESP_LOGW(TAG, "esp_wifi_get_config failed: %s", esp_err_to_name(err));
+    // can continue
+  }
+
+  if (memcmp(&current_conf, &conf, sizeof(wifi_config_t)) != 0) {  // NOLINT
+    err = esp_wifi_disconnect();
+    if (err != ESP_OK) {
+      ESP_LOGV(TAG, "esp_wifi_disconnect failed: %s", esp_err_to_name(err));
+      return false;
+    }
+  }
+
+  err = esp_wifi_set_config(WIFI_IF_STA, &conf);
+  if (err != ESP_OK) {
+    ESP_LOGV(TAG, "esp_wifi_set_config failed: %s", esp_err_to_name(err));
+    return false;
+  }
+
+#ifdef USE_WIFI_MANUAL_IP
+  if (!this->wifi_sta_ip_config_(ap.get_manual_ip())) {
+    return false;
+  }
+#else
+  if (!this->wifi_sta_ip_config_({})) {
+    return false;
+  }
+#endif
+
+  // setup enterprise authentication if required
+#ifdef USE_WIFI_WPA2_EAP
+  const auto &eap_opt = ap.get_eap();
+  if (eap_opt.has_value()) {
+    // note: all certificates and keys have to be null terminated. Lengths are appended by +1 to include \0.
+    const EAPAuth &eap = *eap_opt;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0)
+    err = esp_eap_client_set_identity((uint8_t *) eap.identity.c_str(), eap.identity.length());
+#else
+    err = esp_wifi_sta_wpa2_ent_set_identity((uint8_t *) eap.identity.c_str(), eap.identity.length());
+#endif
+    if (err != ESP_OK) {
+      ESP_LOGV(TAG, "set_identity failed %d", err);
+    }
+    int ca_cert_len = strlen(eap.ca_cert);
+    int client_cert_len = strlen(eap.client_cert);
+    int client_key_len = strlen(eap.client_key);
+    if (ca_cert_len) {
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0)
+      err = esp_eap_client_set_ca_cert((uint8_t *) eap.ca_cert, ca_cert_len + 1);
+#else
+      err = esp_wifi_sta_wpa2_ent_set_ca_cert((uint8_t *) eap.ca_cert, ca_cert_len + 1);
+#endif
+      if (err != ESP_OK) {
+        ESP_LOGV(TAG, "set_ca_cert failed %d", err);
+      }
+    }
+    // workout what type of EAP this is
+    // validation is not required as the config tool has already validated it
+    if (client_cert_len && client_key_len) {
+      // if we have certs, this must be EAP-TLS
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0)
+      err = esp_eap_client_set_certificate_and_key((uint8_t *) eap.client_cert, client_cert_len + 1,
+                                                   (uint8_t *) eap.client_key, client_key_len + 1,
+                                                   (uint8_t *) eap.password.c_str(), eap.password.length());
+#else
+      err = esp_wifi_sta_wpa2_ent_set_cert_key((uint8_t *) eap.client_cert, client_cert_len + 1,
+                                               (uint8_t *) eap.client_key, client_key_len + 1,
+                                               (uint8_t *) eap.password.c_str(), eap.password.length());
+#endif
+      if (err != ESP_OK) {
+        ESP_LOGV(TAG, "set_cert_key failed %d", err);
+      }
+    } else {
+      // in the absence of certs, assume this is username/password based
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0)
+      err = esp_eap_client_set_username((uint8_t *) eap.username.c_str(), eap.username.length());
+#else
+      err = esp_wifi_sta_wpa2_ent_set_username((uint8_t *) eap.username.c_str(), eap.username.length());
+#endif
+      if (err != ESP_OK) {
+        ESP_LOGV(TAG, "set_username failed %d", err);
+      }
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0)
+      err = esp_eap_client_set_password((uint8_t *) eap.password.c_str(), eap.password.length());
+#else
+      err = esp_wifi_sta_wpa2_ent_set_password((uint8_t *) eap.password.c_str(), eap.password.length());
+#endif
+      if (err != ESP_OK) {
+        ESP_LOGV(TAG, "set_password failed %d", err);
+      }
+      // set TTLS Phase 2, defaults to MSCHAPV2
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0)
+      err = esp_eap_client_set_ttls_phase2_method(eap.ttls_phase_2);
+#else
+      err = esp_wifi_sta_wpa2_ent_set_ttls_phase2_method(eap.ttls_phase_2);
+#endif
+      if (err != ESP_OK) {
+        ESP_LOGV(TAG, "set_ttls_phase2_method failed %d", err);
+      }
+    }
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0)
+    err = esp_wifi_sta_enterprise_enable();
+#else
+    err = esp_wifi_sta_wpa2_ent_enable();
+#endif
+    if (err != ESP_OK) {
+      ESP_LOGV(TAG, "enterprise_enable failed %d", err);
+    }
+  }
+#endif  // USE_WIFI_WPA2_EAP
+
+  // Reset flags, do this _before_ wifi_station_connect as the callback method
+  // may be called from wifi_station_connect
+  s_sta_connecting = true;
+  s_sta_connected = false;
+  s_sta_connect_error = false;
+  s_sta_connect_not_found = false;
+  // Reset IP address flags - ensures we don't report connected before DHCP completes
+  // (IP_EVENT_STA_LOST_IP doesn't always fire on disconnect)
+  this->got_ipv4_address_ = false;
+#if USE_NETWORK_IPV6
+  this->num_ipv6_addresses_ = 0;
+#endif
+
+  err = esp_wifi_connect();
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(err));
+    return false;
+  }
+
+  return true;
+}
+
+bool WiFiComponent::wifi_sta_ip_config_(const optional<ManualIP> &manual_ip) {
+  // enable STA
+  if (!this->wifi_mode_(true, {}))
+    return false;
+
+  // Check if the STA interface is initialized before using it
+  if (s_sta_netif == nullptr) {
+    ESP_LOGW(TAG, "STA interface not initialized");
+    return false;
+  }
+
+  esp_netif_dhcp_status_t dhcp_status;
+  esp_err_t err = esp_netif_dhcpc_get_status(s_sta_netif, &dhcp_status);
+  if (err != ESP_OK) {
+    ESP_LOGV(TAG, "esp_netif_dhcpc_get_status failed: %s", esp_err_to_name(err));
+    return false;
+  }
+
+  if (!manual_ip.has_value()) {
+    // lwIP starts the SNTP client if it gets an SNTP server from DHCP. We don't need the time, and more importantly,
+    // the built-in SNTP client has a memory leak in certain situations. Disable this feature.
+    // https://github.com/esphome/issues/issues/2299
+    {
+#if SNTP_GET_SERVERS_FROM_DHCP || SNTP_GET_SERVERS_FROM_DHCPV6
+      // sntp_servermode_dhcp() is an empty macro unless lwIP is built with
+      // DHCP-supplied NTP servers, so only that build needs the core lock.
+      LwIPLock lock;
+#endif
+      sntp_servermode_dhcp(false);
+    }
+
+    // No manual IP is set; use DHCP client
+    if (dhcp_status != ESP_NETIF_DHCP_STARTED) {
+      err = esp_netif_dhcpc_start(s_sta_netif);
+      if (err != ESP_OK) {
+        ESP_LOGV(TAG, "Starting DHCP client failed: %d", err);
+      }
+      return err == ESP_OK;
+    }
+    return true;
+  }
+
+  esp_netif_ip_info_t info;  // struct of ip4_addr_t with ip, netmask, gw
+  info.ip = manual_ip->static_ip;
+  info.gw = manual_ip->gateway;
+  info.netmask = manual_ip->subnet;
+  err = esp_netif_dhcpc_stop(s_sta_netif);
+
+[... middle omitted — see footer ...]
+
+#ifdef CONFIG_SOC_WIFI_SUPPORTED
+  if (this->is_roaming_scan_active()) {
+    config.coex_background_scan = true;
+  }
+#endif
+
+  esp_err_t err = esp_wifi_scan_start(&config, false);
+  if (err != ESP_OK) {
+    ESP_LOGV(TAG, "esp_wifi_scan_start failed: %s", esp_err_to_name(err));
+    return false;
+  }
+
+  this->scan_done_ = false;
+  return true;
+}
+
+#ifdef USE_WIFI_AP
+bool WiFiComponent::wifi_ap_ip_config_(const optional<ManualIP> &manual_ip) {
+  esp_err_t err;
+
+  // enable AP
+  if (!this->wifi_mode_({}, true))
+    return false;
+
+  // Check if the AP interface is initialized before using it
+  if (s_ap_netif == nullptr) {
+    ESP_LOGW(TAG, "AP interface not initialized");
+    return false;
+  }
+
+  esp_netif_ip_info_t info;
+  if (manual_ip.has_value()) {
+    info.ip = manual_ip->static_ip;
+    info.gw = manual_ip->gateway;
+    info.netmask = manual_ip->subnet;
+  } else {
+    info.ip = network::IPAddress(192, 168, 4, 1);
+    info.gw = network::IPAddress(192, 168, 4, 1);
+    info.netmask = network::IPAddress(255, 255, 255, 0);
+  }
+
+  err = esp_netif_dhcps_stop(s_ap_netif);
+  if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
+    ESP_LOGE(TAG, "esp_netif_dhcps_stop failed: %s", esp_err_to_name(err));
+    return false;
+  }
+
+  err = esp_netif_set_ip_info(s_ap_netif, &info);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "esp_netif_set_ip_info failed: %d", err);
+    return false;
+  }
+
+  dhcps_lease_t lease;
+  lease.enable = true;
+  network::IPAddress start_address = network::IPAddress(&info.ip);
+  start_address += 99;
+  lease.start_ip = start_address;
+#if ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_VERBOSE
+  char ip_buf[network::IP_ADDRESS_BUFFER_SIZE];
+#endif
+  ESP_LOGV(TAG, "DHCP server IP lease start: %s", start_address.str_to(ip_buf));
+  start_address += 10;
+  lease.end_ip = start_address;
+  ESP_LOGV(TAG, "DHCP server IP lease end: %s", start_address.str_to(ip_buf));
+  err = esp_netif_dhcps_option(s_ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_REQUESTED_IP_ADDRESS, &lease, sizeof(lease));
+
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "esp_netif_dhcps_option failed: %d", err);
+    return false;
+  }
+
+#if defined(USE_CAPTIVE_PORTAL) && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+  // Configure DHCP Option 114 (Captive Portal URI) if captive portal is enabled
+  // This provides a standards-compliant way for clients to discover the captive portal
+  if (captive_portal::global_captive_portal != nullptr) {
+    // Buffer must be static - dhcps_set_option_info stores pointer, doesn't copy
+    static char captive_portal_uri[24];        // "http://" (7) + IPv4 max (15) + null
+    memcpy(captive_portal_uri, "http://", 7);  // NOLINT(bugprone-not-null-terminated-result) - str_to null-terminates
+    network::IPAddress(&info.ip).str_to(captive_portal_uri + 7);
+    err = esp_netif_dhcps_option(s_ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_CAPTIVEPORTAL_URI, captive_portal_uri,
+                                 strlen(captive_portal_uri));
+    if (err != ESP_OK) {
+      ESP_LOGV(TAG, "Failed to set DHCP captive portal URI: %s", esp_err_to_name(err));
+    } else {
+      ESP_LOGV(TAG, "DHCP Captive Portal URI set to: %s", captive_portal_uri);
+    }
+  }
+#endif
+
+  err = esp_netif_dhcps_start(s_ap_netif);
+
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "esp_netif_dhcps_start failed: %d", err);
+    return false;
+  }
+
+  return true;
+}
+
+bool WiFiComponent::wifi_start_ap_(const WiFiAP &ap) {
+  // enable AP
+  if (!this->wifi_mode_({}, true))
+    return false;
+
+  wifi_config_t conf;
+  memset(&conf, 0, sizeof(conf));
+  if (ap.ssid_.size() > sizeof(conf.ap.ssid)) {
+    ESP_LOGE(TAG, "AP SSID too long");
+    return false;
+  }
+  memcpy(reinterpret_cast<char *>(conf.ap.ssid), ap.ssid_.c_str(), ap.ssid_.size());
+  conf.ap.channel = ap.has_channel() ? ap.get_channel() : 1;
+  conf.ap.ssid_hidden = ap.get_hidden();
+  conf.ap.max_connection = 5;
+  conf.ap.beacon_interval = 100;
+
+  if (ap.password_.empty()) {
+    conf.ap.authmode = WIFI_AUTH_OPEN;
+    *conf.ap.password = 0;
+  } else {
+    conf.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    if (ap.password_.size() > sizeof(conf.ap.password)) {
+      ESP_LOGE(TAG, "AP password too long");
+      return false;
+    }
+    memcpy(reinterpret_cast<char *>(conf.ap.password), ap.password_.c_str(), ap.password_.size());
+  }
+
+  // pairwise cipher of SoftAP, group cipher will be derived using this.
+  conf.ap.pairwise_cipher = WIFI_CIPHER_TYPE_CCMP;
+
+  esp_err_t err = esp_wifi_set_config(WIFI_IF_AP, &conf);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "esp_wifi_set_config failed: %d", err);
+    return false;
+  }
+
+#ifdef USE_WIFI_MANUAL_IP
+  if (!this->wifi_ap_ip_config_(ap.get_manual_ip())) {
+    ESP_LOGE(TAG, "wifi_ap_ip_config_ failed:");
+    return false;
+  }
+#else
+  if (!this->wifi_ap_ip_config_({})) {
+    ESP_LOGE(TAG, "wifi_ap_ip_config_ failed:");
+    return false;
+  }
+#endif
+
+  return true;
+}
+
+network::IPAddress WiFiComponent::wifi_soft_ap_ip() {
+  esp_netif_ip_info_t ip;
+  esp_netif_get_ip_info(s_ap_netif, &ip);
+  return network::IPAddress(&ip.ip);
+}
+#endif  // USE_WIFI_AP
+
+bool WiFiComponent::wifi_disconnect_() { return esp_wifi_disconnect(); }
+
+bssid_t WiFiComponent::wifi_bssid() {
+  bssid_t bssid{};
+  wifi_ap_record_t info;
+  esp_err_t err = esp_wifi_sta_get_ap_info(&info);
+  if (err != ESP_OK) {
+    // Very verbose only: this is expected during dump_config() before connection is established (PR #9823)
+    ESP_LOGVV(TAG, "esp_wifi_sta_get_ap_info failed: %s", esp_err_to_name(err));
+    return bssid;
+  }
+  std::copy(info.bssid, info.bssid + 6, bssid.begin());
+  return bssid;
+}
+const char *WiFiComponent::wifi_ssid_to(std::span<char, SSID_BUFFER_SIZE> buffer) {
+  wifi_ap_record_t info{};
+  esp_err_t err = esp_wifi_sta_get_ap_info(&info);
+  if (err != ESP_OK) {
+    buffer[0] = '\0';
+    return buffer.data();
+  }
+  // info.ssid is uint8[33], but only 32 bytes are SSID data
+  size_t len = strnlen(reinterpret_cast<const char *>(info.ssid), 32);
+  memcpy(buffer.data(), info.ssid, len);
+  buffer[len] = '\0';
+  return buffer.data();
+}
+int8_t WiFiComponent::wifi_rssi() {
+  wifi_ap_record_t info;
+  esp_err_t err = esp_wifi_sta_get_ap_info(&info);
+  if (err != ESP_OK) {
+    // Very verbose only: this is expected during dump_config() before connection is established (PR #9823)
+    ESP_LOGVV(TAG, "esp_wifi_sta_get_ap_info failed: %s", esp_err_to_name(err));
+    return WIFI_RSSI_DISCONNECTED;
+  }
+  return info.rssi;
+}
+int32_t WiFiComponent::get_wifi_channel() {
+  uint8_t primary;
+  wifi_second_chan_t second;
+  esp_err_t err = esp_wifi_get_channel(&primary, &second);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "esp_wifi_get_channel failed: %s", esp_err_to_name(err));
+    return 0;
+  }
+  return primary;
+}
+network::IPAddress WiFiComponent::wifi_subnet_mask_() {
+  esp_netif_ip_info_t ip;
+  esp_err_t err = esp_netif_get_ip_info(s_sta_netif, &ip);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "esp_netif_get_ip_info failed: %s", esp_err_to_name(err));
+    return {};
+  }
+  return network::IPAddress(&ip.netmask);
+}
+network::IPAddress WiFiComponent::wifi_gateway_ip_() {
+  esp_netif_ip_info_t ip;
+  esp_err_t err = esp_netif_get_ip_info(s_sta_netif, &ip);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "esp_netif_get_ip_info failed: %s", esp_err_to_name(err));
+    return {};
+  }
+  return network::IPAddress(&ip.gw);
+}
+network::IPAddress WiFiComponent::wifi_dns_ip_(int num) {
+  const ip_addr_t *dns_ip = dns_getserver(num);
+  return network::IPAddress(dns_ip);
+}
+
+}  // namespace esphome::wifi
+#endif  // USE_ESP32
+#endif
+
+
+──────── [TRUNCATED] ────────
+Showing 22,450 chars (head) + 7,492 chars (tail) of 49,745 total clean characters.
+Full text saved to: /home/kay/.hermes/cache/web/raw.githubusercontent.com-d31f0ad7d8.md
+To read the omitted middle: read_file path="/home/kay/.hermes/cache/web/raw.githubusercontent.com-d31f0ad7d8.md" offset=603 limit=200  (the file is the complete page; raise/lower offset to page through it).
+─────────────────────────────

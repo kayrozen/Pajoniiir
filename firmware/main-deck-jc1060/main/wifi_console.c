@@ -158,14 +158,9 @@ static void wifi_event_cb(void* arg, esp_event_base_t base,
         }
         wifi_event_sta_disconnected_t* evt = (wifi_event_sta_disconnected_t*)data;
         ESP_LOGW(TAG, "Wi-Fi disconnected, reason=%d", evt->reason);
-        /* v65: retry immediately - do NOT block the event loop task (the
-         * old 3 s vTaskDelay inside the handler stopped further events
-         * from being delivered, killing the retry cycle). */
-        esp_err_t err = esp_wifi_connect();
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "esp_wifi_connect: %s (watchdog task will retry)",
-                     esp_err_to_name(err));
-        }
+        /* v78: do NOT call esp_wifi_connect() from the event handler - a
+         * hanging C6 RPC here stalled the whole event loop (only ONE
+         * disconnect was ever delivered). The watchdog task owns retrying. */
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* evt = (ip_event_got_ip_t*)data;
         s_ip_info = evt->ip_info;
@@ -174,12 +169,52 @@ static void wifi_event_cb(void* arg, esp_event_base_t base,
     }
 }
 
+/* v77: diagnostic scan - when the association fails with 203, log what the
+ * C6 radio actually sees (SSID, channel, RSSI, authmode) so we can tell a
+ * band/channel/PMF problem from a weak-signal one. Runs from the watchdog
+ * task, never from the boot path. */
+static void scan_and_log(void)
+{
+    wifi_scan_config_t sc = { .show_hidden = true };
+    esp_err_t err = esp_wifi_scan_start(&sc, true); /* blocking */
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "scan failed: %s", esp_err_to_name(err));
+        return;
+    }
+    uint16_t n = 0;
+    esp_wifi_scan_get_ap_num(&n);
+    if (n == 0) {
+        ESP_LOGW(TAG, "scan: NO APs visible at all");
+        return;
+    }
+    if (n > 10) {
+        n = 10;
+    }
+    wifi_ap_record_t recs[10];
+    esp_wifi_scan_get_ap_records(&n, recs);
+    for (int i = 0; i < n; i++) {
+        ESP_LOGI(TAG, "scan: %02d %-20s ch=%2d rssi=%d auth=%d",
+                 i, (const char*)recs[i].ssid, recs[i].primary,
+                 recs[i].rssi, recs[i].authmode);
+    }
+}
+
+/* v78: scan runs in a throwaway task - a hanging C6 scan RPC must not
+ * kill the watchdog (the watchdog also delays its first connect while
+ * the scan runs). */
+static void scan_task(void* arg)
+{
+    scan_and_log();
+    vTaskDelete(NULL);
+}
+
 /* v65: reconnect watchdog - independent of event delivery, retries every
  * 10 s as long as the station is down. */
 static void wifi_reconnect_task(void* arg)
 {
+    bool first = true;
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(10000));
+        vTaskDelay(pdMS_TO_TICKS(first ? 3000 : 10000));
         if (usb_audio_wifi_suspended()) {
             continue;
         }
@@ -187,17 +222,18 @@ static void wifi_reconnect_task(void* arg)
         if (esp_wifi_get_mode(&mode) != ESP_OK || mode != WIFI_MODE_STA) {
             continue;
         }
-        static bool was_connected;
         bool connected = s_got_ip;
-        if (!connected && was_connected) {
-            was_connected = false;
-        }
         if (!connected) {
+            if (first) {
+                first = false;
+                xTaskCreate(scan_task, "wifi_scan", 4096, NULL, 3, NULL);
+                vTaskDelay(pdMS_TO_TICKS(6000)); /* let the scan finish */
+            }
             esp_err_t err = esp_wifi_connect();
             ESP_LOGI(TAG, "watchdog: esp_wifi_connect -> %s",
                      esp_err_to_name(err));
         } else {
-            was_connected = true;
+            first = false;
         }
     }
 }
@@ -232,7 +268,14 @@ bool wifi_console_start(void)
         .sta = {
             .ssid = WIFI_SSID,
             .password = WIFI_PASSWORD,
-            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            /* v83: ESPHome (which connects fine) uses threshold OPEN - the
+             * weakest authmode accepted; WPA2_PSK filter rejected the AP
+             * and association never even started (203/2). The real auth
+             * mode is negotiated from the AP beacon with our password. */
+            .threshold.authmode = WIFI_AUTH_OPEN,
+            .threshold.rssi = -127,
+            .scan_method = WIFI_FAST_SCAN,
+            .pmf_cfg = { .capable = true, .required = false },
         },
     };
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
@@ -242,17 +285,10 @@ bool wifi_console_start(void)
      * "Wi-Fi steals the bus" theory and can break association with the
      * co-proc version mismatch. Default MIN_MODEM power-save is back. */
 
-    /* Association: without this the STA starts but never associates. */
-    esp_err_t conn_ret = esp_wifi_connect();
-    if (conn_ret != ESP_OK) {
-        ESP_LOGE(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(conn_ret));
-    }
-
-    /* v62: NEVER block the boot path here. The C6 RPC can hang (version
-     * mismatch + SDIO stream corruption during display init) - a blocking
-     * scan or IP wait stalled the whole boot. The event handler retries
-     * association on its own; the console server installs itself from a
-     * background task once the IP arrives. */
+    /* v80: the initial esp_wifi_connect() used to be called here - but when
+     * the association fails the C6 RPC never returns and the whole boot
+     * stalls before the console/watchdog tasks are even created. The
+     * watchdog task owns connecting now. */
 
     /* v72: tee logs to the TCP console from now on (the server task below
      * accepts connections as soon as ANY interface has an IP). */

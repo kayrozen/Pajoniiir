@@ -1,0 +1,546 @@
+[
+  {
+    "name": "__init__.py",
+    "path": "esphome/components/esp32/__init__.py",
+    "sha": "e2e40f21bdc23e49922c1dfd1cced711617321a3",
+    "size": 161166,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/__init__.py?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/__init__.py",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/e2e40f21bdc23e49922c1dfd1cced711617321a3",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/__init__.py",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/__init__.py?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/e2e40f21bdc23e49922c1dfd1cced711617321a3",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/__init__.py"
+    }
+  },
+  {
+    "name": "boards.py",
+    "path": "esphome/components/esp32/boards.py",
+    "sha": "729b0c89ab6b5e48dd0d565e35786cabe9a97697",
+    "size": 64360,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/boards.py?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/boards.py",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/729b0c89ab6b5e48dd0d565e35786cabe9a97697",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/boards.py",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/boards.py?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/729b0c89ab6b5e48dd0d565e35786cabe9a97697",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/boards.py"
+    }
+  },
+  {
+    "name": "const.py",
+    "path": "esphome/components/esp32/const.py",
+    "sha": "a0c9809c50c331723ec0e8ceaad056044969e9ee",
+    "size": 2134,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/const.py?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/const.py",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/a0c9809c50c331723ec0e8ceaad056044969e9ee",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/const.py",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/const.py?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/a0c9809c50c331723ec0e8ceaad056044969e9ee",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/const.py"
+    }
+  },
+  {
+    "name": "core.cpp",
+    "path": "esphome/components/esp32/core.cpp",
+    "sha": "a6916fe73945f1d2f52c3e58e26835e8028b97c9",
+    "size": 1960,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/core.cpp?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/core.cpp",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/a6916fe73945f1d2f52c3e58e26835e8028b97c9",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/core.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/core.cpp?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/a6916fe73945f1d2f52c3e58e26835e8028b97c9",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/core.cpp"
+    }
+  },
+  {
+    "name": "crash_handler.cpp",
+    "path": "esphome/components/esp32/crash_handler.cpp",
+    "sha": "b72a2777c7afb4610677312af2ecda90d208aa8d",
+    "size": 24633,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/crash_handler.cpp?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/crash_handler.cpp",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/b72a2777c7afb4610677312af2ecda90d208aa8d",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/crash_handler.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/crash_handler.cpp?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/b72a2777c7afb4610677312af2ecda90d208aa8d",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/crash_handler.cpp"
+    }
+  },
+  {
+    "name": "crash_handler.h",
+    "path": "esphome/components/esp32/crash_handler.h",
+    "sha": "314be80314c9e9fae156286034c0aa9e9b4eb44d",
+    "size": 491,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/crash_handler.h?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/crash_handler.h",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/314be80314c9e9fae156286034c0aa9e9b4eb44d",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/crash_handler.h",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/crash_handler.h?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/314be80314c9e9fae156286034c0aa9e9b4eb44d",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/crash_handler.h"
+    }
+  },
+  {
+    "name": "gpio.cpp",
+    "path": "esphome/components/esp32/gpio.cpp",
+    "sha": "74665f3126afa2e28764b9a8c6d479785f92c76d",
+    "size": 7107,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio.cpp?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio.cpp",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/74665f3126afa2e28764b9a8c6d479785f92c76d",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/gpio.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio.cpp?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/74665f3126afa2e28764b9a8c6d479785f92c76d",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio.cpp"
+    }
+  },
+  {
+    "name": "gpio.h",
+    "path": "esphome/components/esp32/gpio.h",
+    "sha": "aeff5af51c62d132152dfe577f3de4837a3d6201",
+    "size": 2317,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio.h?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio.h",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/aeff5af51c62d132152dfe577f3de4837a3d6201",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/gpio.h",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio.h?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/aeff5af51c62d132152dfe577f3de4837a3d6201",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio.h"
+    }
+  },
+  {
+    "name": "gpio.py",
+    "path": "esphome/components/esp32/gpio.py",
+    "sha": "98aac209ec4e6ab919c1172c784682edd2b4ebd8",
+    "size": 9871,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio.py?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio.py",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/98aac209ec4e6ab919c1172c784682edd2b4ebd8",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/gpio.py",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio.py?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/98aac209ec4e6ab919c1172c784682edd2b4ebd8",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio.py"
+    }
+  },
+  {
+    "name": "gpio_esp32.py",
+    "path": "esphome/components/esp32/gpio_esp32.py",
+    "sha": "fec257f90b88a063e6959db4eb3cc549037ba815",
+    "size": 2397,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio_esp32.py?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio_esp32.py",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/fec257f90b88a063e6959db4eb3cc549037ba815",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/gpio_esp32.py",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio_esp32.py?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/fec257f90b88a063e6959db4eb3cc549037ba815",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio_esp32.py"
+    }
+  },
+  {
+    "name": "gpio_esp32_c2.py",
+    "path": "esphome/components/esp32/gpio_esp32_c2.py",
+    "sha": "2d6e3a4a4ed5d66525d4b4138a66e2d62a7eb82c",
+    "size": 853,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio_esp32_c2.py?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio_esp32_c2.py",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/2d6e3a4a4ed5d66525d4b4138a66e2d62a7eb82c",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/gpio_esp32_c2.py",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio_esp32_c2.py?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/2d6e3a4a4ed5d66525d4b4138a66e2d62a7eb82c",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio_esp32_c2.py"
+    }
+  },
+  {
+    "name": "gpio_esp32_c3.py",
+    "path": "esphome/components/esp32/gpio_esp32_c3.py",
+    "sha": "6eb002f3f0a2beb8dfbe8dc60751ce8e314270a2",
+    "size": 1477,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio_esp32_c3.py?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio_esp32_c3.py",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/6eb002f3f0a2beb8dfbe8dc60751ce8e314270a2",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/gpio_esp32_c3.py",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio_esp32_c3.py?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/6eb002f3f0a2beb8dfbe8dc60751ce8e314270a2",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio_esp32_c3.py"
+    }
+  },
+  {
+    "name": "gpio_esp32_c5.py",
+    "path": "esphome/components/esp32/gpio_esp32_c5.py",
+    "sha": "639ed64c9ea81bda39b60fc042d0ae9045375c6f",
+    "size": 1783,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio_esp32_c5.py?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio_esp32_c5.py",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/639ed64c9ea81bda39b60fc042d0ae9045375c6f",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/gpio_esp32_c5.py",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio_esp32_c5.py?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/639ed64c9ea81bda39b60fc042d0ae9045375c6f",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio_esp32_c5.py"
+    }
+  },
+  {
+    "name": "gpio_esp32_c6.py",
+    "path": "esphome/components/esp32/gpio_esp32_c6.py",
+    "sha": "bd7bb9e2208fa61165769ac3387d98256ad91161",
+    "size": 2052,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio_esp32_c6.py?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio_esp32_c6.py",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/bd7bb9e2208fa61165769ac3387d98256ad91161",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/gpio_esp32_c6.py",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio_esp32_c6.py?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/bd7bb9e2208fa61165769ac3387d98256ad91161",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio_esp32_c6.py"
+    }
+  },
+  {
+    "name": "gpio_esp32_c61.py",
+    "path": "esphome/components/esp32/gpio_esp32_c61.py",
+    "sha": "2f3abe6a0f9cb6356c2a89f576df96b5aabf5412",
+    "size": 1289,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio_esp32_c61.py?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio_esp32_c61.py",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/2f3abe6a0f9cb6356c2a89f576df96b5aabf5412",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/gpio_esp32_c61.py",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio_esp32_c61.py?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/2f3abe6a0f9cb6356c2a89f576df96b5aabf5412",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio_esp32_c61.py"
+    }
+  },
+  {
+    "name": "gpio_esp32_h2.py",
+    "path": "esphome/components/esp32/gpio_esp32_h2.py",
+    "sha": "9dd6537694446106e4703aeba6db92397fb85651",
+    "size": 1568,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio_esp32_h2.py?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio_esp32_h2.py",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/9dd6537694446106e4703aeba6db92397fb85651",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/gpio_esp32_h2.py",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio_esp32_h2.py?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/9dd6537694446106e4703aeba6db92397fb85651",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio_esp32_h2.py"
+    }
+  },
+  {
+    "name": "gpio_esp32_h21.py",
+    "path": "esphome/components/esp32/gpio_esp32_h21.py",
+    "sha": "5ab1b7c0740ca880842cb75c6c58c0fd1b89d6e2",
+    "size": 1105,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio_esp32_h21.py?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio_esp32_h21.py",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/5ab1b7c0740ca880842cb75c6c58c0fd1b89d6e2",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/gpio_esp32_h21.py",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio_esp32_h21.py?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/5ab1b7c0740ca880842cb75c6c58c0fd1b89d6e2",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio_esp32_h21.py"
+    }
+  },
+  {
+    "name": "gpio_esp32_h4.py",
+    "path": "esphome/components/esp32/gpio_esp32_h4.py",
+    "sha": "86a4d558589aa4e93b686a3fd8e16dc1cafdc918",
+    "size": 1099,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio_esp32_h4.py?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio_esp32_h4.py",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/86a4d558589aa4e93b686a3fd8e16dc1cafdc918",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/gpio_esp32_h4.py",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio_esp32_h4.py?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/86a4d558589aa4e93b686a3fd8e16dc1cafdc918",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio_esp32_h4.py"
+    }
+  },
+  {
+    "name": "gpio_esp32_p4.py",
+    "path": "esphome/components/esp32/gpio_esp32_p4.py",
+    "sha": "6e9227c5015491b1e8b1a27438287c86d623e007",
+    "size": 1678,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio_esp32_p4.py?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio_esp32_p4.py",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/6e9227c5015491b1e8b1a27438287c86d623e007",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/gpio_esp32_p4.py",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio_esp32_p4.py?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/6e9227c5015491b1e8b1a27438287c86d623e007",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio_esp32_p4.py"
+    }
+  },
+  {
+    "name": "gpio_esp32_s2.py",
+    "path": "esphome/components/esp32/gpio_esp32_s2.py",
+    "sha": "4978f48a1c25f086e0c2214524de8adad3425db2",
+    "size": 2106,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio_esp32_s2.py?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio_esp32_s2.py",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/4978f48a1c25f086e0c2214524de8adad3425db2",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/gpio_esp32_s2.py",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio_esp32_s2.py?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/4978f48a1c25f086e0c2214524de8adad3425db2",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio_esp32_s2.py"
+    }
+  },
+  {
+    "name": "gpio_esp32_s3.py",
+    "path": "esphome/components/esp32/gpio_esp32_s3.py",
+    "sha": "db8c5205336fa2d925f5c61768b44698e22b0ea3",
+    "size": 3367,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio_esp32_s3.py?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio_esp32_s3.py",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/db8c5205336fa2d925f5c61768b44698e22b0ea3",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/gpio_esp32_s3.py",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio_esp32_s3.py?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/db8c5205336fa2d925f5c61768b44698e22b0ea3",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio_esp32_s3.py"
+    }
+  },
+  {
+    "name": "gpio_esp32_s31.py",
+    "path": "esphome/components/esp32/gpio_esp32_s31.py",
+    "sha": "7ccb7cdb903f3d8da301cd473fbb43c7efd8a2d2",
+    "size": 2349,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio_esp32_s31.py?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio_esp32_s31.py",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/7ccb7cdb903f3d8da301cd473fbb43c7efd8a2d2",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/gpio_esp32_s31.py",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/gpio_esp32_s31.py?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/7ccb7cdb903f3d8da301cd473fbb43c7efd8a2d2",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/gpio_esp32_s31.py"
+    }
+  },
+  {
+    "name": "hal.cpp",
+    "path": "esphome/components/esp32/hal.cpp",
+    "sha": "199cb89f51659eb069bf4aceffc10ff7abd6705e",
+    "size": 1903,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/hal.cpp?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/hal.cpp",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/199cb89f51659eb069bf4aceffc10ff7abd6705e",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/hal.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/hal.cpp?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/199cb89f51659eb069bf4aceffc10ff7abd6705e",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/hal.cpp"
+    }
+  },
+  {
+    "name": "hal.h",
+    "path": "esphome/components/esp32/hal.h",
+    "sha": "2180f07f6c369618d88d6ba370df64162fb722c5",
+    "size": 1737,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/hal.h?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/hal.h",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/2180f07f6c369618d88d6ba370df64162fb722c5",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/hal.h",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/hal.h?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/2180f07f6c369618d88d6ba370df64162fb722c5",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/hal.h"
+    }
+  },
+  {
+    "name": "helpers.cpp",
+    "path": "esphome/components/esp32/helpers.cpp",
+    "sha": "91b4241211d6e1af80aa2dc7959a5af3d87ec9a8",
+    "size": 5194,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/helpers.cpp?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/helpers.cpp",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/91b4241211d6e1af80aa2dc7959a5af3d87ec9a8",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/helpers.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/helpers.cpp?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/91b4241211d6e1af80aa2dc7959a5af3d87ec9a8",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/helpers.cpp"
+    }
+  },
+  {
+    "name": "iram_fix.py.script",
+    "path": "esphome/components/esp32/iram_fix.py.script",
+    "sha": "b656d7d1a6f9da44dd26160ed37fc1f58ae3c10c",
+    "size": 3028,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/iram_fix.py.script?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/iram_fix.py.script",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/b656d7d1a6f9da44dd26160ed37fc1f58ae3c10c",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/iram_fix.py.script",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/iram_fix.py.script?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/b656d7d1a6f9da44dd26160ed37fc1f58ae3c10c",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/iram_fix.py.script"
+    }
+  },
+  {
+    "name": "post_build.py.script",
+    "path": "esphome/components/esp32/post_build.py.script",
+    "sha": "f1a38f9e76f1877a8a2cee57f75f3a1a3cb9128b",
+    "size": 14418,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/post_build.py.script?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/post_build.py.script",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/f1a38f9e76f1877a8a2cee57f75f3a1a3cb9128b",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/post_build.py.script",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/post_build.py.script?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/f1a38f9e76f1877a8a2cee57f75f3a1a3cb9128b",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/post_build.py.script"
+    }
+  },
+  {
+    "name": "pre_build.py.script",
+    "path": "esphome/components/esp32/pre_build.py.script",
+    "sha": "8728e02a3461461f9faece1a96217f1daecf5025",
+    "size": 591,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/pre_build.py.script?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/pre_build.py.script",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/8728e02a3461461f9faece1a96217f1daecf5025",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/pre_build.py.script",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/pre_build.py.script?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/8728e02a3461461f9faece1a96217f1daecf5025",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/pre_build.py.script"
+    }
+  },
+  {
+    "name": "preference_backend.h",
+    "path": "esphome/components/esp32/preference_backend.h",
+    "sha": "b0771b31283cb4371f25b89b053f4aea49e6ebf5",
+    "size": 755,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/preference_backend.h?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/preference_backend.h",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/b0771b31283cb4371f25b89b053f4aea49e6ebf5",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/preference_backend.h",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/preference_backend.h?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/b0771b31283cb4371f25b89b053f4aea49e6ebf5",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/preference_backend.h"
+    }
+  },
+  {
+    "name": "preferences.cpp",
+    "path": "esphome/components/esp32/preferences.cpp",
+    "sha": "f3d5844cd7aa0c5145b075532da9afa2237ceade",
+    "size": 12301,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/preferences.cpp?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/preferences.cpp",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/f3d5844cd7aa0c5145b075532da9afa2237ceade",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/preferences.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/preferences.cpp?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/f3d5844cd7aa0c5145b075532da9afa2237ceade",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/preferences.cpp"
+    }
+  },
+  {
+    "name": "preferences.h",
+    "path": "esphome/components/esp32/preferences.h",
+    "sha": "91258439587bbc9fdc9d49fdf7628593eaab021d",
+    "size": 1794,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/preferences.h?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/preferences.h",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/91258439587bbc9fdc9d49fdf7628593eaab021d",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/preferences.h",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/preferences.h?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/91258439587bbc9fdc9d49fdf7628593eaab021d",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/preferences.h"
+    }
+  },
+  {
+    "name": "printf_stubs.cpp",
+    "path": "esphome/components/esp32/printf_stubs.cpp",
+    "sha": "489c50394297a87ec0c0222486da59c065360eaa",
+    "size": 3378,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/printf_stubs.cpp?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/printf_stubs.cpp",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/489c50394297a87ec0c0222486da59c065360eaa",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/printf_stubs.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/printf_stubs.cpp?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/489c50394297a87ec0c0222486da59c065360eaa",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/printf_stubs.cpp"
+    }
+  },
+  {
+    "name": "throw_stubs.cpp",
+    "path": "esphome/components/esp32/throw_stubs.cpp",
+    "sha": "e82e5645de342f3d6ceffe9948cc3f3ca5b6ca01",
+    "size": 2707,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/throw_stubs.cpp?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/throw_stubs.cpp",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/e82e5645de342f3d6ceffe9948cc3f3ca5b6ca01",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/throw_stubs.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/throw_stubs.cpp?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/e82e5645de342f3d6ceffe9948cc3f3ca5b6ca01",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/throw_stubs.cpp"
+    }
+  },
+  {
+    "name": "vasprintf_stubs.cpp",
+    "path": "esphome/components/esp32/vasprintf_stubs.cpp",
+    "sha": "308a58ebda78637ddbd6658659d09e1cbc051d17",
+    "size": 1903,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/vasprintf_stubs.cpp?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/vasprintf_stubs.cpp",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/308a58ebda78637ddbd6658659d09e1cbc051d17",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/esp32/vasprintf_stubs.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/esp32/vasprintf_stubs.cpp?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/308a58ebda78637ddbd6658659d09e1cbc051d17",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/esp32/vasprintf_stubs.cpp"
+    }
+  }
+]

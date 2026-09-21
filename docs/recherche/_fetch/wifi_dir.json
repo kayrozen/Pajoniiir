@@ -1,0 +1,162 @@
+[
+  {
+    "name": "__init__.py",
+    "path": "esphome/components/wifi/__init__.py",
+    "sha": "c22d49e665420b084c669fdee04754388ddf92b0",
+    "size": 42351,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/wifi/__init__.py?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/wifi/__init__.py",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/c22d49e665420b084c669fdee04754388ddf92b0",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/wifi/__init__.py",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/wifi/__init__.py?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/c22d49e665420b084c669fdee04754388ddf92b0",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/wifi/__init__.py"
+    }
+  },
+  {
+    "name": "automation.h",
+    "path": "esphome/components/wifi/automation.h",
+    "sha": "c14341330f50eefbf82644f7d292d676d153e18a",
+    "size": 4539,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/wifi/automation.h?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/wifi/automation.h",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/c14341330f50eefbf82644f7d292d676d153e18a",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/wifi/automation.h",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/wifi/automation.h?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/c14341330f50eefbf82644f7d292d676d153e18a",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/wifi/automation.h"
+    }
+  },
+  {
+    "name": "scan_list.h",
+    "path": "esphome/components/wifi/scan_list.h",
+    "sha": "8a11c745da3ed22543a74d9bf10c53b9398f7fce",
+    "size": 1051,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/wifi/scan_list.h?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/wifi/scan_list.h",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/8a11c745da3ed22543a74d9bf10c53b9398f7fce",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/wifi/scan_list.h",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/wifi/scan_list.h?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/8a11c745da3ed22543a74d9bf10c53b9398f7fce",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/wifi/scan_list.h"
+    }
+  },
+  {
+    "name": "wifi_component.cpp",
+    "path": "esphome/components/wifi/wifi_component.cpp",
+    "sha": "125139ad163ca3ccb2064f3ef955da7512fb057a",
+    "size": 116446,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/wifi/wifi_component.cpp?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/wifi/wifi_component.cpp",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/125139ad163ca3ccb2064f3ef955da7512fb057a",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/wifi/wifi_component.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/wifi/wifi_component.cpp?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/125139ad163ca3ccb2064f3ef955da7512fb057a",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/wifi/wifi_component.cpp"
+    }
+  },
+  {
+    "name": "wifi_component.h",
+    "path": "esphome/components/wifi/wifi_component.h",
+    "sha": "679137964997f5a7ab34010acbd3bf8d1417837c",
+    "size": 42357,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/wifi/wifi_component.h?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/wifi/wifi_component.h",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/679137964997f5a7ab34010acbd3bf8d1417837c",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/wifi/wifi_component.h",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/wifi/wifi_component.h?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/679137964997f5a7ab34010acbd3bf8d1417837c",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/wifi/wifi_component.h"
+    }
+  },
+  {
+    "name": "wifi_component_esp8266.cpp",
+    "path": "esphome/components/wifi/wifi_component_esp8266.cpp",
+    "sha": "60ec3f9a4d5a78d79b5acbd1ef08ac3342021bd5",
+    "size": 35382,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/wifi/wifi_component_esp8266.cpp?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/wifi/wifi_component_esp8266.cpp",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/60ec3f9a4d5a78d79b5acbd1ef08ac3342021bd5",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/wifi/wifi_component_esp8266.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/wifi/wifi_component_esp8266.cpp?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/60ec3f9a4d5a78d79b5acbd1ef08ac3342021bd5",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/wifi/wifi_component_esp8266.cpp"
+    }
+  },
+  {
+    "name": "wifi_component_esp_idf.cpp",
+    "path": "esphome/components/wifi/wifi_component_esp_idf.cpp",
+    "sha": "24bf64a99ce3df7e29d72af3e996e4c9cd435930",
+    "size": 49749,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/wifi/wifi_component_esp_idf.cpp?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/wifi/wifi_component_esp_idf.cpp",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/24bf64a99ce3df7e29d72af3e996e4c9cd435930",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/wifi/wifi_component_esp_idf.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/wifi/wifi_component_esp_idf.cpp?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/24bf64a99ce3df7e29d72af3e996e4c9cd435930",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/wifi/wifi_component_esp_idf.cpp"
+    }
+  },
+  {
+    "name": "wifi_component_libretiny.cpp",
+    "path": "esphome/components/wifi/wifi_component_libretiny.cpp",
+    "sha": "940f2a0783055a236ab5abe94a81e253c8ff156e",
+    "size": 31826,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/wifi/wifi_component_libretiny.cpp?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/wifi/wifi_component_libretiny.cpp",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/940f2a0783055a236ab5abe94a81e253c8ff156e",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/wifi/wifi_component_libretiny.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/wifi/wifi_component_libretiny.cpp?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/940f2a0783055a236ab5abe94a81e253c8ff156e",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/wifi/wifi_component_libretiny.cpp"
+    }
+  },
+  {
+    "name": "wifi_component_pico_w.cpp",
+    "path": "esphome/components/wifi/wifi_component_pico_w.cpp",
+    "sha": "325bcf26529f56e105aaccc6dc406b61a9538863",
+    "size": 13673,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/wifi/wifi_component_pico_w.cpp?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/wifi/wifi_component_pico_w.cpp",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/325bcf26529f56e105aaccc6dc406b61a9538863",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/wifi/wifi_component_pico_w.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/wifi/wifi_component_pico_w.cpp?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/325bcf26529f56e105aaccc6dc406b61a9538863",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/wifi/wifi_component_pico_w.cpp"
+    }
+  },
+  {
+    "name": "wpa2_eap.py",
+    "path": "esphome/components/wifi/wpa2_eap.py",
+    "sha": "089a4fa99a4a9deb101cff3b7049a213f3d2743a",
+    "size": 5059,
+    "url": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/wifi/wpa2_eap.py?ref=dev",
+    "html_url": "https://github.com/esphome/esphome/blob/dev/esphome/components/wifi/wpa2_eap.py",
+    "git_url": "https://api.github.com/repos/esphome/esphome/git/blobs/089a4fa99a4a9deb101cff3b7049a213f3d2743a",
+    "download_url": "https://raw.githubusercontent.com/esphome/esphome/dev/esphome/components/wifi/wpa2_eap.py",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/esphome/esphome/contents/esphome/components/wifi/wpa2_eap.py?ref=dev",
+      "git": "https://api.github.com/repos/esphome/esphome/git/blobs/089a4fa99a4a9deb101cff3b7049a213f3d2743a",
+      "html": "https://github.com/esphome/esphome/blob/dev/esphome/components/wifi/wpa2_eap.py"
+    }
+  }
+]
