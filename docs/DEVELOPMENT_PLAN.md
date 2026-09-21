@@ -2903,12 +2903,16 @@ otherwise the waveform comes back blank.
 
 ## Phase 21: JC1060P470C 7" Display Target
 
-Status: **Phase 1 scaffolded; hardware bring-up pending.**
+Status: **Display/audio/USB/ETH bring-up COMPLETE on hardware (v117, IDF
+6.0.2, 2026-09-21). UI porting in progress (separate agent, ui_simulator).**
+Wi-Fi remains parked (EspControl/IDF 5.5.5 reference plan; see
+`docs/recherche/`). Full ETH debug trail:
+`docs/recherche/eth-jc1060p470-phy-is-busy.md`.
 
 Goal: port the Pajoniiir firmware to the Guition JC1060P470C_I_W_Y board as a
 second ESP32-P4 target with a larger 1024x600 landscape display.
 
-### Phase 1: Hardware Bring-Up (scaffolded)
+### Phase 1: Hardware Bring-Up (COMPLETE - v117)
 
 - BSP `bsp_jc1060p470` created with JD9165 MIPI-DSI driver (1024x600, 51.2 MHz
   pixel clock, 2 lanes @ 1.0 Gbps), GT911 capacitive touch (I2C 0x5D) and
@@ -2922,13 +2926,19 @@ second ESP32-P4 target with a larger 1024x600 landscape display.
 - ESP-Hosted ESP32-C6 co-processor pins provisioned (verify from schematic).
 - See `firmware/main-deck-jc1060/BRING_UP_GUIDE.md`.
 
-Exit criteria:
+Validated on hardware (v117, 2026-09-21):
 
-- boot log matches expected sequence (display, touch, audio, backlight);
-- all four visual test patterns render correctly;
-- touch coordinates map to display coordinates;
-- audio codec initialises without noise;
-- no DSI underrun or watchdog reset during the test.
+- Colours correct (v69 fix: explicit INVOFF + ESPHome V1 timings 40/160/160,
+  10/23/12, 54 MHz pclk, 750 Mbps lanes; panel is RGB565 COLMOD 0x55).
+- Audio clean (v57 fix: DSI flush via DMA2D, no USB iso glitches).
+- USB host DDJ (TinyUSB, UTMI PHY) working.
+- Ethernet: RMII EMAC + IP101GR PHY (addr 1) got DHCP IP 192.168.100.131.
+  Fix: NO manual MDIO/config - use exact IDF 6.0.2 driver defaults
+  (MDC=31, MDIO=52, CLK_EXT_IN GPIO50, GPIO51=RESET_N driver-owned). A
+  pre-start MDIO scan both blocked the eth stack AND caused display
+  flicker (eth task spinning on the SMI bus). TCP debug console :2333.
+- On-screen heartbeat shows uptime + ETH IP (bypasses esp_log levels).
+- Main task stack 16 KB required (UI/log/console/ETH bring-up in main).
 
 ### Phase 2: LVGL UI Porting (planned)
 

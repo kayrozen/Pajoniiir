@@ -91,10 +91,14 @@ The following integrations are **work in progress** (uncommitted):
   Smart CFX and dedicated physical loop buttons. See
   `controllers/pioneer_ddj_400/`.
 - **Guition JC1060P470C 7" display**: new ESP32-P4 target with JD9165
-  MIPI-DSI 1024x600 panel, GT911 capacitive touch and ES8311 audio codec. BSP
-  and bring-up example are scaffolded; LVGL UI porting and control-link
-  integration are the next phases. See
-  [`firmware/main-deck-jc1060/BRING_UP_GUIDE.md`](firmware/main-deck-jc1060/BRING_UP_GUIDE.md).
+  MIPI-DSI 1024x600 panel, GT911 capacitive touch and ES8311 audio codec.
+  Hardware bring-up COMPLETE on hardware (v117, ESP-IDF 6.0.2): display
+  colours (v69 INVOFF fix), clean audio (v57 DMA2D fix), USB host DDJ via
+  TinyUSB, and Ethernet (RMII + IP101GR, DHCP working, TCP debug console
+  :2333). Wi-Fi (ESP32-C6 via esp_hosted) parked under IDF 6.0.2 - reference
+  plan on IDF 5.5.5. LVGL UI porting is in progress. See
+  [`firmware/main-deck-jc1060/BRING_UP_GUIDE.md`](firmware/main-deck-jc1060/BRING_UP_GUIDE.md)
+  and [`docs/recherche/eth-jc1060p470-phy-is-busy.md`](docs/recherche/eth-jc1060p470-phy-is-busy.md).
 
 Detailed implementation and acceptance status belongs in
 [Project Overview](docs/PROJECT_OVERVIEW.md),
