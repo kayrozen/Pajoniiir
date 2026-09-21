@@ -145,10 +145,14 @@ static void console_server_task(void* arg)
 /* Wi-Fi events                                                       */
 /* ------------------------------------------------------------------ */
 
+static bool s_sta_started = false;
+
 static void wifi_event_cb(void* arg, esp_event_base_t base,
                           int32_t id, void* data)
 {
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        s_sta_started = true;
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         if (usb_audio_wifi_suspended()) {
             /* Audio owns the radio right now (Wi-Fi suspended to protect the
              * USB iso stream from SDIO bus bursts). Do not reconnect until
@@ -198,8 +202,38 @@ static void scan_and_log(void)
                  recs[i].rssi, recs[i].authmode);
     }
 }
+static bool s_sta_started;
 
-/* v78: scan runs in a throwaway task - a hanging C6 scan RPC must not
+/* v85: ESPHome-exact wifi_config_t - built once, applied from the watchdog
+ * after STA_START (set_config toward an already-started co-processor, the
+ * only sequence validated on the esp_hosted RPC path). */
+static wifi_config_t s_wifi_config = {
+    .sta = {
+        .ssid = WIFI_SSID,
+        .password = WIFI_PASSWORD,
+        .threshold.authmode = WIFI_AUTH_WPA2_PSK, /* ESPHome min_auth default */
+        .threshold.rssi = -127,                   /* no RSSI filter */
+        .bssid_set = false,
+        .channel = 0,
+        .scan_method = WIFI_ALL_CHANNEL_SCAN,     /* ESPHome default path */
+        .listen_interval = 0,
+        .pmf_cfg = { .capable = true, .required = false },
+    },
+};
+
+/* v85: ESPHome-exact connect: set_config AFTER start, then connect. */
+static void wifi_sta_connect_esp_home_style(void)
+{
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &s_wifi_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "set_config: %s", esp_err_to_name(err));
+        return;
+    }
+    err = esp_wifi_connect();
+    ESP_LOGI(TAG, "watchdog: esp_wifi_connect -> %s", esp_err_to_name(err));
+}
+
+/* v85: scan runs in a throwaway task - a hanging C6 scan RPC must not
  * kill the watchdog (the watchdog also delays its first connect while
  * the scan runs). */
 static void scan_task(void* arg)
@@ -224,14 +258,20 @@ static void wifi_reconnect_task(void* arg)
         }
         bool connected = s_got_ip;
         if (!connected) {
+            /* v85: wait for STA_START, then apply ESPHome-exact config. */
+            for (int i = 0; i < 50 && !s_sta_started; i++) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+            if (!s_sta_started) {
+                ESP_LOGW(TAG, "watchdog: STA_START not received, skipping");
+                continue;
+            }
             if (first) {
                 first = false;
                 xTaskCreate(scan_task, "wifi_scan", 4096, NULL, 3, NULL);
                 vTaskDelay(pdMS_TO_TICKS(6000)); /* let the scan finish */
             }
-            esp_err_t err = esp_wifi_connect();
-            ESP_LOGI(TAG, "watchdog: esp_wifi_connect -> %s",
-                     esp_err_to_name(err));
+            wifi_sta_connect_esp_home_style();
         } else {
             first = false;
         }
@@ -264,22 +304,11 @@ bool wifi_console_start(void)
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                                wifi_event_cb, NULL));
 
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASSWORD,
-            /* v83: ESPHome (which connects fine) uses threshold OPEN - the
-             * weakest authmode accepted; WPA2_PSK filter rejected the AP
-             * and association never even started (203/2). The real auth
-             * mode is negotiated from the AP beacon with our password. */
-            .threshold.authmode = WIFI_AUTH_OPEN,
-            .threshold.rssi = -127,
-            .scan_method = WIFI_FAST_SCAN,
-            .pmf_cfg = { .capable = true, .required = false },
-        },
-    };
+    /* v85: ESPHome sequence (validated end-to-end on the esp_hosted RPC
+     * path): init -> set_storage(RAM) -> set_mode -> start; set_config and
+     * connect happen AFTER STA_START (handled in the watchdog task). */
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
     /* v63: PS_NONE (v39) removed - it was added under the invalidated
      * "Wi-Fi steals the bus" theory and can break association with the

@@ -67,7 +67,13 @@ CONFIG_ESP_HOSTED_SLAVE_RESET_ONLY_IF_NECESSARY=y
 # only mode that boots with the ESPHome C6 2.12.12 slave; the RX drops and
 # RPC hangs under it remain under investigation.
 CONFIG_ESP_HOSTED_SDIO_OPTIMIZATION_RX_STREAMING_MODE=y
+# v87 (V4): mempool SRAM = assert sdio_mempool_create (documented failure:
+# our app needs the PSRAM mempool, unlike the light EspControl image).
 CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y
+# v88 (V2): packet stats to prove/disprove the RX stall signature (#243:
+# s2h in frozen while h2s out ok progresses).
+CONFIG_ESP_HOSTED_PKT_STATS=y
+CONFIG_ESP_HOSTED_PKT_STATS_INTERVAL_SEC=2
 CONFIG_FREERTOS_HZ=1000
 
 # OTA: dual-slot with rollback - new image must prove itself (30 s uptime)

@@ -103,9 +103,11 @@ void app_main(void)
         ESP_LOGW(TAG, "SD card not available");
     }
 
-    /* Controller surface (DDJ) + Ethernet (DJ Link path + debug console). */
+    /* Controller surface (DDJ). v86: Ethernet OFF for differential test -
+     * EspControl itself never runs WiFi+Ethernet together (ESPHome
+     * limitation), and the RMII/EMAC may interfere with the SDIO C6 path. */
     usb_tu_start();
-    eth_bringup_start();
+    /* eth_bringup_start(); */
 
     ESP_LOGI(TAG, "Bring-up complete - entering UI loop");
 
