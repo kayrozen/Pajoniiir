@@ -85,8 +85,8 @@ void app_main(void)
     if (nvs_ret != ESP_OK) {
         ESP_LOGE(TAG, "NVS init failed: %s", esp_err_to_name(nvs_ret));
     }
-#if 1 /* v58: Wi-Fi/OTA back ON - audio is clean now (DMA2D flush), the
-           * earlier Wi-Fi "guilt" was the CPU memcpy flush running with it */
+#if 0 /* v89: Wi-Fi parked - RPC hangs under IDF 6.0.2 (never tested upstream,
+           CI = 5.3-5.5 only). Full investigation in docs/recherche/. */
     if (!wifi_console_start()) {
         ESP_LOGW(TAG, "Wi-Fi console not available");
     }
@@ -94,6 +94,12 @@ void app_main(void)
     log_screen_rehook();
     ota_update_start();
 #endif
+
+    /* v89: TCP log console over Ethernet only (Wi-Fi parked). */
+    if (!console_tcp_start()) {
+        ESP_LOGW(TAG, "TCP console not available");
+    }
+    log_screen_rehook();
 
     /* SD card (music library). */
     sdmmc_card_t* card = NULL;
@@ -103,11 +109,9 @@ void app_main(void)
         ESP_LOGW(TAG, "SD card not available");
     }
 
-    /* Controller surface (DDJ). v86: Ethernet OFF for differential test -
-     * EspControl itself never runs WiFi+Ethernet together (ESPHome
-     * limitation), and the RMII/EMAC may interfere with the SDIO C6 path. */
+    /* Controller surface (DDJ) + Ethernet (v89: console debug par ETH). */
     usb_tu_start();
-    /* eth_bringup_start(); */
+    eth_bringup_start();
 
     ESP_LOGI(TAG, "Bring-up complete - entering UI loop");
 

@@ -278,6 +278,23 @@ static void wifi_reconnect_task(void* arg)
     }
 }
 
+/* v89: TCP log console without Wi-Fi. Installs the log tee and starts the
+ * server task; it accepts connections as soon as ANY interface (Ethernet)
+ * has an IP. Used by main.c when the Wi-Fi path is parked. */
+bool console_tcp_start(void)
+{
+    s_sock_mutex = xSemaphoreCreateMutex();
+    if (s_sock_mutex == NULL) {
+        return false;
+    }
+    esp_log_set_vprintf(console_vprintf);
+    if (xTaskCreate(console_server_task, "wifi_console", 4096, NULL, 4, NULL)
+        != pdPASS) {
+        return false;
+    }
+    return true;
+}
+
 bool wifi_console_start(void)
 {
     /* v59: scan results (AP list + RSSI) are ESP_LOGI - raise this tag so
@@ -321,10 +338,7 @@ bool wifi_console_start(void)
 
     /* v72: tee logs to the TCP console from now on (the server task below
      * accepts connections as soon as ANY interface has an IP). */
-    esp_log_set_vprintf(console_vprintf);
-
-    if (xTaskCreate(console_server_task, "wifi_console", 4096, NULL, 4, NULL)
-        != pdPASS) {
+    if (!console_tcp_start()) {
         return false;
     }
     if (xTaskCreate(wifi_reconnect_task, "wifi_reconn", 3072, NULL, 4, NULL)

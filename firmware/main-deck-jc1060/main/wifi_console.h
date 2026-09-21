@@ -22,6 +22,17 @@ extern "C" {
  */
 bool wifi_console_start(void);
 
+/**
+ * @brief Start ONLY the TCP log console (port 2333) - no Wi-Fi.
+ *
+ * v89: installs the log tee and spawns the server task, which accepts
+ * connections as soon as ANY interface (Ethernet) has an IP. Use this when
+ * the Wi-Fi path is parked (#if 0 in main.c).
+ *
+ * @return true if the console task was created
+ */
+bool console_tcp_start(void);
+
 #ifdef __cplusplus
 }
 #endif

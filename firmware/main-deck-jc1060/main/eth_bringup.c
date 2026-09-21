@@ -78,6 +78,14 @@ bool eth_bringup_start(void)
         return false;
     }
 
+    /* v89: netif init used to rely on wifi_console_start running first. With
+     * the Wi-Fi path parked, bring it up here (idempotent). */
+    esp_err_t netif_ret = esp_netif_init();
+    if (netif_ret != ESP_OK && netif_ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "esp_netif_init failed: %s", esp_err_to_name(netif_ret));
+        return false;
+    }
+
     eth_esp32_emac_config_t mac_config = ETH_ESP32_EMAC_DEFAULT_CONFIG();
     /* Defaults match the JC1060P470C board: MDC=31, MDIO=52,
      * RMII REF_CLK input on GPIO50 (50 MHz from the IP101 PHY). */
