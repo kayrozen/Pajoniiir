@@ -240,10 +240,13 @@ static lv_obj_t *ui_performance_tabs_create_screen(lv_obj_t *parent)
 lv_obj_t *ui_performance_tabs_create_hot_cues(lv_obj_t *parent)
 {
     lv_obj_t *screen = ui_performance_tabs_create_screen(parent);
-    ui_controls_create_performance_target_selector(screen, 298, 4);
+    ui_controls_create_performance_target_selector(screen, s_config.hor_res >= 1000 ? 410 : 298, 4);
 
-    int pad_w = 170;
-    int pad_h = 130;
+    /* 800x480 reference grid; wider panels (JC1060 1024) stretch the pads and
+     * drop the status strip to the bottom of the taller screen. */
+    const bool hc_wide = s_config.hor_res >= 1000;
+    int pad_w = hc_wide ? 226 : 170;
+    int pad_h = hc_wide ? 160 : 130;
     int spacing_x = 20;
     int spacing_y = 20;
     int offset_x = 30;
@@ -288,8 +291,8 @@ lv_obj_t *ui_performance_tabs_create_hot_cues(lv_obj_t *parent)
     if (s_config.styles.panel_frame) {
         lv_obj_add_style(status_strip, s_config.styles.panel_frame, LV_PART_MAIN);
     }
-    lv_obj_set_size(status_strip, 740, 62);
-    lv_obj_set_pos(status_strip, 30, 360);
+    lv_obj_set_size(status_strip, hc_wide ? 964 : 740, 62);
+    lv_obj_set_pos(status_strip, 30, hc_wide ? 464 : 360);
     lv_obj_clear_flag(status_strip, LV_OBJ_FLAG_SCROLLABLE);
     ui_performance_tabs_value_label(status_strip, "HOT CUE STATUS", COL_TEXT_MUTED,
                                     &lv_font_montserrat_12, 16, 12);

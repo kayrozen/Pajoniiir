@@ -223,6 +223,13 @@ static void usb_lib_task(void *arg)
     const usb_host_config_t host_cfg = {
         .intr_flags = ESP_INTR_FLAG_LEVEL1,
         .root_port_unpowered = true,
+        /* jc1060: the DDJ owns OTG_HS (TinyUSB, pads USB_DP/DM). The MSC
+         * drive lives on the second USB-C connector wired to OTG_FS
+         * (GPIO26/27) -> peripheral 1. Default (0) would be the HS port
+         * already claimed by TinyUSB. */
+        .peripheral_map = BIT(1),
+        /* (fsls_only n'existe pas dans espressif/usb 1.5.0 - l'OTG_FS n'a
+         * de toute façon pas de PHY HS.) */
     };
     ESP_ERROR_CHECK(usb_host_install(&host_cfg));
 
@@ -235,7 +242,7 @@ static void usb_lib_task(void *arg)
     ESP_ERROR_CHECK(msc_host_install(&msc_cfg));
 
     root_port_power_cycle("initial bring-up");
-    ESP_LOGI(TAG, "USB host + MSC installed; waiting for a drive on the HS USB port");
+    ESP_LOGI(TAG, "USB host + MSC installed on OTG_FS (peripheral 1); waiting for a drive");
 
     usb_storage_session_t session = desired_snapshot();
     usb_storage_recovery_t recovery;

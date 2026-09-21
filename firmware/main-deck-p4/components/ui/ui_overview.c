@@ -152,10 +152,10 @@ static void ui_obj_set_x_if_changed(lv_obj_t *obj, int32_t x)
 #define OVERVIEW_TRANSPORT_CUE_Y_OFFSET 126
 #define OVERVIEW_VU_Y_OFFSET 4
 #define OVERVIEW_VU_SEGMENT_H 14
-#define OVERVIEW_DECK_INFO_W 520
+#define OVERVIEW_DECK_INFO_W 512
 #define OVERVIEW_TITLE_Y 404
 #define OVERVIEW_TITLE_H 36
-#define OVERVIEW_TITLE_TEXT_W 512
+#define OVERVIEW_TITLE_TEXT_W 504
 #define OVERVIEW_INFO_DIVIDER_Y 442
 #define OVERVIEW_INFO_ROW_Y 444
 #define OVERVIEW_TIME_Y 452
@@ -168,7 +168,7 @@ static void ui_obj_set_x_if_changed(lv_obj_t *obj, int32_t x)
 #define OVERVIEW_REMAIN_X 118
 #define OVERVIEW_REMAIN_W 104
 #define OVERVIEW_PITCH_X 380
-#define OVERVIEW_MT_X 480
+#define OVERVIEW_MT_X 470
 #define OVERVIEW_MINI_WAVE_Y 484
 #define OVERVIEW_BEAT_STRIP_DOT_SIZE_PX 14
 #define OVERVIEW_BEAT_STRIP_STEP_PX 30
@@ -736,9 +736,9 @@ static void ui_create_overview_deck_panel(lv_obj_t *parent, uint8_t deck, int y)
     panel->last_wave_center_ms = UINT32_MAX;
     panel->last_wave_window_ms = 0;
     panel->last_time_bucket = UINT32_MAX;
-    int top_y = (deck == CTRL_DECK_1) ? 0 : 158;
+    int top_y = (deck == CTRL_DECK_1) ? 0 : (OVERVIEW_DECK2_WAVE_Y + 16);
     int wave_y = (deck == CTRL_DECK_1) ? OVERVIEW_DECK1_WAVE_Y : OVERVIEW_DECK2_WAVE_Y;
-    int info_x = (deck == CTRL_DECK_1) ? 0 : 400;
+    int info_x = (deck == CTRL_DECK_1) ? 0 : OVERVIEW_DECK_INFO_W;
 
     panel->panel = lv_obj_create(parent);
     lv_obj_remove_style_all(panel->panel);

@@ -4,12 +4,12 @@
   "height": 600,
   "lvgl_commit": "263ae5e13dec1e525109aed556cec1bbdfdecd5a",
   "captures": {
-    "overview_deck1": "e0d8bc2543f081026e7a5597e18bffd9f959a76988c34d6e122d7d23efd88fa0",
-    "overview_deck2": "b87ac46dd09736ca7247a1ef4453b02c29c80238e13e7b05c3fd5c3b1070d0de",
-    "library": "83b75fc9532b1791ba38980510d153d125ffa460a111d20ee41a848b93825fce",
-    "hot_cues": "a727f0ddefd3313ef7cd8672d83838f6e953a2c7a676a80e92c9071c451ec30c",
-    "settings": "254a84909f6a7403740bc85af0141dd86cf2145c929c03ec583a5041b2506722",
+    "overview_deck1": "f6f241bb25dc0dc5681c0dfbbfe95012ff2651168057ea161d510731c06699d8",
+    "overview_deck2": "7f363dd520ec336ee19c6b73bb075892d84d5f43cda07563c1678b7b84abda05",
+    "library": "bf8eb3d3ea32291d164599fd1da88ba443bbe5c160737b1f15232deff03a2581",
+    "hot_cues": "b5a68aae6c9f0f1fa56fd39a502d47f7d95182f2347eb3d1f08e0a9bbffd9804",
+    "settings": "7ff943c607a531435a0706710150d58accb120d88d9c645ce0d800049d49fa8c",
     "screensaver": "ebef1da480aca395f88c76ca69c51f63e64e793379c4ab001ba52b40e5fb51f8",
-    "settings_restored": "254a84909f6a7403740bc85af0141dd86cf2145c929c03ec583a5041b2506722"
+    "settings_restored": "7ff943c607a531435a0706710150d58accb120d88d9c645ce0d800049d49fa8c"
   }
 }

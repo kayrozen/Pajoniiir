@@ -24,6 +24,7 @@
 #include "eth_bringup.h"
 #include "wifi_console.h"
 #include "ota_update.h"
+#include "usb_storage.h"
 #include "esp_app_desc.h"
 
 static const char* TAG = "deck";
@@ -117,6 +118,12 @@ void app_main(void)
      * clock/power resources with the EMAC. */
     usb_tu_start(); /* v117: USB/DDJ back ON with working ETH */
     eth_bringup_start(); /* v111 bisect: ETH ON - flicker suspect */
+
+    /* v120: USB MSC on OTG_FS (second USB-C, GPIO26/27) - library drive.
+     * The DDJ stays on OTG_HS via TinyUSB. DISABLED for now: the same
+     * physical port is still needed to flash the tablet. Re-enable when
+     * flashing goes through OTA or the other connector.
+     * ESP_ERROR_CHECK_WITHOUT_ABORT(usb_storage_init(NULL)); */
 
     ESP_LOGI(TAG, "Bring-up complete - entering UI loop");
 
