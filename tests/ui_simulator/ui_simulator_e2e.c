@@ -227,6 +227,27 @@ int main(int argc, char **argv)
     }
 
     pump(3200);
+    if (getenv("UI_SIM_DUMP_FX")) {
+        lv_obj_t *beat = find_any_label(lv_screen_active(), "BEAT");
+        if (beat) {
+            lv_area_t a;
+            lv_obj_get_coords(beat, &a);
+            fprintf(stderr, "BEAT abs coords y=%d..%d (rel y=%d)\n", (int)a.y1, (int)a.y2,
+                    (int)lv_obj_get_y(beat));
+            lv_obj_t *p = lv_obj_get_parent(beat);
+            lv_obj_get_coords(p, &a);
+            fprintf(stderr, "FX panel abs y=%d..%d scroll_y=%d scrollable=%d\n",
+                    (int)a.y1, (int)a.y2, (int)lv_obj_get_scroll_y(p),
+                    lv_obj_has_flag(p, LV_OBJ_FLAG_SCROLLABLE) ? 1 : 0);
+            lv_obj_t *dp = lv_obj_get_parent(p);
+            if (dp) {
+                lv_area_t da;
+                lv_obj_get_coords(dp, &da);
+                fprintf(stderr, "deck panel abs y=%d..%d scroll_y=%d\n", (int)da.y1,
+                        (int)da.y2, (int)lv_obj_get_scroll_y(dp));
+            }
+        }
+    }
     if (!ui_is_overview_active()) {
         fail("overview is not active after boot splash");
     }

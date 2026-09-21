@@ -15,6 +15,8 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_netif.h"
+#include "esp_app_desc.h"
+#include "eth_bringup.h"
 #include "bsp/display.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -165,21 +167,11 @@ void log_screen_task(void)
     /* v91: alive marker every ~5 s (25 x 200 ms loop). */
     if (++s_alive_tick % 25 == 0) {
         char line[96];
-        /* v115: ETH state in the heartbeat - bypasses the esp_log level
-         * system entirely, so "no link" can no longer be a log clipping
-         * artifact. */
-        ip_event_got_ip_t dummy = {0};
-        (void)dummy;
-        extern bool eth_bringup_got_ip(void);
-        extern esp_netif_ip_info_t eth_bringup_ip_info(void);
-        if (eth_bringup_got_ip()) {
-            esp_netif_ip_info_t ip = eth_bringup_ip_info();
-            snprintf(line, sizeof(line), "[alive] uptime=%ds ETH " IPSTR,
-                     (int)(esp_timer_get_time() / 1000000LL), IP2STR(&ip.ip));
-        } else {
-            snprintf(line, sizeof(line), "[alive] uptime=%ds ETH no-ip",
-                     (int)(esp_timer_get_time() / 1000000LL));
-        }
+        /* v123: heartbeat shows the running version too. */
+        snprintf(line, sizeof(line), "[alive] uptime=%ds v%s ETH %s",
+                 (int)(esp_timer_get_time() / 1000000LL),
+                 esp_app_get_description()->version,
+                 eth_bringup_got_ip() ? "up" : "no-ip");
         ls_put_line(line);
         /* v115: also WARN so the serial capture sees the ETH state. */
         ESP_LOGW(TAG, "%s", line);

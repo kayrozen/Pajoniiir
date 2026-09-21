@@ -105,17 +105,34 @@ static void ota_task(void* arg)
             continue;
         }
 
+        /* v124: WARN so the OTA start is always visible on the UART. */
+        ESP_LOGW(TAG, "OTA download starting: %s -> '%s' %s", url,
+                 new_desc.project_name, new_desc.version);
+
+        int last_pct = -25;
         while (1) {
             ret = esp_https_ota_perform(handle);
             if (ret != ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
                 break;
             }
+            /* v124: progress every 25 %. */
+            int img_len = esp_https_ota_get_image_len_read(handle);
+            int img_size = esp_https_ota_get_image_size(handle);
+            if (img_size > 0) {
+                int pct = img_len * 100 / img_size;
+                if (pct - last_pct >= 25) {
+                    last_pct = (pct / 25) * 25;
+                    ESP_LOGW(TAG, "OTA progress: %d/%d kB (%d%%)",
+                             img_len / 1024, img_size / 1024, pct);
+                }
+            }
             vTaskDelay(pdMS_TO_TICKS(100));
         }
         if (ret == ESP_OK) {
+            ESP_LOGW(TAG, "OTA download complete, validating...");
             ret = esp_https_ota_finish(handle);
             if (ret == ESP_OK) {
-                ESP_LOGI(TAG, "OTA image validated, rebooting...");
+                ESP_LOGW(TAG, "OTA image validated, rebooting...");
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 esp_restart();
             }

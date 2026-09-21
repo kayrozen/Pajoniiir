@@ -74,6 +74,8 @@ bool eth_bringup_start(void)
 
     /* v90: make this component's INFO logs visible (screen log tee). */
     esp_log_level_set(TAG, ESP_LOG_INFO);
+    /* v123: OTA checks are INFO - make them visible on the UART capture. */
+    esp_log_level_set("ota_update", ESP_LOG_INFO);
     /* v104-night: DEBUG on the eth stack to see autonego/link poll state. */
     esp_log_level_set("eth_phy_802_3", ESP_LOG_DEBUG);
     esp_log_level_set("emac_esp", ESP_LOG_DEBUG);

@@ -1313,8 +1313,10 @@ lv_obj_t *ui_library_create(lv_obj_t *parent)
     lv_obj_set_style_text_color(s_library_header_table, COL_ACCENT, LV_PART_ITEMS);
     lv_obj_set_style_text_font(s_library_header_table, &lv_font_montserrat_14, LV_PART_ITEMS);
 
-    lv_table_set_column_width(s_library_header_table, 0, 280);
-    lv_table_set_column_width(s_library_header_table, 1, 160);
+    const int col_title_w = lib_wide ? 430 : 280;
+    const int col_artist_w = lib_wide ? 230 : 160;
+    lv_table_set_column_width(s_library_header_table, 0, col_title_w);
+    lv_table_set_column_width(s_library_header_table, 1, col_artist_w);
     lv_table_set_column_width(s_library_header_table, 2, 70);
     lv_table_set_column_width(s_library_header_table, 3, 55);
     lv_table_set_column_width(s_library_header_table, 4, 65);
@@ -1355,8 +1357,8 @@ lv_obj_t *ui_library_create(lv_obj_t *parent)
     lv_obj_set_style_border_side(s_library_table, LV_BORDER_SIDE_BOTTOM, LV_PART_ITEMS | LV_STATE_FOCUSED);
     lv_obj_set_style_border_opa(s_library_table, LV_OPA_COVER, LV_PART_ITEMS | LV_STATE_FOCUSED);
     lv_obj_set_style_text_color(s_library_table, COL_ON_ACCENT, LV_PART_ITEMS | LV_STATE_FOCUSED);
-    lv_table_set_column_width(s_library_table, 0, 280);
-    lv_table_set_column_width(s_library_table, 1, 160);
+    lv_table_set_column_width(s_library_table, 0, col_title_w);
+    lv_table_set_column_width(s_library_table, 1, col_artist_w);
     lv_table_set_column_width(s_library_table, 2, 70);
     lv_table_set_column_width(s_library_table, 3, 55);
     lv_table_set_column_width(s_library_table, 4, 65);
