@@ -41,6 +41,11 @@ static SemaphoreHandle_t s_sock_mutex = NULL;
 /* Log duplication hook                                               */
 /* ------------------------------------------------------------------ */
 
+/* v97: capture the previous vprintf and chain to it - the hard-wired
+ * vprintf() libc call bypassed the log_screen tee whenever the rehook
+ * order changed, which killed the UART console after the first tee swap. */
+static vprintf_like_t s_console_prev;
+
 static int console_vprintf(const char* fmt, va_list args)
 {
     /* Format once for the TCP client (va_copy: args is reused below). */
@@ -67,8 +72,14 @@ static int console_vprintf(const char* fmt, va_list args)
         xSemaphoreGive(s_sock_mutex);
     }
 
-    /* Chain to the previous/default output. */
-    return vprintf(fmt, args);
+    /* Chain to the previous tee (log_screen), never the libc default. */
+    if (s_console_prev) {
+        va_list args2;
+        va_copy(args2, args);
+        s_console_prev(fmt, args2);
+        va_end(args2);
+    }
+    return len;
 }
 
 /* ------------------------------------------------------------------ */
@@ -287,7 +298,8 @@ bool console_tcp_start(void)
     if (s_sock_mutex == NULL) {
         return false;
     }
-    esp_log_set_vprintf(console_vprintf);
+    /* v97: capture the previous tee so the chain stays intact. */
+    s_console_prev = esp_log_set_vprintf(console_vprintf);
     if (xTaskCreate(console_server_task, "wifi_console", 4096, NULL, 4, NULL)
         != pdPASS) {
         return false;

@@ -102,9 +102,10 @@ static void ls_render_locked(void)
 
 void log_screen_rehook(void)
 {
-    if (s_prev_vprintf) {
-        esp_log_set_vprintf(ls_vprintf);
-    }
+    /* v97: always re-capture the current tee (e.g. the TCP console installed
+     * between start and rehook) so the chain ls -> console -> UART stays
+     * intact instead of orphaning the middle link. */
+    s_prev_vprintf = esp_log_set_vprintf(ls_vprintf);
 }
 
 void log_screen_start(void)
@@ -140,8 +141,8 @@ static int s_alive_tick;
 
 void log_screen_task(void)
 {
-    if (s_lock == NULL) {
-        return;
+    if (s_lock == NULL || !lv_is_initialized()) {
+        return; /* v103: no display -> no LVGL lock/unlock */
     }
     /* v68 color test removed (v70): diagnostic complete — the panel needs
      * INVOFF (fixed in v69). Resume normal log rendering. */

@@ -36,7 +36,7 @@ void app_main(void)
     ESP_LOGI(TAG, "Board: %s", bsp_board_get_name());
 
     /* Display + LVGL. */
-#if 1 /* v37: display back ON (Wi-Fi/OTA/Eth stay OFF) */
+#if 0 /* v101 differential test: display OFF (DSI/LDO/MIPI-PLL vs EMAC) */
     bsp_display_cfg_t disp_cfg = {
         .h_res = BSP_LCD_H_RES,
         .v_res = BSP_LCD_V_RES,
@@ -55,13 +55,14 @@ void app_main(void)
     } else {
         ESP_LOGE(TAG, "Display init failed");
     }
-#endif /* v37 display ON */
+#endif /* v101 display OFF for differential test */
 
     /* On-screen verbose log (teed). */
     log_screen_start();
     ESP_LOGI(TAG, "log screen test line");
 
     /* Audio codec (internal outs; DDJ audio route comes next). */
+#if 0 /* v102 differential: audio OFF (I2S/ES8311 vs EMAC) */
     bsp_audio_config_t audio_cfg = {
         .sample_rate = 44100,
         .bit_width = I2S_DATA_BIT_WIDTH_16BIT,
@@ -73,6 +74,7 @@ void app_main(void)
     } else {
         ESP_LOGW(TAG, "Audio init failed");
     }
+#endif /* v102 audio OFF */
 
     bsp_display_backlight_on();
 
@@ -95,11 +97,13 @@ void app_main(void)
     ota_update_start();
 #endif
 
-    /* v89: TCP log console over Ethernet only (Wi-Fi parked). */
+    /* v97: TCP console over Ethernet only (Wi-Fi parked). NOTE: do NOT call
+     * log_screen_rehook() after console_tcp_start() - console chains into
+     * ls via its captured prev, and re-capturing would create an
+     * ls->console->ls recursion (stack overflow). */
     if (!console_tcp_start()) {
         ESP_LOGW(TAG, "TCP console not available");
     }
-    log_screen_rehook();
 
     /* SD card (music library). */
     sdmmc_card_t* card = NULL;

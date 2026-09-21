@@ -74,7 +74,12 @@ CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y
 # s2h in frozen while h2s out ok progresses).
 CONFIG_ESP_HOSTED_PKT_STATS=y
 CONFIG_ESP_HOSTED_PKT_STATS_INTERVAL_SEC=2
-CONFIG_FREERTOS_HZ=1000
+# v104 A/B: test with default 100 Hz tick (the working vendor example runs at
+# 100 Hz). CONFIG_FREERTOS_HZ=1000
+# v99: 16 KB - the main task runs UI/log/console/ETH bring-up (main-deck-p4
+# documents the same 16 KB; 3584 overflowed with the vprintf tees + MDIO scan
+# and corrupted the EMAC handle -> Load access fault in esp_eth_driver_install).
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 
 # OTA: dual-slot with rollback - new image must prove itself (30 s uptime)
 # before being marked valid, else bootloader falls back to the other slot.

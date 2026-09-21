@@ -139,16 +139,17 @@ bool eth_bringup_start(void)
         return false;
     }
 
-    /* v94: MDIO scan BEFORE esp_eth_start - the generic PHY's autonego
+    /* v94/v100: MDIO scan BEFORE esp_eth_start - the generic PHY's autonego
      * polling collides with our raw reads once the driver runs ("phy is
-     * busy" was a self-inflicted MDIO collision, not a dead bus). */
+     * busy" was a self-inflicted MDIO collision, not a dead bus).
+     * NOTE: first arg is the MAC object itself (containerof). */
     for (int addr = 0; addr < 32; addr++) {
         uint32_t bmsr = 0;
-        if (mac->read_phy_reg(s_eth_handle, addr, 0x01, &bmsr) == ESP_OK &&
+        if (mac->read_phy_reg(mac, addr, 0x01, &bmsr) == ESP_OK &&
             bmsr != 0x0000 && bmsr != 0xffff) {
             uint32_t id1 = 0, id2 = 0;
-            mac->read_phy_reg(s_eth_handle, addr, 0x02, &id1);
-            mac->read_phy_reg(s_eth_handle, addr, 0x03, &id2);
+            mac->read_phy_reg(mac, addr, 0x02, &id1);
+            mac->read_phy_reg(mac, addr, 0x03, &id2);
             ESP_LOGW(TAG, "MDIO scan: addr=%d BMSR=0x%04lx ID=0x%04lx%04lx",
                      addr, bmsr, id1, id2);
         }

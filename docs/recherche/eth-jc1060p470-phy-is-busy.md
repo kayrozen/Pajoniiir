@@ -257,3 +257,30 @@ Sources : doc IDF P4 `api-reference/network/esp_eth.html` (stable, vérifiée 20
 - HA community 959144 (variantes JC1060P470, Ethernet sur le modèle combiné) et 1003085 (JC1060P470C-I-W-Y, config Wi-Fi sans Ethernet)
 - atomic14 (fiche board, variantes, silicium rev 3.0) : https://www.atomic14.com/esp32/boards/guition-jc1060p470/
 - ESPHome issue #19330 (P4+IP101 post-link quirk, silicium pré-v3) : https://github.com/esphome/esphome/issues/19330
+
+---
+
+## Bilan debug nocturne 2026-09-20 (v97-v104, Pajoniiir)
+
+1. **Chaîne vprintf réparée** (v97/v98) : console_vprintf capture son prev et
+   log_screen_rehook re-capture toujours - la chaîne ls -> console -> UART
+   est linéaire. ⚠️ Ne PAS re-capturer console dans ls ET ls dans console
+   (récursion infinie -> stack protection fault, observé).
+2. **MDIO scan fonctionnel** (v100) : `mac->read_phy_reg(mac, ...)` - le
+   premier argument est l'objet MAC, pas le handle eth (containerof).
+   Résultat : **addr=1 répond, ID=0x02430c54 = IP101GR** - le bus MDIO et le
+   PHY sont vivants.
+3. **Espoirs écartés par A/B sur hardware** :
+   - USB OFF (v96) : pas de changement
+   - Display/DSI/LVGL OFF (v101, v103 fix assert lvgl_port_unlock) : rien
+   - Audio ES8311/I2S OFF (v102) : rien
+   - FREERTOS_HZ 100 (v104) : rien (esp_hosted recommande même 1000)
+   - PSRAM 200M HEX+XIP dans l'exemple vendor : l'ETH marche quand même
+4. **État** : Pajoniiir v104 = app minimale (ETH+log), step 6 atteint, PHY
+   vivant, mais aucun event ETHERNET_EVENT_START/CONNECTED ni DHCP. Le même
+   exemple IDF 6.0.2 obtient Link Up + IP en 3-4 s.
+5. **Restant** : (a) diff bit-à-bit sdkconfig exemple vs Pajoniiir (le diff
+   initial ne montre rien d'évident côté ETH), (b) tester les ISR cache-safe
+   ETH (CONFIG_ETH_ISR_CACHE_SAFE ?), (c) porter l'exemple vers le composant
+   `espressif/ip101` du registry, (d) suspect restant : une tâche/timer de
+   l'app qui affame le poll de link du generic PHY (cf. #184 mono-core).
