@@ -284,3 +284,19 @@ Sources : doc IDF P4 `api-reference/network/esp_eth.html` (stable, vérifiée 20
    ETH (CONFIG_ETH_ISR_CACHE_SAFE ?), (c) porter l'exemple vers le composant
    `espressif/ip101` du registry, (d) suspect restant : une tâche/timer de
    l'app qui affame le poll de link du generic PHY (cf. #184 mono-core).
+
+## Complément nuit (v105, logs DEBUG eth)
+
+Même avec DEBUG sur eth_phy_802_3/emac_esp/netif_glue : **aucun log du stack
+ETH après le start** - pas d'autonego, pas de timeout autonego, pas d'event
+ETHERNET_EVENT_START. Le PHY répond au MDIO (scan), donc le plan de
+management fonctionne, mais le driver ne lance jamais son cycle de link.
+
+⇒ Le suspect n°1 devient un composant LIÉ au build (pas démarré) qui
+interfère : esp_hosted (lié, non démarré), tinyusb (lié, non démarré en
+v101+), lvgl, ou un hook global. Test du matin : construire l'exemple vendor
+en ajoutant les composants liés de Pajoniiir un par un (esp_hosted, tinyusb,
+lvgl) dans un projet hybride qui COMPILE (le test hybride audio a échoué sur
+un include, à reprendre avec les bons includes: board.h/audio.h).
+Alternative rapide : désactiver les composants dans main-deck-jc1060
+(idf_component.yml / CMakeLists) un par un et mesurer.

@@ -74,6 +74,10 @@ bool eth_bringup_start(void)
 
     /* v90: make this component's INFO logs visible (screen log tee). */
     esp_log_level_set(TAG, ESP_LOG_INFO);
+    /* v104-night: DEBUG on the eth stack to see autonego/link poll state. */
+    esp_log_level_set("eth_phy_802_3", ESP_LOG_DEBUG);
+    esp_log_level_set("emac_esp", ESP_LOG_DEBUG);
+    esp_log_level_set("esp_eth.netif.netif_glue", ESP_LOG_DEBUG);
 
     /* v91: step markers in WARN level - always visible on the screen log,
      * they localize exactly where bring-up stalls (if it does). */
