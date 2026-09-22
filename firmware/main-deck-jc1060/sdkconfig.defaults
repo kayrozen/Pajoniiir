@@ -122,3 +122,14 @@ CONFIG_ESP_SYSTEM_USE_FRAME_POINTER=y
 CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y
 CONFIG_BOOTLOADER_COMPILER_OPTIMIZATION_SIZE=y
 CONFIG_ESP_BROWNOUT_DET=n
+
+# v142: OTA download flickers the DSI panel - flash writes stall the MSPI.
+# Smaller write chunks + longer erase yields keep the DSI fed.
+CONFIG_SPI_FLASH_WRITE_CHUNK_SIZE=512
+CONFIG_SPI_FLASH_ERASE_YIELD_DURATION_MS=40
+CONFIG_SPI_FLASH_ERASE_YIELD_TICKS=2
+# v144: execute firmware from PSRAM - during flash writes (OTA) the code
+# and ISRs keep running from PSRAM instead of stalling on the suspended
+# flash cache; this was starving the MIPI-DSI DMA (screen flicker) and
+# throttling downloads 100x (4 kB/s vs 1 MB/s without flash writes).
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y

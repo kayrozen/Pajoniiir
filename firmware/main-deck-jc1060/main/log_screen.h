@@ -15,4 +15,5 @@ void log_screen_start(void);
 void log_screen_rehook(void);
 
 /* Call periodically from the UI loop to refresh the on-screen text. */
+void log_screen_pause_render(bool pause);
 void log_screen_task(void);

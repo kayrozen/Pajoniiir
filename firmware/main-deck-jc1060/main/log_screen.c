@@ -41,6 +41,14 @@ static char s_render[LS_MAX_LINES * LS_LINE_MAX];
 static void ls_render_locked(void);
 static void ls_lvgl_task(void *arg);
 
+/* v139: OTA download freezes the on-screen log render. */
+static volatile bool s_render_paused = false;
+
+void log_screen_pause_render(bool pause)
+{
+    s_render_paused = pause;
+}
+
 static void ls_put_line(const char *line)
 {
     if (xSemaphoreTake(s_lock, 0) != pdTRUE) {
@@ -197,7 +205,10 @@ void log_screen_task(void)
         /* v106: render only when new lines arrived - rebuilding the
          * fullscreen label 5x/s (even unchanged) makes the panel visibly
          * flicker. */
-        if (s_dirty) {
+        /* v139: during an OTA download the repaints fight the flash/cache
+         * activity and the panel flickers white/blue continuously; freeze
+         * the label (last frame stays on the DSI) until resume. */
+        if (s_dirty && !s_render_paused) {
             ls_render_locked();
         }
         xSemaphoreGive(s_lock);

@@ -118,7 +118,11 @@ void app_main(void)
 
     /* v96 differential test: USB OFF - the TinyUSB UTMI PHY may share
      * clock/power resources with the EMAC. */
-    usb_tu_start(); /* v117: USB/DDJ back ON with working ETH */
+    /* v136: TinyUSB DISABLED - diagnostic. usb_tu_start() claims OTG_HS via
+     * its own DWC2 driver; the proven dual-host configuration is ONE
+     * usb_host_install owning BOTH ports (esp-usb PR #402, issue #396).
+     * If the drive enumerates with TinyUSB off, the cohabitation is the
+     * culprit. */
     eth_bringup_start(); /* v111 bisect: ETH ON - flicker suspect */
 
     /* v127: USB MSC on OTG_FS (peripheral_map BIT1) - library drive.

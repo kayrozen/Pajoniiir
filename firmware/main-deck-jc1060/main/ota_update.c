@@ -17,11 +17,14 @@
 
 #include <string.h>
 #include "esp_log.h"
+#include "log_screen.h"
 #include "esp_ota_ops.h"
 #include "esp_https_ota.h"
 #include "esp_system.h"
+#include "esp_http_client.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+
 
 #define OTA_TASK_STACK      (8192)
 #define OTA_CHECK_PERIOD_S  (60)
@@ -108,6 +111,10 @@ static void ota_task(void* arg)
         /* v124: WARN so the OTA start is always visible on the UART. */
         ESP_LOGW(TAG, "OTA download starting: %s -> '%s' %s", url,
                  new_desc.project_name, new_desc.version);
+        /* v139: freeze the on-screen log render during the download - the
+         * repaints fight the flash/cache activity and the panel flickers
+         * white/blue continuously. Last frame stays on the DSI. */
+        log_screen_pause_render(true);
 
         int last_pct = -25;
         while (1) {
@@ -131,6 +138,7 @@ static void ota_task(void* arg)
         if (ret == ESP_OK) {
             ESP_LOGW(TAG, "OTA download complete, validating...");
             ret = esp_https_ota_finish(handle);
+            log_screen_pause_render(false); /* v139 */
             if (ret == ESP_OK) {
                 ESP_LOGW(TAG, "OTA image validated, rebooting...");
                 vTaskDelay(pdMS_TO_TICKS(1000));
@@ -140,6 +148,7 @@ static void ota_task(void* arg)
         } else {
             ESP_LOGE(TAG, "OTA failed: %s", esp_err_to_name(ret));
             esp_https_ota_finish(handle);
+            log_screen_pause_render(false); /* v139 */
         }
 
         vTaskDelay(pdMS_TO_TICKS(OTA_CHECK_PERIOD_S * 1000));
@@ -148,6 +157,8 @@ static void ota_task(void* arg)
 
 void ota_update_start(void)
 {
+    /* v147: netdl diagnostic task removed (its job is done - the flicker
+     * was proven to come from flash writes, fixed by XIP from PSRAM). */
     if (xTaskCreate(ota_task, "ota_update", OTA_TASK_STACK, NULL, 3, NULL)
         != pdPASS) {
         ESP_LOGE(TAG, "Failed to create OTA task");
