@@ -7,6 +7,8 @@
 #include "freertos/task.h"
 
 #include "esp_log.h"
+#include "hal/usb_wrap_ll.h"
+#include "soc/usb_wrap_struct.h"
 #include "usb/usb_host.h"
 #include "usb/msc_host.h"
 #include "usb_media_mount.h"
@@ -218,6 +220,15 @@ static void msc_event_cb(const msc_host_event_t *event, void *arg)
 static void usb_lib_task(void *arg)
 {
     (void)arg;
+    /* v148: JC1060 wires the second USB-C connector (the "FS" port) to
+     * GPIO24/25 = FSLS PHY0, whose DEFAULT owner is USB_SERIAL_JTAG
+     * (console/flash). USB OTG FS maps to PHY1 (GPIO26/27) which is NOT
+     * connected on this board - that is why the controller was blind.
+     * Swap: USB_WRAP (OTG_FS) -> PHY0 (GPIO24/25), USJ -> PHY1.
+     * Side effect: the console/flash ACM disconnects (OTA is the flash
+     * path now). */
+    usb_wrap_ll_phy_select(&USB_WRAP, 0);
+    ESP_LOGW(TAG, "OTG_FS routed to PHY0 (GPIO24/25); USB-JTAG moved to PHY1 - ACM console/flash on this port is gone");
     /* v130: NO manual usb_new_phy here - usb_host_install (espressif/usb
      * 1.5.0) installs the FSLS PHY itself for every port in peripheral_map
      * (usb_host.c:718). A manual install aborted with "selected PHY is in
