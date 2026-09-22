@@ -220,6 +220,10 @@ static void msc_event_cb(const msc_host_event_t *event, void *arg)
 static void usb_lib_task(void *arg)
 {
     (void)arg;
+    /* v130: NO manual usb_new_phy here - usb_host_install (espressif/usb
+     * 1.5.0) installs the FSLS PHY itself for every port in peripheral_map
+     * (usb_host.c:718). A manual install aborted with "selected PHY is in
+     * use" and boot-looped v128/v129. */
     const usb_host_config_t host_cfg = {
         .intr_flags = ESP_INTR_FLAG_LEVEL1,
         .root_port_unpowered = true,
@@ -228,8 +232,6 @@ static void usb_lib_task(void *arg)
          * (GPIO26/27) -> peripheral 1. Default (0) would be the HS port
          * already claimed by TinyUSB. */
         .peripheral_map = BIT(1),
-        /* (fsls_only n'existe pas dans espressif/usb 1.5.0 - l'OTG_FS n'a
-         * de toute façon pas de PHY HS.) */
     };
     ESP_ERROR_CHECK(usb_host_install(&host_cfg));
 
@@ -241,7 +243,10 @@ static void usb_lib_task(void *arg)
     };
     ESP_ERROR_CHECK(msc_host_install(&msc_cfg));
 
-    root_port_power_cycle("initial bring-up");
+    /* v129: root-port power cycle DISABLED at boot. With the FSLS PHY now
+     * installed the recovery hammering on a freshly-powered port crashes
+     * the image (v128 rolled back <30 s every boot). A hot-plug of the
+     * drive is enough to trigger enumeration. */
     ESP_LOGI(TAG, "USB host + MSC installed on OTG_FS (peripheral 1); waiting for a drive");
 
     usb_storage_session_t session = desired_snapshot();

@@ -81,6 +81,21 @@ CONFIG_FREERTOS_HZ=1000
 # documents the same 16 KB; 3584 overflowed with the vprintf tees + MDIO scan
 # and corrupted the EMAC handle -> Load access fault in esp_eth_driver_install).
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+# v131: UART0 on the MX1.25 4P debug connector (GPIO37/38) as primary
+# console, USB_SERIAL_JTAG kept as secondary - both ports output the log.
+# v132: REVERTED to the USB_SERIAL_JTAG primary console - flashing safety
+# first. UART0 (GPIO37/38) is served by an additive vprintf tee instead
+# (log_screen.c dbg_uart), no Kconfig console change involved.
+# CONFIG_ESP_CONSOLE_UART_CUSTOM is not set (v132: vprintf tee instead)
+# CONFIG_ESP_CONSOLE_UART_TX_GPIO=37
+# CONFIG_ESP_CONSOLE_UART_RX_GPIO=38
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
+
+# FatFS: LFN required by the vendored fatfs component (blk_ofs in FF_DIR);
+# a bare regenerate picks LFN_NONE and breaks the build (v131).
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_API_ENCODING_UTF_8=y
 
 # OTA: dual-slot with rollback - new image must prove itself (30 s uptime)
 # before being marked valid, else bootloader falls back to the other slot.

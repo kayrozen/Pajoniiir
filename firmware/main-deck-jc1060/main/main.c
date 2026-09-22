@@ -121,12 +121,15 @@ void app_main(void)
     usb_tu_start(); /* v117: USB/DDJ back ON with working ETH */
     eth_bringup_start(); /* v111 bisect: ETH ON - flicker suspect */
 
-    /* v120: USB MSC on OTG_FS (second USB-C, GPIO26/27) - library drive.
-     * The DDJ stays on OTG_HS via TinyUSB. DISABLED for now: the same
-     * physical port is still needed to flash the tablet. Re-enable when
-     * flashing goes through OTA or the other connector.
-     * ESP_ERROR_CHECK_WITHOUT_ABORT(usb_storage_init(NULL)); */
+    /* v127: USB MSC on OTG_FS (peripheral_map BIT1) - library drive.
+     * The DDJ stays on OTG_HS via TinyUSB. Activated: flashing now goes
+     * over ETH OTA only, the USB-C ports are free for USB duties. */
+    ESP_ERROR_CHECK_WITHOUT_ABORT(usb_storage_init(NULL));
 
+    /* v129: log the reset reason - distinguishes a PANIC/WDT crash from a
+     * brownout (power) reboot on the TCP console, since UART is gone. */
+    ESP_LOGW(TAG, "boot: reset reason=%d, running v%s",
+             (int)esp_reset_reason(), esp_app_get_description()->version);
     ESP_LOGI(TAG, "Bring-up complete - entering UI loop");
 
     /* UI loop placeholder: log screen refreshes here (full deck UI replaces

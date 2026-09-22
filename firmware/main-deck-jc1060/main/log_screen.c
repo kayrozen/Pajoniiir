@@ -55,12 +55,51 @@ static void ls_put_line(const char *line)
     xSemaphoreGive(s_lock);
 }
 
+/* v132: raw UART0 debug tee on the MX1.25 4P connector (TX=GPIO37).
+ * Additive only - the system console (USB_SERIAL_JTAG) and flashing are
+ * untouched. Every formatted log line is echoed here. */
+#include "driver/uart.h"
+#define DBG_UART_NUM  UART_NUM_0
+#define DBG_UART_TX   37
+#define DBG_UART_RX   38
+
+static void dbg_uart_write(const char *s, int len)
+{
+    uart_write_bytes(DBG_UART_NUM, s, len);
+}
+
+static bool dbg_uart_ready = false;
+
+static void dbg_uart_init(void)
+{
+    uart_config_t cfg = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    if (uart_driver_install(DBG_UART_NUM, 512, 0, 0, NULL, 0) == ESP_OK &&
+        uart_param_config(DBG_UART_NUM, &cfg) == ESP_OK &&
+        uart_set_pin(DBG_UART_NUM, DBG_UART_TX, DBG_UART_RX,
+                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE) == ESP_OK) {
+        dbg_uart_ready = true;
+        uart_write_bytes(DBG_UART_NUM, "\r\n[dbg-uart] online\r\n", 21);
+    } else {
+        ESP_LOGE("log_screen", "debug UART0 init failed");
+    }
+}
+
 /* esp_log vprintf: format, strip trailing newline, tee, chain. */
 static int ls_vprintf(const char *fmt, va_list args)
 {
     char buf[LS_LINE_MAX];
     int len = vsnprintf(buf, sizeof(buf), fmt, args);
     if (len > 0) {
+        if (dbg_uart_ready) {
+            dbg_uart_write(buf, len);
+        }
         /* esp_log emits one full line per call, usually ending in \n. */
         int n = (int)strlen(buf);
         while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) {
@@ -114,6 +153,7 @@ void log_screen_rehook(void)
 void log_screen_start(void)
 {
     s_lock = xSemaphoreCreateMutex();
+    dbg_uart_init(); /* v132: MX1.25 4P debug UART echo */
     s_prev_vprintf = esp_log_set_vprintf(ls_vprintf);
 
     if (lv_is_initialized() && lv_display_get_default() != NULL) {
