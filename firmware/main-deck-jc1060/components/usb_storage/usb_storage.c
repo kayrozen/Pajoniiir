@@ -118,14 +118,12 @@ static void root_port_power_cycle(const char *why)
 {
     ESP_LOGI(TAG, "root port power cycle (%s)", why ? why : "");
     esp_err_t rc = usb_host_lib_set_root_port_power(false);
-    if (rc != ESP_OK && rc != ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "root port power off: %s", esp_err_to_name(rc));
-    }
+    /* v133: log the real result at INFO - the power-on state of the FS
+     * root port is the prime suspect for "no enumeration at all". */
+    ESP_LOGI(TAG, "root port power off rc=%s", esp_err_to_name(rc));
     vTaskDelay(pdMS_TO_TICKS(ROOT_PORT_SETTLE_MS));
     rc = usb_host_lib_set_root_port_power(true);
-    if (rc != ESP_OK && rc != ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "root port power on: %s", esp_err_to_name(rc));
-    }
+    ESP_LOGI(TAG, "root port power on rc=%s", esp_err_to_name(rc));
 }
 
 static void release_device(void)
@@ -267,6 +265,12 @@ static void usb_lib_task(void *arg)
 
         session = desired_snapshot();
         uint32_t now = (uint32_t)xTaskGetTickCount();
+        /* v133: count real lib events - if rc==ESP_OK but flags stay 0 and
+         * no device ever appears, the controller sees no line state at all
+         * (PHY/routing issue), not a driver issue. */
+        if (rc == ESP_OK && flags != 0u) {
+            ESP_LOGI(TAG, "lib events flags=0x%08lx", (unsigned long)flags);
+        }
         usb_storage_recovery_observe(&recovery,
                                      session.connected,
                                      session.epoch,
@@ -292,7 +296,11 @@ static void usb_lib_task(void *arg)
                      (unsigned)ROOT_PORT_MAX_CYCLES,
                      (unsigned)ROOT_PORT_SLOW_MS);
         }
-        root_port_power_cycle("no active storage session");
+        /* v134: power-cycle DISABLED in steady state. Cycling the root port
+         * while an OTA download runs trips the interrupt watchdog (crash),
+         * and cycling is useless anyway: with the port powered continuously
+         * a hot-plug of the drive triggers enumeration on its own. */
+        ESP_LOGI(TAG, "no device yet - waiting for hot-plug (no power cycle)");
     }
 }
 

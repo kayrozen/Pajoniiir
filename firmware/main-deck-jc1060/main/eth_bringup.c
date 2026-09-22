@@ -74,8 +74,15 @@ bool eth_bringup_start(void)
 
     /* v90: make this component's INFO logs visible (screen log tee). */
     esp_log_level_set(TAG, ESP_LOG_INFO);
-    /* v123: OTA checks are INFO - make them visible on the UART capture. */
+    /* v133: OTA checks are INFO - make them visible on the UART capture. */
     esp_log_level_set("ota_update", ESP_LOG_INFO);
+    /* v135: full USB stack debug - does the FS controller even see the
+     * line state change when the drive is plugged? */
+    esp_log_level_set("USB HOST", ESP_LOG_DEBUG);
+    esp_log_level_set("USBH", ESP_LOG_DEBUG);
+    esp_log_level_set("HUB", ESP_LOG_DEBUG);
+    esp_log_level_set("usb_phy", ESP_LOG_DEBUG);
+    esp_log_level_set("usb_storage", ESP_LOG_DEBUG);
     /* v104-night: DEBUG on the eth stack to see autonego/link poll state. */
     esp_log_level_set("eth_phy_802_3", ESP_LOG_DEBUG);
     esp_log_level_set("emac_esp", ESP_LOG_DEBUG);
