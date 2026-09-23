@@ -466,6 +466,34 @@ esp_err_t usb_host_manager_init(const usb_host_manager_config_t *config)
     return s_install_result;
 }
 
+/* jc1060 board extension (v169): the fork's virtual root hub merges the
+ * two DWC controllers AND the external hub's downstream ports, so a stick
+ * behind the hub shows up with root=2..N (direct=1). Expose the observed
+ * root so route filters can decide by side instead of one exact index. */
+esp_err_t usb_host_manager_device_root(uint8_t address,
+                                       uint8_t *root_port_index_out,
+                                       bool *known_out)
+{
+    if (!root_port_index_out || !known_out || address == 0u ||
+        address >= USB_HOST_TOPOLOGY_ADDRESS_COUNT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *root_port_index_out = 0u;
+    *known_out = false;
+    if (!usb_host_manager_is_ready()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    portENTER_CRITICAL(&s_topology_mux);
+    const usb_host_topology_entry_t *entry =
+        &s_topology.entries[address];
+    if (entry->observed && entry->present) {
+        *root_port_index_out = entry->root_port_index;
+        *known_out = true;
+    }
+    portEXIT_CRITICAL(&s_topology_mux);
+    return *known_out ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
 esp_err_t usb_host_manager_device_matches_root(uint8_t address,
                                                uint8_t root_port_index,
                                                bool require_direct_root,

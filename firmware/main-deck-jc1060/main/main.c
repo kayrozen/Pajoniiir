@@ -25,6 +25,7 @@
 #include "wifi_console.h"
 #include "ota_update.h"
 #include "usb_storage.h"
+#include "controller_bootstrap.h"
 #include "usb_spike.h"
 #include "esp_app_desc.h"
 
@@ -146,6 +147,10 @@ void app_main(void)
      * now UART0 (BOOT-mode flashing unaffected). The v158 manager crash
      * during FS init was the USB-JTAG driver owning the PHY - gone. */
     ESP_ERROR_CHECK_WITHOUT_ABORT(usb_storage_init(NULL));
+    /* v163: controller path (MIDI + UAC) on the HS root - upstream
+     * p4_local_controller flow (manager ready -> controller_usb_host_init).
+     * Profile/runtime layers not ported yet: MIDI/connection logged. */
+    controller_bootstrap_start();
 
     /* v149 J0 spike: usb_storage DISABLED (it would install a second host
      * lib). usb_spike owns BOTH ports in ONE usb_host_install(BIT0|BIT1)

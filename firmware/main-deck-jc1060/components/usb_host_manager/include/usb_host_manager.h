@@ -61,6 +61,13 @@ bool usb_host_manager_is_ready(void);
 esp_err_t usb_host_manager_set_all_root_power(bool enable);
 esp_err_t usb_host_manager_set_root_power_by_index(uint8_t root_port_index,
                                                    bool enable);
+/* jc1060 board extension (v169): observed virtual-root port of a device.
+ * The fork's root hub merges both DWCs and the external hub ports, so a
+ * stick behind a hub reports root=2..N. */
+esp_err_t usb_host_manager_device_root(uint8_t address,
+                                       uint8_t *root_port_index_out,
+                                       bool *known_out);
+
 esp_err_t usb_host_manager_device_matches_root(uint8_t address,
                                                uint8_t root_port_index,
                                                bool require_direct_root,

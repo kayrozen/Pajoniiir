@@ -14,23 +14,31 @@
 #include "freertos/task.h"
 #include "usb/usb_host.h"
 
-/* v162: root index 1 = the Full-Speed controller (port top connector).
- * Empirically proven: manager root 0 powers the HS DWC (HPRT HS pwr=1) and
- * enumerated the DDJ on the bottom port; the FS root stayed pwr=0. The
- * stick lives on root 1. */
+/* v168: layout A - powered hub + stick on the FS root (top connector),
+ * DDJ on the HS root (bottom). Matches the proven v165 wiring; the DDJ
+ * HS transfer fault is the remaining issue to diagnose. */
 #define SHARED_STORAGE_ROOT_INDEX 1u
 static bool shared_storage_device_route_allowed(uint8_t address)
 {
+    /* v169: route by SIDE, not by one exact virtual root index. The fork's
+     * root hub merges the DWCs and the hub ports, so a stick behind the
+     * powered hub reports root=2..N. The stick side is "anything not on
+     * the HS root (0)" - the HS root stays exclusive to the controller
+     * path (DDJ). */
     bool matches = false;
-    const esp_err_t rc = usb_host_manager_device_matches_root(
-        address, SHARED_STORAGE_ROOT_INDEX, true, &matches);
-    if (rc == ESP_ERR_NOT_FOUND) {
+    uint8_t device_root = 0u;
+    bool known = false;
+    const esp_err_t rc = usb_host_manager_device_root(
+        address, &device_root, &known);
+    if (rc != ESP_OK) {
         /* The topology client and MSC client receive the same enumeration
          * edge independently. The storage owner retries mounting, so defer
          * until the topology client has published this address. */
         return false;
     }
-    return rc == ESP_OK && matches;
+    matches = device_root != 0u;
+    (void)known;
+    return matches;
 }
 
 static bool shared_storage_request_root_recovery(const char *why)
