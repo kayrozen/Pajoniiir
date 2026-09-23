@@ -25,6 +25,7 @@
 #include "wifi_console.h"
 #include "ota_update.h"
 #include "usb_storage.h"
+#include "usb_spike.h"
 #include "esp_app_desc.h"
 
 static const char* TAG = "deck";
@@ -125,10 +126,16 @@ void app_main(void)
      * culprit. */
     eth_bringup_start(); /* v111 bisect: ETH ON - flicker suspect */
 
-    /* v127: USB MSC on OTG_FS (peripheral_map BIT1) - library drive.
-     * The DDJ stays on OTG_HS via TinyUSB. Activated: flashing now goes
-     * over ETH OTA only, the USB-C ports are free for USB duties. */
-    ESP_ERROR_CHECK_WITHOUT_ABORT(usb_storage_init(NULL));
+    /* v156: discriminating test - TinyUSB HS only (usb_storage/manager
+     * off). TinyUSB detected the DDJ reliably up to v135. If it still does
+     * under the v144+ config (XIP from PSRAM), the Host Lib path is the
+     * problem; if not, the v144+ sdkconfig broke USB at the HCD level. */
+    ESP_ERROR_CHECK_WITHOUT_ABORT(usb_tu_start());
+
+    /* v149 J0 spike: usb_storage DISABLED (it would install a second host
+     * lib). usb_spike owns BOTH ports in ONE usb_host_install(BIT0|BIT1)
+     * and logs DEV_NEW VID:PID - verifies dual-port ownership + where the
+     * DDJ and the stick enumerate. */
 
     /* v129: log the reset reason - distinguishes a PANIC/WDT crash from a
      * brownout (power) reboot on the TCP console, since UART is gone. */

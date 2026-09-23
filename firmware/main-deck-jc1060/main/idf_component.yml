@@ -1,5 +1,7 @@
 dependencies:
-  espressif/usb: "^1.0.0"
+  # v152: usb + usb_host_msc come from the upstream dev's esp-usb fork,
+  # pinned in components/usb_storage/idf_component.yml. Do NOT also pin
+  # espressif/usb here - the two cannot coexist (component name clash).
   espressif/esp_hosted:
     version: "^2.0.0"
     rules:

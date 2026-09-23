@@ -12,6 +12,13 @@ set(EXTRA_COMPONENT_DIRS
     "${CMAKE_CURRENT_LIST_DIR}/../common/control_state_reconciler")
 
 # Bump on every OTA-worthy change (same-version images are skipped by OTA).
-set(PROJECT_VER "148")
+set(PROJECT_VER "156")
 
 project(pajoniiir_deck)
+
+# v155: patch the pinned esp-usb fork exactly like upstream main-deck-p4 -
+# indexed idle-recovery + HS/FS FIFO split + MSC teardown. Must run AFTER
+# project() so the component manager has materialized the fork components.
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/apply_espressif_usb_fifo_patch.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/apply_espressif_usb_idle_recovery_patch.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/apply_usb_host_msc_teardown_patch.cmake")

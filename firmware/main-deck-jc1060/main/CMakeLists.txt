@@ -15,5 +15,8 @@ idf_component_register(SRCS "main.c" "usb_tu_app.c" "eth_bringup.c" "wifi_consol
                         tinyusb
                         esp_hw_support
                         esp_hosted
+                        usb
+                        hal
+                        soc
                         usb_storage
 )
