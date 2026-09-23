@@ -126,11 +126,26 @@ void app_main(void)
      * culprit. */
     eth_bringup_start(); /* v111 bisect: ETH ON - flicker suspect */
 
-    /* v156: discriminating test - TinyUSB HS only (usb_storage/manager
-     * off). TinyUSB detected the DDJ reliably up to v135. If it still does
-     * under the v144+ config (XIP from PSRAM), the Host Lib path is the
-     * problem; if not, the v144+ sdkconfig broke USB at the HCD level. */
-    ESP_ERROR_CHECK_WITHOUT_ABORT(usb_tu_start());
+    /* v157: back to the ported upstream stack (manager DUAL, override
+     * FS PHY0, MSC root 0), with the USB stack debug logs unlocked
+     * (CONFIG_LOG_MAXIMUM_LEVEL=4) so HCD/hub/USBH port transitions are
+     * finally visible. TinyUSB path confirmed working (v156). */
+    esp_log_level_set("USB HOST", ESP_LOG_DEBUG);
+    esp_log_level_set("USBH", ESP_LOG_DEBUG);
+    esp_log_level_set("HUB", ESP_LOG_DEBUG);
+    esp_log_level_set("usb_phy", ESP_LOG_DEBUG);
+    esp_log_level_set("usb_host_mgr", ESP_LOG_DEBUG);
+    esp_log_level_set("usb_storage", ESP_LOG_DEBUG);
+    esp_log_level_set("USB_MSC", ESP_LOG_DEBUG);
+    esp_log_level_set("USB_MSC_SCSI", ESP_LOG_DEBUG);
+    esp_log_level_set("MSC VFS", ESP_LOG_DEBUG);
+    esp_log_level_set("diskio_usb", ESP_LOG_DEBUG);
+    /* v160: upstream-faithful USB stack only - usb_storage (upstream copy)
+     * + usb_host_manager DUAL. TinyUSB removed from the product (v156 was
+     * diagnostic only). USB_SERIAL_JTAG no longer claims PHY0: console is
+     * now UART0 (BOOT-mode flashing unaffected). The v158 manager crash
+     * during FS init was the USB-JTAG driver owning the PHY - gone. */
+    ESP_ERROR_CHECK_WITHOUT_ABORT(usb_storage_init(NULL));
 
     /* v149 J0 spike: usb_storage DISABLED (it would install a second host
      * lib). usb_spike owns BOTH ports in ONE usb_host_install(BIT0|BIT1)

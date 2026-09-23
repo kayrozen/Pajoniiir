@@ -90,7 +90,7 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 # CONFIG_ESP_CONSOLE_UART_TX_GPIO=37
 # CONFIG_ESP_CONSOLE_UART_RX_GPIO=38
 CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
-CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 
 # FatFS: LFN required by the vendored fatfs component (blk_ofs in FF_DIR);
 # a bare regenerate picks LFN_NONE and breaks the build (v131).
@@ -113,11 +113,10 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 # log spam, audio performance unchanged (runtime per-tag level checks only).
 CONFIG_LOG_DEFAULT_LEVEL_WARN=y
 CONFIG_LOG_DEFAULT_LEVEL=2
-CONFIG_LOG_MAXIMUM_LEVEL=3
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
 
 # Route the ROM/build console to USB-Serial-JTAG (same connector as flashing)
 # so the bring-up log is visible on the host USB port.
-CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 CONFIG_ESP_SYSTEM_USE_FRAME_POINTER=y
 CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y
 CONFIG_BOOTLOADER_COMPILER_OPTIMIZATION_SIZE=y
@@ -133,3 +132,15 @@ CONFIG_SPI_FLASH_ERASE_YIELD_TICKS=2
 # flash cache; this was starving the MIPI-DSI DMA (screen flicker) and
 # throttling downloads 100x (4 kB/s vs 1 MB/s without flash writes).
 CONFIG_SPIRAM_XIP_FROM_PSRAM=y
+
+# v157: allow runtime DEBUG logs from the USB host stack (HCD/hub/USBH) -
+# with LOG_MAXIMUM_LEVEL=2 the port transitions were compiled out entirely.
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+
+# v160: console moves to UART0 (GPIO37/38 tee already wired). USB_SERIAL_JTAG
+# must no longer claim PHY0 - the upstream manager needs the FS controller,
+# and BOOT-mode flashing stays available regardless of the console choice.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=n
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_NUM=0
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200

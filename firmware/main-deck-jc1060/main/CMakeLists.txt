@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.c" "usb_tu_app.c" "eth_bringup.c" "wifi_console.c" "ota_update.c" "log_screen.c"
+idf_component_register(SRCS "main.c" "usb_spike.c" "usb_tu_app.c" "eth_bringup.c" "wifi_console.c" "ota_update.c" "log_screen.c"
                     EMBED_FILES "tone4ch.wav"
                     INCLUDE_DIRS "."
                     REQUIRES

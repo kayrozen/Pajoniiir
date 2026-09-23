@@ -14,8 +14,11 @@
 #include "freertos/task.h"
 #include "usb/usb_host.h"
 
-#define SHARED_STORAGE_ROOT_INDEX 0u
-
+/* v162: root index 1 = the Full-Speed controller (port top connector).
+ * Empirically proven: manager root 0 powers the HS DWC (HPRT HS pwr=1) and
+ * enumerated the DDJ on the bottom port; the FS root stayed pwr=0. The
+ * stick lives on root 1. */
+#define SHARED_STORAGE_ROOT_INDEX 1u
 static bool shared_storage_device_route_allowed(uint8_t address)
 {
     bool matches = false;
