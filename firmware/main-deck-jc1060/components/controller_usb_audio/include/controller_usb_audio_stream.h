@@ -71,6 +71,9 @@ esp_err_t controller_usb_audio_stream_write(const int16_t *master_samples,
 bool controller_usb_audio_stream_pace_ready(size_t frame_count,
                                            uint32_t source_sample_rate,
                                            bool *ready);
+/* v226: lowest ring fill (frames) pace_ready() saw since the previous call,
+ * then resets. UINT32_MAX = no pace_ready() call in between. */
+uint32_t controller_usb_audio_stream_take_pace_low_water(void);
 void controller_usb_audio_stream_get_stats(
     controller_usb_audio_stream_stats_t *out_stats);
 

@@ -721,3 +721,240 @@ carte.
   - `test_convert_web_profile` OK ;
   - `gcc -fsyntax-only` : seules restent des erreurs dues aux stubs
     FreeRTOS. Pas de build firmware.
+
+## v226 : chasse aux spikes de playback, échelle VU dans le profil (2026-09-24)
+
+Spikes audibles alors que le ring UAC reste stable (`ring=1280`, `dup=2`,
+`drop=0`, `lim=0`). Le HB montre des pics de mix (~9,6 ms) et de décodage
+(~10 ms pendant les lectures MSC).
+
+- Analyse :
+  - le ring UAC oscille entre ~670 et 1280 trames (14 à 27 ms), donc un bloc
+    de mix à 9,6 ms (période 5,3 ms) ne s'entend pas tant que le ring ne
+    tombe pas à 0 ;
+  - le décodage lit via un cache compressé et devance la tête de lecture
+    d'environ 2 s dans la timeline PCM. Un `fread` MSC de 10 ms est surtout
+    de l'attente I/O : il ne coûte pas de CPU0 à `ae_output` ;
+  - trois tâches USB tournaient sur le cœur audio ou pouvaient y tomber :
+    - `msc_host` : sa config était initialisée à zéro, donc `core_id = 0`,
+      et il tournait épinglé sur CPU0 en prio 5, comme `ae_decode` ;
+    - `controller_usb` : non épinglé, prio 6 pendant le streaming comme
+      `ae_output` ; il remplit les paquets isochrones et pouvait se
+      partager le temps CPU0 avec le mix ;
+    - `usb_hostd` : non épinglé ; `usb_host_install()` alloue les
+      interruptions DWC sur le cœur de cette tâche.
+- Instrumentation, nouvelle ligne `HB spk` après les deux lignes HB
+  (deltas calculés sur la fenêtre du HB) :
+  - `over` : blocs dont le rendu dépasse la période ;
+  - `behind` : blocs où le drain attendait déjà, sans sommeil de pacing ;
+  - `pace_wait max` : plus longue attente de pacing ;
+  - `uac_low` : niveau minimal du ring vu par `pace_ready()`, juste avant
+    chaque remplissage (`controller_usb_host_audio_take_pace_low_water()`) ;
+  - `u_under`, `u_dup`, `u_trim`, `u_lost` : deltas des compteurs UAC ;
+  - `pcm_under D1/D2` : pops PCM ratés par deck, c'est-à-dire un deck à
+    sec ;
+  - `runway_min D1/D2` : minimum de PCM décodé en avance, sur les decks
+    actifs ;
+  - `dec_max D1/D2` : pire appel de décodage de la fenêtre.
+
+  Lecture : un clic avec `u_under > 0` vient d'un ring UAC vide (timing).
+  Avec `pcm_under > 0`, un deck est tombé à sec (décodage/I/O). Si les deux
+  sont à 0, le timing est hors de cause et il faut chercher dans le contenu
+  DSP : `lim`, `peak`, modes PROBE.
+- Correctifs :
+  - `usb_storage.c` : `MSC_TASK_CORE 1` ;
+  - `usb_storage_shared.c` : `daemon_core_id = 1`, ce qui place aussi les
+    ISR USB sur CPU1 ;
+  - `p4_local_controller.c` : `task_core_id = 1` pour `controller_usb`.
+
+  Les priorités ne changent pas. Sur CPU1, `controller_usb` (5 ou 6) et
+  `msc_host` (5) passent avant LVGL (4), et `usb_hostd` (4) partage le
+  round-robin avec LVGL. `usb_store` (3) et `usb_lib` (4) restent non
+  épinglés : ils sont sous la prio de l'audio et hors du chemin temps réel.
+- PROBE : nouveau `AE_MIX_PROBE_ISOLATE`, laissé à 1 pour ce build de
+  diagnostic. À 0, plus de groupe à scheduler suspendu ni à IRQ masquées ;
+  c'est la valeur à prendre en production une fois la source connue.
+- Lecture fichier : inchangée. Rien n'indique pour l'instant qu'elle affame
+  l'audio ; `runway_min` et `pcm_under` le diront.
+- Échelle VU dans le profil :
+  - l'output `cc_value` accepte un `"scale"` optionnel, compilé dans le u16
+    à l'offset 10 de l'entrée output (ex-réservé) ;
+  - `cp_profile_map_led` envoie `min(127, state * scale / 127)` ;
+  - un `scale` non nul sur une sortie note est rejeté par le compilateur et
+    par le parser JC1060 ;
+  - `LED_DDJ400_VU_SCALE` et `LED_DDJ400_PID` sont supprimés de
+    `controller_led_runtime.c`.
+
+  Le `profile.s3bin` DDJ-400 fait toujours 6160 octets ; seuls deux octets
+  d'échelle et le CRC changent (CRC 0xB51FE77F). **Recopier le `.s3bin` sur
+  la SD.** Les fixtures FLX4, generic et Hercules ne changent pas.
+- `STREAM_TEST_TONE_HZ` reste à `0u`.
+- Vérification :
+  - test PC du scratchpad, parser JC1060 :
+    - VU DDJ-400 B0/B1 02 : 64 → 75, 85 → 100, 100 → 118, 127 → 127 ;
+    - la sortie note PLAY ne change pas ;
+    - une sortie note avec un scale est rejetée (rc -6) ;
+    - les trois fixtures ont `value_scale = 0` et un VU brut ;
+  - `test_convert_web_profile` OK ;
+  - `gcc -fsyntax-only` : il ne reste que des erreurs de stubs ESP-IDF, en
+    dehors des zones modifiées.
+
+  Pas de build firmware.
+
+## v228 — load NO_MEM : tâche `ae_output` persistante
+
+Symptôme v226/v227 : aucun load ne passe, `failed to start shared output
+task` (`ESP_ERR_NO_MEM`) sur les deux decks. v225 chargeait normalement.
+
+- Diff v225 → v227 : l'`audio_engine` n'a ajouté aucune allocation heap.
+  Il n'y a que ~84 o de `.bss`/`.sdata` (`s_hb_base`, champs ajoutés à
+  `s_hb`, `s_hb_decode_max_us`, `s_pace_low_water`). Le code HB est en flash.
+  `AE_MIX_PROBE_ISOLATE` n'alloue rien. Le `value_scale` du profil ajoute
+  +320 o à `s_profile` (`.dram1.bss`, région heap 2) et +320 o au malloc
+  interne transitoire du parse.
+- Région `0x4ff27b80` (78912 o) à 147/147 blocs au boot : c'est le premier
+  morceau de heap interne (juste après `.dram0.bss`), rempli en premier par
+  first-fit. Ce n'est pas une anomalie en soi. Il faudrait un dump v225 au
+  même moment pour comparer.
+- Cause réelle : `ae_output` était détruite au dernier unload
+  (`vTaskDelete`), puis recréée à chaque premier load avec 8 Ko de stack +
+  TCB contigus en RAM interne. Ce create tombe après la fragmentation du
+  heap (USB, profil, UI), et parfois avant que l'idle ait libéré l'ancienne
+  stack. Quelques centaines d'octets en moins et un ordre d'allocation
+  différent (tâches repinnées en v226) suffisent à le faire échouer.
+- Correctif :
+  - `ae_output` est créée une seule fois dans `audio_engine_init`, heap
+    encore propre ;
+  - entre deux sessions, elle reste parquée sur `ulTaskNotifyTake` ;
+  - `ensure_started` ne fait plus que `run=true` + `xTaskNotifyGive`, avec
+    une création lazy en secours si l'init a échoué ;
+  - `s_output_active` appartient au côté contrôle. Chaque run donne un seul
+    `s_output_done`, consommé soit par `stop`, soit par `ensure_started`
+    (après une sink fault) ;
+  - si le create échoue, le log donne `internal free` / `largest` ;
+  - `controller_profile_runtime_activate` alloue le scratch de parse en PSRAM
+    (repli sur `malloc`).
+- Vérification : `gcc -fsyntax-only` ne signale que des trous de stubs
+  ESP-IDF ; le test PC du runtime compile avec `-Werror`. Pas de build
+  firmware.
+
+## v229 — waveform qui recule de quelques frames
+
+Symptôme : chaque deck, indépendamment de l'autre, voit parfois sa waveform
+reculer de quelques frames puis repartir. Le playback est sain (v228 :
+`pcm_under` 0/0, runway ~91 ms, mix max ~4,4 ms). Des pics `dec_max` jusqu'à
+9,7 ms apparaissent (lectures MSC).
+
+- Cause : `ui_position_interpolator` extrapolait depuis une ancre à
+  l'horloge locale et ignorait le snapshot tant que l'écart restait sous
+  120 ms. La dérive entre l'horloge UI et la position audio (permille
+  entier, commit de position retardé par un pic) s'accumulait sans être
+  corrigée. Au franchissement du seuil, un snap arrière d'un coup ramenait
+  la waveform plusieurs frames en arrière. Test PC avec 0,3 % de dérive sur
+  3 min : l'ancien algo fait 4 reculs, jusqu'à 87 ms.
+- Correctif, côté UI uniquement (copie JC1060) :
+  - la position affichée est en µs et ne décroît jamais pendant la lecture ;
+  - un snapshot neuf ne fait que moduler la vitesse d'affichage
+    (constante de temps `UI_POSITION_INTERPOLATOR_SLEW_TAU_MS` = 500 ms) ;
+  - un snapshot inchangé ne corrige rien : on suit l'horloge ;
+  - un affichage en avance de plus de 120 ms attend l'audio au lieu de
+    reculer ;
+  - un snapshot qui recule (seek, cue, hot cue, loop wrap) ou qui saute de
+    plus de 120 ms en avant (beat jump) est suivi immédiatement ;
+  - pause, premier sample et scratch (`speed_permille == 0`) restent
+    autoritatifs.
+- Chemin audio intact : aucun changement de mix, de pacing, de priorité de
+  tâche, ni d'allocation.
+- Vérification :
+  - `tests/ui_position_interpolator` (7 cas existants) passe contre la copie
+    JC1060 ;
+  - test scratchpad : commit retardé de 15 ms, pas entre 32 et 34 ms, jamais
+    de recul ; dérive de 0,3 % : écart max 1 ms, sans recul ; stall de
+    300 ms : l'affichage attend ; cue arrière de 50 ms et seek avant
+    immédiats.
+  - La copie `main-deck-p4` n'est pas modifiée.
+
+## v230 — micro-coupure audio toutes les ~2,7 s, synchrone sur les 2 decks
+
+Symptôme : le son se coupe un instant puis repart, toutes les ~3 s, sur les
+deux decks en même temps. La période est celle du heartbeat
+(`AE_HB_BLOCKS` = 500 blocs, soit 2662 ms à 187,5 blocs/s).
+
+- Cause confirmée dans le code :
+  - `ae_output_heartbeat_note()` appelait `ESP_LOGI` depuis `ae_output`
+    (prio 6, core 0). En fin de fenêtre, il imprimait 5 lignes : HB UAC,
+    HB blk, HB spk et les deux lignes PROBE, soit ~1 000 caractères.
+  - Chaque `ESP_LOG` traverse la chaîne de sortie de façon synchrone :
+    1. `console_vprintf` : `send()` TCP bloquant si un client est connecté ;
+    2. `ls_vprintf` : `uart_write_bytes(UART0)`, driver installé avec
+       `tx_buffer_size = 0`, donc bloquant jusqu'à ce que tout soit entré
+       dans la FIFO ;
+    3. vprintf libc vers la console, UART0 elle aussi, en polling.
+  - À 115200 bauds, c'est ~87 µs par caractère, écrit deux fois : environ
+    170 ms de mix bloqué, contre un ring UAC de ~14-27 ms.
+  - Les lignes blk/UAC/PROBE existaient avant ; v226 a ajouté HB spk
+    (~220 caractères), d'où les « petits spikes » déjà entendus.
+- Correctif, sans toucher au `sdkconfig` :
+  - `ae_output` ne formate et n'imprime plus rien. En fin de fenêtre, il
+    copie `s_hb` et `s_mix_probe` dans un `ae_hb_report_t` en PSRAM, mais
+    seulement si le slot est libre, puis appelle `xTaskNotifyGive`. Si le
+    slot est occupé, la fenêtre est comptée comme perdue, et l'audio
+    n'attend jamais.
+  - Nouvelle tâche `ae_log` : prio 1, core 1, stack de 6 Ko en PSRAM, créée
+    dans `audio_engine_init`. Elle lit les stats UAC et limiter, prend
+    `uac_low`, `pcm_under` et `dec_max`, puis imprime les 5 lignes.
+  - Les messages ponctuels du chemin de sortie passent par un ring de 8
+    événements : `EOF drain complete`, `startup gate released` et
+    `output sink fault`. Il est protégé par un spinlock de quelques
+    instructions. Ring plein : le message est perdu et compté.
+  - Si `ae_log` ne peut pas être créée, les logs du chemin de sortie sont
+    perdus ; ils ne sont jamais imprimés en ligne.
+  - `controller_usb_host_get_audio_stats()` peut lui-même logguer (control
+    stall, dump pkt24). Il n'est plus appelé depuis `ae_output`.
+- Restent à surveiller, sans changement dans v230 :
+  - `AE_MIX_PROBE_ISOLATE` est passé de 1 à 0 dans ce même build v230 :
+    plus de groupe à scheduler suspendu ni à IRQ masquées par bloc. Les
+    lignes PROBE restent, avec susp/irqoff lus comme norm ; remettre 1 pour
+    rediagnostiquer.
+  - Les logs d'erreur `isochronous status/resubmit` restent synchrones dans
+    le callback USB.
+  - La tee UART0 de `log_screen.c` reste sans buffer TX.
+- Vérification : un scan des fonctions appelées par `ae_output_task` ne
+  trouve plus aucun `ESP_LOG`. `gcc -fsyntax-only` ne signale que des trous
+  de stubs ESP-IDF. Pas de build firmware.
+
+## v231 — waveform : monotone strict, sans lissage lent
+
+Retour HIL v230 : la micro-coupure de ~3 s a disparu. En revanche, le blend
+v229 (constante de temps de 500 ms) laissait l'affichage décrocher
+visiblement de la position réelle.
+
+- `ui_overview` lit la position moteur en direct à chaque frame
+  (`deck_core_get_deck_state()` → `audio_engine_deck_position_ms()`, résolution
+  d'un bloc de sortie, ~5 ms). Il n'y a donc rien à lisser : il suffit
+  d'afficher cette position sans jamais reculer.
+- Nouvel algorithme de `ui_position_interpolator`, copie JC1060 :
+  - ancre = dernière position moteur, horodatée quand l'UI la voit changer ;
+  - affiché = max(affiché précédent, ancre + min(écoulé × vitesse, 33 ms)) ;
+  - une position moteur en avance sur l'affichage est prise à l'instant
+    (snap avant, sans blend) ;
+  - l'avance au-delà du moteur est bornée par
+    `UI_POSITION_INTERPOLATOR_MAX_LEAD_MS` = 33 ms, soit 1 refresh LVGL
+    (`CONFIG_LV_DEF_REFR_PERIOD` = 33). Si le moteur stagne, l'affichage
+    s'arrête là et attend ;
+  - un recul du moteur (seek, cue, hot cue, loop wrap) est suivi
+    immédiatement. Pause, premier sample et scratch (`speed_permille == 0`)
+    restent autoritatifs ;
+  - `UI_POSITION_INTERPOLATOR_REBASE_THRESHOLD_MS` et
+    `UI_POSITION_INTERPOLATOR_SLEW_TAU_MS` sont supprimés.
+- Audio : aucun changement.
+- Vérification, test scratchpad `t_v231` :
+  - lecture en direct, blocs de 5 ms, un commit en retard de 10 ms toutes les
+    40 frames : jamais de recul, jamais derrière le moteur, avance max 0 ms ;
+  - moteur figé : l'affichage plafonne à +33 ms puis reprend sans recul ;
+  - snap avant immédiat ;
+  - cue arrière et seek avant immédiats ;
+  - dérive de 0,3 % : avance max 0 ms.
+- `tests/ui_position_interpolator` (copie P4) suppose une extrapolation
+  illimitée avec un snapshot figé. Il échoue donc contre la copie JC1060 ;
+  il ne la vise pas, et la copie P4 n'est pas modifiée.

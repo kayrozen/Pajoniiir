@@ -132,7 +132,7 @@ controller-specific MIDI OUT.
 | `kind` | Fields | Behaviour |
 | --- | --- | --- |
 | `note` | `led`, `deck_status` (2-element array) or `status` + `deck` (`0`, `1`, or `"any"`), `data1`, optional `on`/`off`/`blink` (default `0x7F`/`0x00`/`0x7F`) | state 0 → off byte, 1 → on byte, 2 → blink byte. |
-| `cc_value` | same addressing, no on/off | data byte = LED state value `& 0x7F` (value passthrough, e.g. VU meter level). |
+| `cc_value` | same addressing, no on/off, optional `scale` | data byte = LED state value `& 0x7F` (value passthrough, e.g. VU meter level). With `scale` (1..65535, JC1060 only): `min(127, value * scale / 127)`; DDJ-400 VU uses 150, like its Mixxx script. |
 | `note_bank` | `led_bank`, `deck_status`, `first_data1`, `count`, optional `on`/`off`/`blink` | Compiler expands to `count` sequential `note` entries for pad LED banks and applies the same state bytes to each entry. Defaults match `note`; controller-specific RGB Data2 values can override them. |
 
 `deck_status: ["0x90", "0x91"]` expands to two entries (deck 0 and deck 1).
@@ -238,11 +238,14 @@ copies still reject such a profile on size.
 | 6 | 1 | on_value |
 | 7 | 1 | blink_value |
 | 8 | 2 | flags (0) |
-| 10 | 2 | reserved (0) |
+| 10 | 2 | value_scale (CC_VALUE only; 0 = passthrough; was reserved) |
 
 Runtime lookup key is `(led_id, deck)`; entries with `deck = 0xFF` match any
 deck. NOTE_ONOFF picks the byte by LED state (0/1/2); CC_VALUE passes the
-state byte through (`& 0x7F`).
+state byte through (`& 0x7F`), or scales it by `value_scale / 127` clamped to
+127 when `value_scale` is non-zero. The JC1060 parser rejects a non-zero
+`value_scale` on a NOTE_ONOFF entry; the S3 and main-deck-p4 copies ignore the
+field and send the raw level.
 
 ## Runtime state requirements
 

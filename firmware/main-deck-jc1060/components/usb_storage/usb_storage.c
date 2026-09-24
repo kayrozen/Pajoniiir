@@ -23,6 +23,10 @@ static const char *TAG = "usb_storage";
 #define USB_LIB_TASK_PRIO        4
 #define MSC_TASK_STACK           4096
 #define MSC_TASK_PRIO            5
+/* v226: keep USB work off CPU0, where ae_output/ae_decode run. The MSC
+ * driver config was zero-initialised, which pinned its client task (prio 5,
+ * same as ae_decode) to CPU0 rather than leaving it unpinned. */
+#define MSC_TASK_CORE            1
 /* The mount callback runs library_init() (PDB parse) + UI refresh. */
 #define STORAGE_TASK_STACK       (16 * 1024)
 #define STORAGE_TASK_PRIO        3
@@ -310,6 +314,7 @@ static void usb_lib_task(void *arg)
         .create_backround_task = true,
         .task_priority = MSC_TASK_PRIO,
         .stack_size = MSC_TASK_STACK,
+        .core_id = MSC_TASK_CORE,
         .callback = msc_event_cb,
     };
     ESP_ERROR_CHECK(msc_host_install(&msc_cfg));

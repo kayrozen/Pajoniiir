@@ -188,7 +188,7 @@
     { "kind": "note_bank", "led_bank": "beat_jump_shift_helpers", "deck_status": ["0x98", "0x9A"], "first_data1": "0x26", "count": 2 },
 
     { "kind": "note", "led": "beat_fx_on", "deck_status": ["0x94", "0x95"], "data1": "0x47" },
-    { "kind": "cc_value", "led": "vu_meter", "deck_status": ["0xB0", "0xB1"], "data1": "0x02" },
+    { "kind": "cc_value", "led": "vu_meter", "deck_status": ["0xB0", "0xB1"], "data1": "0x02", "scale": 150 },
 
     { "kind": "note", "led": "master_cue", "deck": "any", "status": "0x96", "data1": "0x63" },
     { "kind": "note", "led": "track_load_deck1", "deck": "any", "status": "0x9F", "data1": "0x00" },

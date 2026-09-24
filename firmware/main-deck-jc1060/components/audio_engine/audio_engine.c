@@ -1261,6 +1261,10 @@ static SemaphoreHandle_t      s_tasks_done[AUDIO_ENGINE_DECK_COUNT] = { NULL };
 static SemaphoreHandle_t      s_output_done = NULL;
 static TaskHandle_t           s_output_task = NULL;
 static volatile bool          s_output_run = false;
+/* v228: ae_output is created once and parked between sessions. Owned by
+ * ensure_started()/stop(): true from a run start until that run's single
+ * s_output_done signal has been consumed. */
+static volatile bool          s_output_active = false;
 /* Guards the decode-task ring/resampler flush against the output-task consumer:
  * both are pinned to AE_AUDIO_TASK_CORE, so a brief critical section makes the
  * two-index ring reset atomic w.r.t. a concurrent pop (which runs outside
@@ -1349,6 +1353,91 @@ static AE_RT_ATTR bool ae_keylock_render_cb(void *ctx, float tempo_factor,
     return audio_pcm_timeline_set_playhead_output_owner(timeline, play_seq);
 }
 
+/* v230: the output path never writes a log line itself. Each ESP_LOG goes
+ * synchronously through the console tee: TCP send, the UART0 debug echo
+ * (driver installed without a TX buffer), then the UART0 console. That is
+ * ~87 us per character, twice, at 115200 baud. Output-path messages are
+ * posted here instead; the low-priority ae_log task prints them on the
+ * other core. A full ring drops the message, never the audio. */
+enum {
+    AE_RT_EV_EOF_DRAIN = 1,
+    AE_RT_EV_START_GATE,
+    AE_RT_EV_SINK_FAULT,
+};
+
+typedef struct {
+    uint8_t kind;
+    uint8_t deck;
+    int32_t a;
+    int32_t b;
+} ae_rt_event_t;
+
+static void ae_rt_event_print(const ae_rt_event_t *ev)
+{
+    switch (ev->kind) {
+    case AE_RT_EV_EOF_DRAIN:
+        ESP_LOGI(TAG, "EOF drain complete D%u", (unsigned)ev->deck);
+        break;
+    case AE_RT_EV_START_GATE:
+        ESP_LOGI(TAG, "startup gate D%u released with %u future frames (min %u)",
+                 (unsigned)ev->deck + 1u, (unsigned)ev->a, (unsigned)ev->b);
+        break;
+    case AE_RT_EV_SINK_FAULT:
+        ESP_LOGE(TAG, "output sink fault: main=%s hp=%s",
+                 esp_err_to_name((esp_err_t)ev->a), esp_err_to_name((esp_err_t)ev->b));
+        break;
+    default:
+        break;
+    }
+}
+
+#if AE_FW
+#define AE_RT_EVENT_SLOTS 8u
+static portMUX_TYPE s_rt_event_mux = portMUX_INITIALIZER_UNLOCKED;
+static ae_rt_event_t s_rt_events[AE_RT_EVENT_SLOTS];
+static uint32_t s_rt_event_head;
+static uint32_t s_rt_event_tail;
+static uint32_t s_rt_event_dropped;
+static TaskHandle_t s_log_task;
+
+static void ae_rt_log_event(uint8_t kind, uint8_t deck, int32_t a, int32_t b)
+{
+    bool posted = false;
+    portENTER_CRITICAL_SAFE(&s_rt_event_mux);
+    if (s_rt_event_head - s_rt_event_tail < AE_RT_EVENT_SLOTS) {
+        s_rt_events[s_rt_event_head % AE_RT_EVENT_SLOTS] =
+            (ae_rt_event_t){ .kind = kind, .deck = deck, .a = a, .b = b };
+        s_rt_event_head++;
+        posted = true;
+    } else {
+        s_rt_event_dropped++;
+    }
+    portEXIT_CRITICAL_SAFE(&s_rt_event_mux);
+    if (posted && s_log_task) xTaskNotifyGive(s_log_task);
+}
+
+static bool ae_rt_event_take(ae_rt_event_t *out, uint32_t *dropped)
+{
+    bool taken = false;
+    portENTER_CRITICAL(&s_rt_event_mux);
+    if (s_rt_event_tail != s_rt_event_head) {
+        *out = s_rt_events[s_rt_event_tail % AE_RT_EVENT_SLOTS];
+        s_rt_event_tail++;
+        taken = true;
+    }
+    *dropped = s_rt_event_dropped;
+    s_rt_event_dropped = 0u;
+    portEXIT_CRITICAL(&s_rt_event_mux);
+    return taken;
+}
+#else
+static void ae_rt_log_event(uint8_t kind, uint8_t deck, int32_t a, int32_t b)
+{
+    const ae_rt_event_t ev = { .kind = kind, .deck = deck, .a = a, .b = b };
+    ae_rt_event_print(&ev);
+}
+#endif
+
 static void complete_eof_drain_if_ready(uint8_t deck)
 {
     if (deck >= AUDIO_ENGINE_DECK_COUNT) return;
@@ -1382,7 +1471,7 @@ static void complete_eof_drain_if_ready(uint8_t deck)
         atomic_store_bool(&eng->playing, false);
         audio_resampler_reset(&s_resamplers[deck]);
         s_keylocks[deck].initialized = false;
-        ESP_LOGI(TAG, "EOF drain complete D%u", (unsigned)deck);
+        ae_rt_log_event(AE_RT_EV_EOF_DRAIN, deck, 0, 0);
     }
     AE_UNLOCK();
 }
@@ -1421,7 +1510,7 @@ static void reset_all_fw_task_contexts(void)
 
 static bool audio_fw_output_task_running(void)
 {
-    return s_output_run && s_output_task != NULL;
+    return s_output_run && s_output_active;
 }
 
 static bool deck_output_active(uint8_t deck)
@@ -1449,8 +1538,7 @@ static bool deck_output_active(uint8_t deck)
         atomic_store_bool(&s_start_waiting[deck], false);
         atomic_store_u32(&s_start_prebuffer_frames[deck],
                          AE_START_PREBUFFER_FRAMES);
-        ESP_LOGI(TAG, "startup gate D%u released with %u future frames (min %u)",
-                 (unsigned)deck + 1u, (unsigned)future, (unsigned)minimum);
+        ae_rt_log_event(AE_RT_EV_START_GATE, deck, (int32_t)future, (int32_t)minimum);
     }
     return true;
 }
@@ -2498,6 +2586,10 @@ static void ae_diag_reset(void)
     }
 }
 
+/* v226: worst decode call per heartbeat window, read and cleared by the HB
+ * (the diag decode line above uses its own, much longer window). */
+static uint32_t s_hb_decode_max_us[AUDIO_ENGINE_DECK_COUNT];
+
 static void ae_diag_record_decode(uint8_t deck,
                                   uint32_t decode_us,
                                   int samples,
@@ -2509,6 +2601,7 @@ static void ae_diag_record_decode(uint8_t deck,
     if (deck >= AUDIO_ENGINE_DECK_COUNT || samples <= 0) {
         return;
     }
+    if (decode_us > s_hb_decode_max_us[deck]) s_hb_decode_max_us[deck] = decode_us;
 
     audio_diag_report_t report;
     if (audio_diag_record(&s_diag_decode_frames[deck], decode_us, &report)) {
@@ -3425,8 +3518,7 @@ static void audio_output_mark_sink_fault(esp_err_t main_rc, esp_err_t hp_rc)
         atomic_store_bool(&eng->playback_finished, false);
     }
     AE_UNLOCK();
-    ESP_LOGE(TAG, "output sink fault: main=%s hp=%s",
-             esp_err_to_name(main_rc), esp_err_to_name(hp_rc));
+    ae_rt_log_event(AE_RT_EV_SINK_FAULT, 0u, (int32_t)main_rc, (int32_t)hp_rc);
     s_output_run = false;
 }
 
@@ -3434,8 +3526,8 @@ static void audio_output_mark_sink_fault(esp_err_t main_rc, esp_err_t hp_rc)
 /* v204 diagnostics: one line every AE_HB_BLOCKS output blocks (~2.9 s at
  * 44.1 kHz when paced). Answers "is the mix slower than the block period"
  * (CPU0 overload) versus "blocks run faster than real time" (free-run: the
- * wall-clock rate blocks/s is far above sample_rate / AE_OUT_FRAMES). The
- * print is blocking UART I/O, so keep the window long. */
+ * wall-clock rate blocks/s is far above sample_rate / AE_OUT_FRAMES). v230:
+ * the output task only snapshots the window; ae_log formats and prints it. */
 #define AE_HB_BLOCKS 500u
 typedef struct {
     int64_t  start_us;
@@ -3450,9 +3542,27 @@ typedef struct {
     esp_err_t last_main_rc;
     uint32_t uac_write_fail;
     esp_err_t last_uac_rc;
+    /* v226 spike hunt, see the "HB spk" line. */
+    uint32_t pace_behind;
+    uint32_t pace_wait_max_us;
+    uint32_t runway_min[AUDIO_ENGINE_DECK_COUNT];
+    uint32_t runway_seen;
 } ae_output_heartbeat_t;
 
 static ae_output_heartbeat_t s_hb;
+
+/* v226: cumulative counters at the previous heartbeat, so the "HB spk" line
+ * reports per-window deltas instead of totals since boot. */
+typedef struct {
+    bool     valid;
+    uint32_t pcm_underrun[AUDIO_ENGINE_DECK_COUNT];
+    uint64_t uac_underrun;
+    uint64_t uac_duplicated;
+    uint64_t uac_trimmed;
+    uint64_t uac_lost;
+} ae_hb_base_t;
+
+static ae_hb_base_t s_hb_base;
 
 /* v208: in USB mode MAIN and cue only leave through the UAC stream. Its return
  * code used to be discarded, so a stream that never started was silent. */
@@ -3494,7 +3604,29 @@ typedef struct {
 } ae_mix_probe_t;
 
 static ae_mix_probe_t s_mix_probe;
-static void ae_mix_probe_window_report(void);
+static void ae_mix_probe_window_reset(void);
+
+/* v230: one heartbeat window handed from ae_output to ae_log. Lives in
+ * PSRAM (allocated with the log task). ae_output fills it only while
+ * s_hb_report_busy is false and never waits for it. */
+typedef struct {
+    ae_output_heartbeat_t hb;
+    ae_mix_probe_t probe;
+    uint32_t window_ms;
+    uint32_t wdt_block;
+    uint32_t period_us;
+    uint32_t out_rate;
+    uint32_t active_decks;
+    uint32_t busy_blocks;
+    uint32_t dropped;
+    bool codec_open;
+    bool main_i2s;
+    bool codec;
+} ae_hb_report_t;
+
+static ae_hb_report_t *s_hb_report;
+static bool s_hb_report_busy;
+static uint32_t s_hb_report_dropped;
 
 static void ae_output_heartbeat_note(bool active, uint32_t elapsed_us,
                                      uint32_t period_us, esp_err_t main_rc)
@@ -3514,59 +3646,46 @@ static void ae_output_heartbeat_note(bool active, uint32_t elapsed_us,
         if (s_phase_block[AE_PH_MAIN] > s_hb.main_max_us) {
             s_hb.main_max_us = s_phase_block[AE_PH_MAIN];
         }
+        /* Decoded PCM left ahead of the play head, after this block popped. */
+        for (uint8_t d = 0u; d < AUDIO_ENGINE_DECK_COUNT; d++) {
+            if ((s_audio_wdt_active_decks & (1u << d)) == 0u) continue;
+            const uint32_t runway = deck_pcm_used(d);
+            if ((s_hb.runway_seen & (1u << d)) == 0u ||
+                runway < s_hb.runway_min[d]) {
+                s_hb.runway_min[d] = runway;
+            }
+            s_hb.runway_seen |= 1u << d;
+        }
     } else {
         s_hb.idle++;
     }
     s_hb.last_main_rc = main_rc;
     if (s_hb.active + s_hb.idle < AE_HB_BLOCKS) return;
 
-    controller_usb_host_audio_stats_t uac = { 0 };
-    controller_usb_host_get_audio_stats(&uac);
-    /* v215: cumulative MAIN soft-limiter activity (knee 30000) next to the
-     * UAC slip/loss counters, to tell engine saturation from USB damage. */
-    audio_mixer_limiter_stats_t lim;
-    limiter_stats_snapshot(&lim);
-    ESP_LOGI(TAG, "HB UAC rc=0x%x fail=%u/%u claimed=%d cfg=%d streaming=%d "
-             "faulted=%d epoch=%u cfg_fail=%u xfer_fail=%u pkt_fail=%u "
-             "sub=%u drop=%u ring=%u/%u under=%u over=%u trim=%u dup=%u "
-             "lost=%u lim=%u peak=%d",
-             (unsigned)s_hb.last_uac_rc, (unsigned)s_hb.uac_write_fail,
-             (unsigned)(s_hb.active + s_hb.idle),
-             uac.claimed ? 1 : 0, uac.configuring ? 1 : 0,
-             uac.streaming ? 1 : 0, uac.faulted ? 1 : 0,
-             (unsigned)uac.stream_epoch, (unsigned)uac.config_failures,
-             (unsigned)uac.transfer_failures, (unsigned)uac.packet_failures,
-             (unsigned)uac.submitted_blocks, (unsigned)uac.dropped_blocks,
-             (unsigned)uac.ring_queued_frames, (unsigned)uac.ring_capacity_frames,
-             (unsigned)uac.underrun_frames, (unsigned)uac.overrun_frames,
-             (unsigned)uac.clock_trimmed_frames,
-             (unsigned)uac.clock_duplicated_frames,
-             (unsigned)uac.packet_lost_frames,
-             (unsigned)lim.limited_samples, (int)lim.peak_input_abs);
+    ae_hb_report_t *r = s_hb_report;
+    if (r && !__atomic_load_n(&s_hb_report_busy, __ATOMIC_ACQUIRE)) {
+        r->hb = s_hb;
+        r->probe = s_mix_probe;
+        r->window_ms = (uint32_t)((now - s_hb.start_us) / 1000);
+        r->wdt_block = s_audio_wdt_block;
+        r->period_us = audio_output_block_period_us(s_output_sample_rate);
+        r->out_rate = s_output_sample_rate;
+        r->active_decks = s_audio_wdt_active_decks;
+        r->busy_blocks = s_audio_wdt_busy_blocks;
+        r->dropped = s_hb_report_dropped;
+        r->codec_open = s_output_codec_open;
+        r->main_i2s = s_main_i2s_tx != NULL;
+        r->codec = s_codec != NULL;
+        s_hb_report_dropped = 0u;
+        __atomic_store_n(&s_hb_report_busy, true, __ATOMIC_RELEASE);
+        if (s_log_task) xTaskNotifyGive(s_log_task);
+    } else {
+        s_hb_report_dropped++;
+    }
 
-    uint32_t window_ms = (uint32_t)((now - s_hb.start_us) / 1000);
-    uint32_t blocks = s_hb.active + s_hb.idle;
-    uint32_t expected_bps = s_output_sample_rate / AE_OUT_FRAMES;
-    ESP_LOGI(TAG, "HB blk=%u act=%u idle=%u win=%ums rate=%u blk/s (exp %u) "
-             "mix avg=%u max=%u us elapsed max=%u us period=%u us over=%u "
-             "monitor max=%u main max=%u us main_rc=0x%x open=%d main_i2s=%d "
-             "codec=%d out_rate=%u decks=0x%x busy=%u",
-             (unsigned)s_audio_wdt_block, (unsigned)s_hb.active,
-             (unsigned)s_hb.idle, (unsigned)window_ms,
-             window_ms ? (unsigned)((uint64_t)blocks * 1000u / window_ms) : 0u,
-             (unsigned)expected_bps,
-             s_hb.active ? (unsigned)(s_hb.mix_sum_us / s_hb.active) : 0u,
-             (unsigned)s_hb.mix_max_us, (unsigned)s_hb.elapsed_max_us,
-             (unsigned)audio_output_block_period_us(s_output_sample_rate),
-             (unsigned)s_hb.over_period, (unsigned)s_hb.monitor_max_us,
-             (unsigned)s_hb.main_max_us, (unsigned)s_hb.last_main_rc,
-             s_output_codec_open ? 1 : 0, s_main_i2s_tx ? 1 : 0,
-             s_codec ? 1 : 0, (unsigned)s_output_sample_rate,
-             (unsigned)s_audio_wdt_active_decks,
-             (unsigned)s_audio_wdt_busy_blocks);
     s_hb = (ae_output_heartbeat_t){ 0 };
     s_hb.start_us = esp_timer_get_time();
-    ae_mix_probe_window_report();
+    ae_mix_probe_window_reset();
 }
 
 /* v205 diagnostics: v204 measured ~30 ms per 256-frame mix. Timing 16-frame
@@ -3612,22 +3731,32 @@ static inline AE_RT_ATTR void ae_mix_probe_block_begin(const audio_output_mixer_
     s_mix_probe.deck_modes[1] = ae_mix_probe_deck_modes(deck1);
 }
 
+/* v226: 1 = the rotated suspended / masked groups above (diagnostic build).
+ * 0 = every group runs normally; susp/irqoff then only label group slots and
+ * read like norm. Masking CPU0 interrupts delays the USB ISR if it lands on
+ * CPU0, so production builds should use 0 once the spike source is known. */
+#define AE_MIX_PROBE_ISOLATE 0
+
 static inline AE_RT_ATTR void ae_mix_probe_group_begin(uint32_t group)
 {
+#if AE_MIX_PROBE_ISOLATE
     if (group == s_mix_probe.susp_group) vTaskSuspendAll();
     if (group == s_mix_probe.irq_group) {
         s_mix_probe.irq_state = portSET_INTERRUPT_MASK_FROM_ISR();
     }
+#endif
     s_mix_probe.t0_us = esp_timer_get_time();
 }
 
 static inline AE_RT_ATTR void ae_mix_probe_group_end(uint32_t group)
 {
     int64_t t1 = esp_timer_get_time();
+#if AE_MIX_PROBE_ISOLATE
     if (group == s_mix_probe.irq_group) {
         portCLEAR_INTERRUPT_MASK_FROM_ISR(s_mix_probe.irq_state);
     }
     if (group == s_mix_probe.susp_group) (void)xTaskResumeAll();
+#endif
     if (group < AE_MIX_GROUPS) {
         s_mix_probe.group_us[group] = (uint32_t)(t1 - s_mix_probe.t0_us);
     }
@@ -3667,9 +3796,8 @@ static unsigned ae_probe_avg(const ae_probe_acc_t *acc)
     return acc->groups ? (unsigned)(acc->us / acc->groups) : 0u;
 }
 
-static void ae_mix_probe_window_report(void)
+static void ae_mix_probe_report_print(const ae_mix_probe_t *p)
 {
-    ae_mix_probe_t *p = &s_mix_probe;
     if (p->blocks != 0u) {
         const uint32_t *w = p->worst_group_us;
         ESP_LOGI(TAG, "PROBE spikes=%u/%u avg us/16fr spike norm=%u susp=%u "
@@ -3691,9 +3819,154 @@ static void ae_mix_probe_window_report(void)
                  (unsigned)w[8], (unsigned)w[9], (unsigned)w[10], (unsigned)w[11],
                  (unsigned)w[12], (unsigned)w[13], (unsigned)w[14], (unsigned)w[15]);
     }
+}
+
+static void ae_mix_probe_window_reset(void)
+{
+    ae_mix_probe_t *p = &s_mix_probe;
     uint32_t block_seq = p->block_seq;
     *p = (ae_mix_probe_t){ 0 };
     p->block_seq = block_seq;
+}
+
+/* v230: runs in ae_log only. Reads the UAC/limiter counters and resets the
+ * per-window cumulative bases here, off the output path. */
+static void ae_hb_report_print(const ae_hb_report_t *r)
+{
+    const ae_output_heartbeat_t *hb = &r->hb;
+    controller_usb_host_audio_stats_t uac = { 0 };
+    controller_usb_host_get_audio_stats(&uac);
+    /* v215: cumulative MAIN soft-limiter activity (knee 30000) next to the
+     * UAC slip/loss counters, to tell engine saturation from USB damage. */
+    audio_mixer_limiter_stats_t lim;
+    limiter_stats_snapshot(&lim);
+    ESP_LOGI(TAG, "HB UAC rc=0x%x fail=%u/%u claimed=%d cfg=%d streaming=%d "
+             "faulted=%d epoch=%u cfg_fail=%u xfer_fail=%u pkt_fail=%u "
+             "sub=%u drop=%u ring=%u/%u under=%u over=%u trim=%u dup=%u "
+             "lost=%u lim=%u peak=%d",
+             (unsigned)hb->last_uac_rc, (unsigned)hb->uac_write_fail,
+             (unsigned)(hb->active + hb->idle),
+             uac.claimed ? 1 : 0, uac.configuring ? 1 : 0,
+             uac.streaming ? 1 : 0, uac.faulted ? 1 : 0,
+             (unsigned)uac.stream_epoch, (unsigned)uac.config_failures,
+             (unsigned)uac.transfer_failures, (unsigned)uac.packet_failures,
+             (unsigned)uac.submitted_blocks, (unsigned)uac.dropped_blocks,
+             (unsigned)uac.ring_queued_frames, (unsigned)uac.ring_capacity_frames,
+             (unsigned)uac.underrun_frames, (unsigned)uac.overrun_frames,
+             (unsigned)uac.clock_trimmed_frames,
+             (unsigned)uac.clock_duplicated_frames,
+             (unsigned)uac.packet_lost_frames,
+             (unsigned)lim.limited_samples, (int)lim.peak_input_abs);
+
+    uint32_t window_ms = r->window_ms;
+    uint32_t blocks = hb->active + hb->idle;
+    uint32_t expected_bps = r->out_rate / AE_OUT_FRAMES;
+    ESP_LOGI(TAG, "HB blk=%u act=%u idle=%u win=%ums rate=%u blk/s (exp %u) "
+             "mix avg=%u max=%u us elapsed max=%u us period=%u us over=%u "
+             "monitor max=%u main max=%u us main_rc=0x%x open=%d main_i2s=%d "
+             "codec=%d out_rate=%u decks=0x%x busy=%u",
+             (unsigned)r->wdt_block, (unsigned)hb->active,
+             (unsigned)hb->idle, (unsigned)window_ms,
+             window_ms ? (unsigned)((uint64_t)blocks * 1000u / window_ms) : 0u,
+             (unsigned)expected_bps,
+             hb->active ? (unsigned)(hb->mix_sum_us / hb->active) : 0u,
+             (unsigned)hb->mix_max_us, (unsigned)hb->elapsed_max_us,
+             (unsigned)r->period_us,
+             (unsigned)hb->over_period, (unsigned)hb->monitor_max_us,
+             (unsigned)hb->main_max_us, (unsigned)hb->last_main_rc,
+             r->codec_open ? 1 : 0, r->main_i2s ? 1 : 0,
+             r->codec ? 1 : 0, (unsigned)r->out_rate,
+             (unsigned)r->active_decks,
+             (unsigned)r->busy_blocks);
+
+    /* v226 spike hunt. The ring holds ~670..1280 frames in steady state, so
+     * one late mix block is inaudible unless uac_low reaches 0 (u_under > 0).
+     * An audible click with u_under = 0 and pcm_under > 0 is a decode-side
+     * gap (deck ran dry); both 0 points at the DSP content, not timing.
+     * behind = blocks the drain was already waiting for (no pace sleep). */
+    const uint32_t uac_low = controller_usb_host_audio_take_pace_low_water();
+    uint32_t pcm_under[AUDIO_ENGINE_DECK_COUNT];
+    uint32_t dec_max[AUDIO_ENGINE_DECK_COUNT];
+    for (uint8_t d = 0u; d < AUDIO_ENGINE_DECK_COUNT; d++) {
+        const uint32_t total = s_pcm_underrun_count[d];
+        pcm_under[d] = s_hb_base.valid ? total - s_hb_base.pcm_underrun[d] : 0u;
+        s_hb_base.pcm_underrun[d] = total;
+        dec_max[d] = s_hb_decode_max_us[d];
+        s_hb_decode_max_us[d] = 0u;
+    }
+    const bool base_valid = s_hb_base.valid;
+    ESP_LOGI(TAG, "HB spk over=%u behind=%u pace_wait max=%u us uac_low=%d "
+             "u_under=%u u_dup=%u u_trim=%u u_lost=%u pcm_under D1=%u D2=%u "
+             "runway_min D1=%d D2=%d dec_max D1=%u D2=%u us",
+             (unsigned)hb->over_period, (unsigned)hb->pace_behind,
+             (unsigned)hb->pace_wait_max_us,
+             uac_low == UINT32_MAX ? -1 : (int)uac_low,
+             base_valid ? (unsigned)(uac.underrun_frames - s_hb_base.uac_underrun) : 0u,
+             base_valid ? (unsigned)(uac.clock_duplicated_frames - s_hb_base.uac_duplicated) : 0u,
+             base_valid ? (unsigned)(uac.clock_trimmed_frames - s_hb_base.uac_trimmed) : 0u,
+             base_valid ? (unsigned)(uac.packet_lost_frames - s_hb_base.uac_lost) : 0u,
+             (unsigned)pcm_under[0], (unsigned)pcm_under[1],
+             (hb->runway_seen & 1u) ? (int)hb->runway_min[0] : -1,
+             (hb->runway_seen & 2u) ? (int)hb->runway_min[1] : -1,
+             (unsigned)dec_max[0], (unsigned)dec_max[1]);
+    s_hb_base.uac_underrun = uac.underrun_frames;
+    s_hb_base.uac_duplicated = uac.clock_duplicated_frames;
+    s_hb_base.uac_trimmed = uac.clock_trimmed_frames;
+    s_hb_base.uac_lost = uac.packet_lost_frames;
+    s_hb_base.valid = true;
+
+    if (r->dropped != 0u) {
+        ESP_LOGW(TAG, "HB %u window(s) not printed (log task busy)",
+                 (unsigned)r->dropped);
+    }
+    ae_mix_probe_report_print(&r->probe);
+}
+
+/* v230: prints everything the output path posts. Lowest useful priority on
+ * the non-audio core: it may block on the console for tens of ms, and any
+ * other task preempts it. Stack and report live in PSRAM so the internal
+ * heap keeps its v228 headroom. */
+#define AE_LOG_TASK_STACK 6144
+#define AE_LOG_TASK_PRIORITY 1u
+#define AE_LOG_TASK_CORE 1
+
+static void ae_log_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        ae_rt_event_t ev;
+        uint32_t dropped = 0u;
+        while (ae_rt_event_take(&ev, &dropped)) {
+            ae_rt_event_print(&ev);
+        }
+        if (dropped != 0u) {
+            ESP_LOGW(TAG, "output log ring full: %u message(s) dropped",
+                     (unsigned)dropped);
+        }
+        if (s_hb_report && __atomic_load_n(&s_hb_report_busy, __ATOMIC_ACQUIRE)) {
+            ae_hb_report_print(s_hb_report);
+            __atomic_store_n(&s_hb_report_busy, false, __ATOMIC_RELEASE);
+        }
+    }
+}
+
+static void ae_log_task_start(void)
+{
+    if (s_log_task) return;
+    if (!s_hb_report) {
+        s_hb_report = heap_caps_calloc(1, sizeof(*s_hb_report),
+                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    TaskHandle_t task = NULL;
+    if (xTaskCreatePinnedToCoreWithCaps(ae_log_task, "ae_log", AE_LOG_TASK_STACK, NULL,
+                                        AE_LOG_TASK_PRIORITY, &task, AE_LOG_TASK_CORE,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        /* Output-path messages are then dropped, never printed inline. */
+        ESP_LOGW(TAG, "ae_log task create failed; output-path logs disabled");
+        return;
+    }
+    s_log_task = task;
 }
 #endif
 
@@ -3723,9 +3996,11 @@ static AE_RT_ATTR void ae_output_pace_sinkless(int64_t *deadline_us,
     if (s_output_sample_rate != 0u &&
         controller_usb_host_audio_pace_ready(AE_OUT_FRAMES,
                                              s_output_sample_rate, &ready)) {
-        const int64_t give_up_us = esp_timer_get_time() +
+        const int64_t wait_start_us = esp_timer_get_time();
+        const int64_t give_up_us = wait_start_us +
             (int64_t)audio_output_block_period_us(s_output_sample_rate) *
                 AE_PACE_MAX_LAG;
+        if (ready) s_hb.pace_behind++;
         while (!ready && esp_timer_get_time() < give_up_us) {
             vTaskDelay(1);
             if (!controller_usb_host_audio_pace_ready(
@@ -3733,6 +4008,9 @@ static AE_RT_ATTR void ae_output_pace_sinkless(int64_t *deadline_us,
                 break;
             }
         }
+        const uint32_t waited_us =
+            (uint32_t)(esp_timer_get_time() - wait_start_us);
+        if (waited_us > s_hb.pace_wait_max_us) s_hb.pace_wait_max_us = waited_us;
         if (ready) {
             *deadline_us = 0;
             return;
@@ -3759,6 +4037,13 @@ static AE_RT_ATTR void ae_output_task(void *arg)
     (void)arg;
     int16_t master_out[AE_OUT_FRAMES * 2];
     int16_t hp_out[AE_OUT_FRAMES * 2];
+    /* v228: the task is persistent. v226/v227 destroyed it on the last
+     * unload and recreated its 8 KB internal stack on the next load; on a
+     * fragmented internal heap that create failed with ESP_ERR_NO_MEM. */
+    for (;;) {
+    while (!s_output_run) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    }
     uint32_t consecutive_busy_blocks = 0u;
     int64_t last_idle_tick_us = esp_timer_get_time();
     int64_t pace_deadline_us = 0;
@@ -4257,33 +4542,60 @@ static AE_RT_ATTR void ae_output_task(void *arg)
         s_output_codec_open = false;
         s_output_sample_rate = 0;
     }
-    s_output_task = NULL;
     if (s_output_done) xSemaphoreGive(s_output_done);
-    vTaskDelete(NULL);
+    }
 }
 
-static esp_err_t audio_output_service_ensure_started(void)
+static void ae_output_log_internal_heap(const char *what)
+{
+    ESP_LOGE(TAG, "%s: internal free=%u largest=%u", what,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                                        MALLOC_CAP_8BIT));
+}
+
+static esp_err_t audio_output_service_create(void)
 {
     if (s_output_task) return ESP_OK;
-    if (s_output_done) {
-        while (xSemaphoreTake(s_output_done, 0) == pdTRUE) {
-            /* drain stale output exit signals */
-        }
-    }
-    s_output_run = true;
     if (xTaskCreatePinnedToCore(ae_output_task, "ae_output", AE_OUTPUT_TASK_STACK, NULL,
                                 AE_OUTPUT_TASK_PRIORITY,
                                 &s_output_task, AE_AUDIO_TASK_CORE) != pdPASS) {
-        s_output_run = false;
         s_output_task = NULL;
+        ae_output_log_internal_heap("ae_output create failed");
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
 }
 
+static esp_err_t audio_output_service_ensure_started(void)
+{
+    esp_err_t rc = audio_output_service_create();
+    if (rc != ESP_OK) return rc;
+    if (s_output_active) {
+        if (s_output_run) return ESP_OK;
+        /* A sink fault cleared s_output_run from inside the task; let that
+         * run finish (codec close + done) before starting a new one. */
+        if (s_output_done &&
+            xSemaphoreTake(s_output_done, pdMS_TO_TICKS(1500)) != pdTRUE) {
+            ESP_LOGE(TAG, "shared output restart timed out");
+            return ESP_ERR_TIMEOUT;
+        }
+        s_output_active = false;
+    }
+    if (s_output_done) {
+        while (xSemaphoreTake(s_output_done, 0) == pdTRUE) {
+            /* drain stale output exit signals */
+        }
+    }
+    s_output_active = true;
+    s_output_run = true;
+    xTaskNotifyGive(s_output_task);
+    return ESP_OK;
+}
+
 static esp_err_t audio_output_service_stop(void)
 {
-    if (!s_output_task) {
+    if (!s_output_active) {
         if (s_output_codec_open) {
             if (s_codec) esp_codec_dev_close(s_codec);
             s_output_codec_open = false;
@@ -4308,6 +4620,7 @@ static esp_err_t audio_output_service_stop(void)
         ESP_LOGE(TAG, "shared output stop timed out");
         return ESP_ERR_TIMEOUT;
     }
+    s_output_active = false;
     return ESP_OK;
 }
 #endif /* AE_FW */
@@ -4480,6 +4793,12 @@ esp_err_t audio_engine_init(void)
     if (!s_file_mutex || !s_lifecycle_admission_mutex ||
         !s_lifecycle_mutex[0] || !s_lifecycle_mutex[1] ||
         !tasks_done_ok || !s_output_done) return ESP_ERR_NO_MEM;
+    ae_log_task_start();
+    /* v228: create the parked output task while the internal heap is still
+     * unfragmented; ensure_started() retries lazily if this fails. */
+    if (audio_output_service_create() != ESP_OK) {
+        ESP_LOGW(TAG, "audio_engine_init: ae_output deferred to first load");
+    }
     ESP_LOGI(TAG, "audio_engine_init: output ready (ES8311=%s, PCM5102A=%s)",
              s_codec ? "on" : "off", s_main_i2s_tx ? "on" : "off");
 #endif
@@ -4768,7 +5087,7 @@ static esp_err_t audio_engine_play_for_deck(uint8_t deck)
              (unsigned)deck, eng->loaded ? 1 : 0, (unsigned)eng->sample_rate,
              s_output_codec_open ? 1 : 0, s_main_i2s_tx ? 1 : 0,
              s_codec ? 1 : 0, (unsigned)s_output_sample_rate,
-             s_output_task ? 1 : 0, (unsigned)s_audio_wdt_block);
+             s_output_active ? 1 : 0, (unsigned)s_audio_wdt_block);
 #endif
     if (!eng->loaded) return ESP_ERR_INVALID_STATE;
 

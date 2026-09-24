@@ -113,6 +113,9 @@ static const char *TAG = "controller_uac";
 
 static void prime_and_ready(void);
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
+/* v226: lowest ring level seen by pace_ready() since the last take, i.e. the
+ * level just before each producer refill. Under s_mux. */
+static uint32_t s_pace_low_water = UINT32_MAX;
 static controller_audio_ring_t s_ring;
 static int16_t s_ring_storage[STREAM_RING_FRAMES * STREAM_CHANNELS];
 static controller_audio_resampler_t s_resampler;
@@ -947,9 +950,21 @@ bool controller_usb_audio_stream_pace_ready(size_t frame_count,
         source_sample_rate);
     portENTER_CRITICAL(&s_mux);
     const uint32_t queued = s_ring.queued_frames;
+    if (queued < s_pace_low_water) {
+        s_pace_low_water = queued;
+    }
     portEXIT_CRITICAL(&s_mux);
     *ready = queued + incoming <= STREAM_PACE_CEILING_FRAMES;
     return true;
+}
+
+uint32_t controller_usb_audio_stream_take_pace_low_water(void)
+{
+    portENTER_CRITICAL(&s_mux);
+    const uint32_t low = s_pace_low_water;
+    s_pace_low_water = UINT32_MAX;
+    portEXIT_CRITICAL(&s_mux);
+    return low;
 }
 
 void controller_usb_audio_stream_get_stats(

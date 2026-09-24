@@ -122,6 +122,8 @@ esp_err_t controller_usb_host_write_audio(const int16_t *master_samples,
 bool controller_usb_host_audio_pace_ready(size_t frame_count,
                                          uint32_t source_sample_rate,
                                          bool *ready);
+/* v226: see controller_usb_audio_stream_take_pace_low_water(). */
+uint32_t controller_usb_host_audio_take_pace_low_water(void);
 void controller_usb_host_get_audio_stats(
     controller_usb_host_audio_stats_t *stats_out);
 

@@ -1070,6 +1070,11 @@ bool controller_usb_host_audio_pace_ready(size_t frame_count,
                                                   source_sample_rate, ready);
 }
 
+uint32_t controller_usb_host_audio_take_pace_low_water(void)
+{
+    return controller_usb_audio_stream_take_pace_low_water();
+}
+
 void controller_usb_host_get_audio_stats(
     controller_usb_host_audio_stats_t *stats_out)
 {

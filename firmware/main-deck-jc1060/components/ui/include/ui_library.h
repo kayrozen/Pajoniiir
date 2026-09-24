@@ -13,7 +13,9 @@
 #endif
 
 /* The LVGL table owns cells only for one page. Eight 40 px rows fit in the
- * 330 px data viewport, keeping the live cell model bounded at 8 x 5. */
+ * data viewport, keeping the live cell model bounded at 8 x 5. 10 rows was
+ * reverted: the extra ~600 B of internal-RAM page cache pushed the shared
+ * output task creation below its worst-case largest-free-block (v226). */
 #define UI_LIBRARY_PAGE_ROWS 8
 
 typedef struct {

@@ -314,7 +314,10 @@ static void local_bootstrap_task(void *arg)
         .callback_ctx = NULL,
         .task_stack_size = 8192u,
         .task_priority = 5u,
-        .task_core_id = tskNO_AFFINITY,
+        /* v226: CPU1. While streaming this task runs at prio 6 like
+         * ae_output and refills the UAC isochronous packets; unpinned it
+         * could time-slice with the mix on CPU0. */
+        .task_core_id = 1,
         .midi_out_queue_depth = 256u,
         .max_event_messages = 8,
     };

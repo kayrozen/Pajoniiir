@@ -10,7 +10,9 @@
 #define RT_UNLOCK() ((void)0)
 #define RT_LOGW(...) ((void)0)
 #define RT_LOGI(...) ((void)0)
+#define RT_SCRATCH_ALLOC(n) malloc(n)
 #else
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -20,6 +22,14 @@ static SemaphoreHandle_t s_lock;
 static const char *TAG = "ctrl_profile_rt";
 #define RT_LOGW(...) ESP_LOGW(TAG, __VA_ARGS__)
 #define RT_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+/* v228: the ~7 KB parse scratch goes to PSRAM so profile activation does not
+ * punch a transient hole in the internal heap audio tasks allocate from. */
+static void *rt_scratch_alloc(size_t n)
+{
+    void *p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return p ? p : malloc(n);
+}
+#define RT_SCRATCH_ALLOC(n) rt_scratch_alloc(n)
 #endif
 
 static cp_profile_t s_profile;
@@ -46,7 +56,7 @@ bool controller_profile_runtime_activate(const uint8_t *blob, size_t len,
 
     /* Parse into a scratch profile first so a failed parse never disturbs a
      * currently active one. */
-    cp_profile_t *parsed = malloc(sizeof(*parsed));
+    cp_profile_t *parsed = RT_SCRATCH_ALLOC(sizeof(*parsed));
     if (!parsed) {
         RT_LOGW("profile parse allocation failed (VID=0x%04X PID=0x%04X)",
                 vid, pid);

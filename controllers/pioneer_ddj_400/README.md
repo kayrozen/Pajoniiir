@@ -53,9 +53,10 @@ The script's `lights` table lists deck 2 `vuMeter` as `B0`; its VU function
 really sends `B1`, which is what the profile uses.
 
 The script scales the VU as `value * 150` (Mixxx VU 0..1), i.e. full meter
-at 85 % input. `controller_led_runtime.c` (`LED_DDJ400_VU_SCALE`) applies the
-same curve to the 0..127 level, clamped to 127 (a MIDI data byte cannot carry
-150). The script also sends the Pioneer SysEx
+at 85 % input. Since v226 `profile.json` declares this on the `vu_meter`
+output as `"scale": 150`; the JC1060 profile runtime applies it to the 0..127
+level, clamped to 127 (a MIDI data byte cannot carry 150). v224-v225
+hardcoded the same curve in `controller_led_runtime.c` by VID/PID. The script also sends the Pioneer SysEx
 `F0 00 40 05 00 00 02 06 00 03 01 F7` at startup (control-position request);
 it is declared in `profile.json` as `"init_sysex"` and sent by the generic
 profile path (`controller_led_runtime_send_profile_init()`) on profile

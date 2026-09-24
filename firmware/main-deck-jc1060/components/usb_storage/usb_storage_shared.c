@@ -71,7 +71,10 @@ static esp_err_t shared_storage_host_install(const usb_host_config_t *ignored)
         .intr_flags = ESP_INTR_FLAG_LEVEL1,
         .daemon_stack_size = 4096u,
         .daemon_priority = 4u,
-        .daemon_core_id = tskNO_AFFINITY,
+        /* v226: usb_host_install() runs in this task and allocates the DWC
+         * interrupts on its core; pin it to CPU1 so USB ISRs stay off the
+         * audio core (CPU0). */
+        .daemon_core_id = 1,
     };
     return usb_host_manager_init(&config);
 }

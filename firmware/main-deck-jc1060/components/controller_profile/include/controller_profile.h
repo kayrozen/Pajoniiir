@@ -94,6 +94,9 @@ typedef struct {
     uint8_t off_value;
     uint8_t on_value;
     uint8_t blink_value;
+    /* v226: CC_VALUE only. 0 = pass the state through; otherwise send
+     * min(127, state * value_scale / 127) (e.g. DDJ-400 VU: 150). */
+    uint16_t value_scale;
 } cp_output_entry_t;
 
 typedef struct {

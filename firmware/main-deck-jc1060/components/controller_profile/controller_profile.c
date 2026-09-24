@@ -126,7 +126,9 @@ int cp_profile_parse(const uint8_t *data, size_t len, cp_profile_t *out)
         o->off_value = p[5];
         o->on_value = p[6];
         o->blink_value = p[7];
-        if (o->out_kind > CP_OUT_CC_VALUE) {
+        o->value_scale = rd_u16(p + 10);
+        if (o->out_kind > CP_OUT_CC_VALUE ||
+            (o->value_scale != 0u && o->out_kind != CP_OUT_CC_VALUE)) {
             return CP_ERR_BOUNDS;
         }
     }
@@ -318,7 +320,12 @@ bool cp_profile_map_led(const cp_profile_t *profile, uint8_t led, uint8_t deck,
         midi_out[0] = o->status;
         midi_out[1] = o->data1;
         if (o->out_kind == CP_OUT_CC_VALUE) {
-            midi_out[2] = state & 0x7F;
+            uint32_t value = state & 0x7Fu;
+            if (o->value_scale != 0u) {
+                value = value * o->value_scale / 127u;
+                if (value > 0x7Fu) value = 0x7Fu;
+            }
+            midi_out[2] = (uint8_t)value;
         } else if (state == 0) {
             midi_out[2] = o->off_value;
         } else if (state == 2) {

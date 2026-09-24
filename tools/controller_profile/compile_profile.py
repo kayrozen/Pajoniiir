@@ -219,7 +219,7 @@ class Entry:
 
 class Output:
     def __init__(self, led_id, deck, kind, status, data1,
-                 off=0x00, on=0x7F, blink=0x7F):
+                 off=0x00, on=0x7F, blink=0x7F, scale=0):
         self.led_id = led_id
         self.deck = deck
         self.kind = kind
@@ -228,11 +228,13 @@ class Output:
         self.off = off
         self.on = on
         self.blink = blink
+        self.scale = scale
 
     def pack(self):
+        # u16 at offset 10 (formerly reserved) = cc_value scale, 0 = raw.
         return struct.pack("<BBBBBBBBHH", self.led_id, self.deck, self.kind,
                            self.status, self.data1, self.off, self.on,
-                           self.blink, 0, 0)
+                           self.blink, 0, self.scale)
 
 
 def compile_inputs(inputs):
@@ -341,10 +343,16 @@ def compile_outputs(outputs):
         off = num(item.get("off", 0x00))
         on = num(item.get("on", 0x7F))
         blink = num(item.get("blink", 0x7F))
+        scale = num(item.get("scale", 0))
+        if scale and out_kind != OUT_CC_VALUE:
+            raise ValueError("scale is only valid on cc_value outputs")
+        if not 0 <= scale <= 0xFFFF:
+            raise ValueError("scale must be 0..65535")
         if "deck_status" in item:
             for deck, status in enumerate(item["deck_status"]):
                 entries.append(Output(led_id, deck, out_kind, num(status),
-                                      num(item["data1"]), off, on, blink))
+                                      num(item["data1"]), off, on, blink,
+                                      scale))
         else:
             deck_value = item.get("deck")
             if deck_value == "any":
@@ -354,7 +362,7 @@ def compile_outputs(outputs):
             else:
                 raise ValueError("output needs deck_status, deck:0/1, or deck:'any'")
             entries.append(Output(led_id, deck, out_kind, num(item["status"]),
-                                   num(item["data1"]), off, on, blink))
+                                   num(item["data1"]), off, on, blink, scale))
     return entries
 
 
@@ -451,13 +459,13 @@ def dump(blob):
               (n, status, data1, RAW_TYPE_NAMES.get(raw, "?"), st, sid, extra))
         off += INPUT_ENTRY_SIZE
     for n in range(out_count):
-        led, deck, kind, status, data1, offv, onv, blinkv, _, _ = \
+        led, deck, kind, status, data1, offv, onv, blinkv, _, scale = \
             struct.unpack_from("<BBBBBBBBHH", blob, off)
         deck_s = "any" if deck == 0xFF else str(deck)
-        print("  out[%3d] led=%-26s deck=%-3s %s %02X %02X off=%02X on=%02X blink=%02X" %
+        print("  out[%3d] led=%-26s deck=%-3s %s %02X %02X off=%02X on=%02X blink=%02X%s" %
               (n, LED_NAME_BY_ID.get(led, str(led)), deck_s,
                "cc " if kind == OUT_CC_VALUE else "note", status, data1,
-               offv, onv, blinkv))
+               offv, onv, blinkv, " scale=%d" % scale if scale else ""))
         off += OUTPUT_ENTRY_SIZE
     if sysex_len:
         print("  init_sysex[%d] %s" %

@@ -26,12 +26,8 @@ static uint32_t s_led_vu_logged[LED_LOG_SLOTS];
  * hardware (FLX4-only, note 0x96 00/01) and are sent on deck 0 only. */
 static uint32_t s_led_unmapped_logged[(LED_REMOTE_COUNT + 31) / 32];
 
-/* v224: the Mixxx DDJ-400 script (quirxmode) sends the VU as value * 150 on
- * B0/B1 02, value being Mixxx's 0..1 VU. A MIDI data byte stops at 127, so
- * that meter reaches full scale at 127/150 (85 %) of the input. Same curve
- * here: 0..127 level * 150 / 127, clamped to 127. 0 = raw 0..127. */
-#define LED_DDJ400_VU_SCALE 150u
-#define LED_DDJ400_PID 0x0026u
+/* v226: the per-controller VU curve (DDJ-400 * 150 / 127, v224) is now the
+ * profile's cc_value "scale", applied in cp_profile_map_led(). */
 static bool s_led_profile_seen;
 
 static uint32_t s_dynamic_packets;
@@ -124,18 +120,6 @@ esp_err_t controller_led_runtime_send(uint8_t led,
         memset(s_led_unmapped_logged, 0, sizeof(s_led_unmapped_logged));
         ESP_LOGW(TAG, "LED path sees profile_active=%d", profile_now ? 1 : 0);
     }
-#if LED_DDJ400_VU_SCALE
-    if (led == LED_VU_METER) {
-        controller_usb_identity_t vu_identity;
-        if (controller_usb_host_get_identity(&vu_identity) &&
-            vu_identity.vid == 0x2B73u &&
-            vu_identity.pid == LED_DDJ400_PID) {
-            const uint32_t scaled =
-                ((uint32_t)(state & 0x7Fu) * LED_DDJ400_VU_SCALE) / 127u;
-            state = (uint8_t)(scaled > 127u ? 127u : scaled);
-        }
-    }
-#endif
     if (!controller_led_runtime_build_packet(led, state, deck, packet)) {
         const uint32_t bit = 1u << (led % 32u);
         if (led < LED_REMOTE_COUNT &&
