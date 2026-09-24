@@ -318,6 +318,29 @@ static void usb_host_daemon_task(void *arg)
         .intr_flags = s_config.intr_flags,
         .enum_filter_cb = NULL,
         .peripheral_map = s_config.peripheral_map,
+        /* P4 DWC DFIFO = 512 lines total, 4 bytes/line. DDJ-400 needs
+         * interrupt IN/OUT (MIDI) AND iso OUT MPS 576 (UAC audio)
+         * concurrently - no stock bias preset satisfies both.
+         *   rx  160 lines -> in_mps     = (160-2)*4 = 632 >= 512
+         *   nptx 160 lines -> nptx_mps  = 640 >= 512
+         *   ptx  180 lines -> ptx_mps   = 720 >= 576
+         * (Same split as main/usb_host_bringup.c; without it the FS DWC
+         * defaults to ptx=100 lines = 400 bytes and the UAC EP alloc
+         * fails with ESP_ERR_NOT_SUPPORTED.) */
+        .fifo_settings_custom = {
+            .rx_fifo_lines = 160,
+            .nptx_fifo_lines = 160,
+            .ptx_fifo_lines = 180,
+        },
+        /* Dual-port: per-port overrides (index = DWC instance).
+         * Port 0 (HS, MSC stick): default bias keeps rx>=130 lines for
+         * bulk 512. Port 1 (FS, DDJ): total FIFO is only ~200 lines, so
+         * reserve ptx=150 lines (600 B >= UAC iso MPS 576) while keeping
+         * rx=30 (in_mps 112 >= MIDI intr 64) and nptx=20 (ctrl 64). */
+        .fifo_settings_per_port = {
+            { .rx_fifo_lines = 0,  .nptx_fifo_lines = 0, .ptx_fifo_lines = 0   },
+            { .rx_fifo_lines = 30, .nptx_fifo_lines = 20, .ptx_fifo_lines = 150 },
+        },
     };
 
 #if defined(CONFIG_IDF_TARGET_ESP32P4)

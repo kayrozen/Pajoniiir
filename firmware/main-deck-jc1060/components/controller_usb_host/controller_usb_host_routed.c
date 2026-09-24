@@ -38,8 +38,17 @@ static esp_err_t routed_interface_claim(usb_host_client_handle_t client,
 static BaseType_t routed_queue_reset(QueueHandle_t queue)
 {
     controller_midi_out_gate_stop(&s_output_gate);
+    /* v217: taskYIELD() only runs tasks of equal or higher priority. The
+     * controller task (5, or 6 while streaming) spun here while a
+     * lower-priority LED producer (dispatch, 4) was preempted inside the gate,
+     * so close_step() could stall the unplug path. Sleep one tick instead. */
+    uint32_t waited_ticks = 0u;
     while (controller_midi_out_gate_active_producers(&s_output_gate) != 0u) {
-        taskYIELD();
+        vTaskDelay(1);
+        if (++waited_ticks == pdMS_TO_TICKS(500)) {
+            ESP_LOGW(ROUTED_TAG, "recovery: MIDI OUT producers still active "
+                                 "after 500 ms");
+        }
     }
     return xQueueGenericReset(queue, pdFALSE);
 }

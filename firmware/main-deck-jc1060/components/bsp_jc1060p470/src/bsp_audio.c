@@ -142,7 +142,7 @@ static esp_err_t bsp_codec_init(void)
     return ESP_OK;
 }
 
-esp_err_t bsp_audio_init(const bsp_audio_config_t* config)
+esp_err_t bsp_audio_init_cfg(const bsp_audio_config_t* config)
 {
     if (g_initialized) {
         ESP_LOGW(TAG, "Audio already initialized");
@@ -186,7 +186,7 @@ esp_err_t bsp_audio_init(const bsp_audio_config_t* config)
 }
 
 i2s_chan_handle_t bsp_audio_get_i2s_tx_chan(void) { return g_i2s_tx_chan; }
-esp_codec_dev_handle_t bsp_audio_get_codec_dev(void) { return g_codec_dev; }
+esp_codec_dev_handle_t bsp_audio_get_codec_dev_cfg(void) { return g_codec_dev; }
 
 esp_err_t bsp_audio_set_volume(int volume)
 {

@@ -14,7 +14,24 @@
 static const char *TAG = "controller_usb";
 #define DEFAULT_TRANSFER_BYTES 64
 #define FLX4_USB_VID 0x2B73u
+/* Pioneer DJ VID 0x2B73. DDJ-FLX4 = PID 0x0045 (UAC1 16-bit, 4ch).
+ * DDJ-400 = PID 0x0026 (UAC1 24-bit, 4ch) — per ddj400_re 03_USB_SYSTEM.
+ * Both expose UAC1 + MIDI; UAC start is attempted for either and the
+ * format selector picks what the device offers. */
 #define FLX4_USB_PID 0x0045u
+#define DDJ400_USB_PID 0x0026u
+/* v210: UAC placement gate. Upstream starts UAC only for a direct child of
+ * root port 1. The jc1060 fork reports parent.port_num as the zero-based
+ * root index for root devices and the 1-based hub port for devices behind a
+ * hub, and always leaves parent.dev_hdl NULL, so direct_root_child cannot
+ * tell the two apart. Layout A puts the controller on the HS root (index 0,
+ * see controller_bootstrap.c), which the upstream "== 1" test rejected
+ * silently: no descriptor parse, no claim, every write INVALID_STATE. Port 1
+ * (FS root, or hub port 1) is kept because UAC was proven there on v205/206.
+ * The device is identified by VID/PID and the format selector still
+ * validates the stream. */
+#define CONTROLLER_UAC_ROOT_PORT 0u
+#define CONTROLLER_UAC_LEGACY_PORT 1u
 /* Keep the UAC consumer level with the priority-6 ae_output producer. Raising
  * this client above ae_output lets dense jog MIDI traffic continuously preempt
  * the only task that refills the UAC ring, producing headphone underruns while
@@ -22,6 +39,18 @@ static const char *TAG = "controller_usb";
  * service through FreeRTOS time slicing and ae_output's explicit yield/block
  * points without increasing the audio ring or its cue latency. */
 #define CONTROLLER_USB_ACTIVE_PRIORITY 6u
+/* v217 unplug/replug recovery. The root port is re-armed by the Host Library
+ * only after every client has closed the gone device, so a close that stalls
+ * leaves the controller root dead (no NEW_DEV, no MIDI, no UAC). After
+ * CLOSE_FORCE_MS the endpoints are halted/flushed even for a gone device;
+ * progress is logged every CLOSE_LOG_MS. Once closed, a root that does not
+ * re-enumerate is power-cycled through the manager after REARM_FIRST_MS,
+ * then every REARM_RETRY_MS while the controller stays absent. */
+#define CONTROLLER_CLOSE_LOG_MS 1000u
+#define CONTROLLER_CLOSE_FORCE_MS 1000u
+#define CONTROLLER_REARM_FIRST_MS 5000u
+#define CONTROLLER_REARM_RETRY_MS 15000u
+#define CONTROLLER_ROOT_UNKNOWN 0xFFu
 
 typedef struct {
     uint32_t generation;
@@ -46,6 +75,16 @@ typedef struct {
     bool out_generation_closed;
     bool midi_flush_attempted;
     controller_usb_recovery_gate_t recovery_gate;
+    /* v217: survives the identity memset at the end of close_step(). */
+    uint8_t recovery_root;
+    bool close_timing;
+    bool close_forced;
+    TickType_t close_started;
+    TickType_t close_last_log;
+    bool awaiting_reattach;
+    TickType_t detached_at;
+    TickType_t last_rearm;
+    uint32_t rearm_count;
 } controller_state_t;
 
 static controller_state_t s_state;
@@ -66,6 +105,12 @@ static uint32_t s_midi_parse_rejects;
 static uint32_t s_midi_in_submit_failures;
 static uint32_t s_midi_out_submit_failures;
 static uint32_t s_midi_out_queue_drops;
+/* v220 diagnostic: the first MIDI OUT transfers of each connection are
+ * logged at submit and completion, so a HIL log shows whether LED feedback
+ * really reaches the OUT endpoint and whether the device accepts it. */
+#define MIDI_OUT_LOG_LIMIT 16u
+static uint32_t s_midi_out_submit_logged;
+static uint32_t s_midi_out_done_logged;
 static uint32_t s_probe_event_drops;
 static uint32_t s_recovery_requests;
 static int32_t s_last_probe_result = ESP_ERR_INVALID_STATE;
@@ -83,6 +128,11 @@ static inline void count_inc(uint32_t *value)
     (void)__atomic_add_fetch(value, 1u, __ATOMIC_RELAXED);
 }
 
+static inline uint32_t ticks_to_ms(TickType_t ticks)
+{
+    return (uint32_t)ticks * (uint32_t)portTICK_PERIOD_MS;
+}
+
 static void record_probe_result(controller_usb_probe_stage_t stage,
                                 esp_err_t result)
 {
@@ -95,15 +145,19 @@ static void begin_controller_fault_recovery(controller_state_t *state,
                                             const char *operation,
                                             esp_err_t error)
 {
-    if (!state || !controller_usb_recovery_gate_begin_fault(
-            &state->recovery_gate)) {
+    /* v217: an unplug during streaming first surfaces as isoc/MIDI transfer
+     * errors. A gone device needs a plain close, not a power-cycle, and the
+     * DEV_GONE flag must never be cleared by a late fault report. */
+    if (!state || state->device_gone ||
+        !controller_usb_recovery_gate_begin_fault(&state->recovery_gate)) {
         return;
     }
-    ESP_LOGW(TAG, "%s fault (%s); closing USB1 before one recovery request",
-             operation ? operation : "controller USB", esp_err_to_name(error));
+    ESP_LOGW(TAG, "%s fault (%s); closing controller before one recovery "
+                  "request on root %u",
+             operation ? operation : "controller USB", esp_err_to_name(error),
+             (unsigned)state->recovery_root);
     __atomic_store_n(&s_accepting_out, false, __ATOMIC_RELEASE);
     state->closing = true;
-    state->device_gone = false;
     state->midi_flush_attempted = false;
     controller_usb_audio_stream_request_stop(false);
 }
@@ -114,8 +168,17 @@ static void submit_deferred_controller_recovery(controller_state_t *state)
             &state->recovery_gate)) {
         return;
     }
+    /* v217: upstream hard-coded USB1 (index 1). On jc1060 index 1 is the
+     * storage root; the controller root is the one it was probed on. */
+    if (state->recovery_root == CONTROLLER_ROOT_UNKNOWN) {
+        ESP_LOGW(TAG, "recovery: controller root unknown, power-cycle skipped");
+        controller_usb_recovery_gate_complete(&state->recovery_gate);
+        return;
+    }
     const esp_err_t rc = usb_host_manager_request_recovery(
-        1u, USB_HOST_RECOVERY_REASON_TRANSFER);
+        state->recovery_root, USB_HOST_RECOVERY_REASON_TRANSFER);
+    ESP_LOGW(TAG, "recovery: fault power-cycle request root %u: %s",
+             (unsigned)state->recovery_root, esp_err_to_name(rc));
     if (rc == ESP_OK) {
         count_inc(&s_recovery_requests);
         controller_usb_recovery_gate_complete(&state->recovery_gate);
@@ -208,6 +271,22 @@ static esp_err_t submit_out_if_idle(controller_state_t *state)
     state->out_transfer->bEndpointAddress = state->identity.midi.out_ep_addr;
     state->out_transfer->num_bytes = (int)(packets * 4u);
     const esp_err_t rc = usb_host_transfer_submit(state->out_transfer);
+    if (s_midi_out_submit_logged < MIDI_OUT_LOG_LIMIT) {
+        s_midi_out_submit_logged++;
+        const uint8_t *b = state->out_transfer->data_buffer;
+        ESP_LOGW(TAG, "MIDI OUT ep 0x%02x submit %u pkt rc=%s drops=%u",
+                 state->identity.midi.out_ep_addr, (unsigned)packets,
+                 esp_err_to_name(rc),
+                 (unsigned)__atomic_load_n(&s_midi_out_queue_drops,
+                                           __ATOMIC_RELAXED));
+        /* v222: every packet of the logged transfers, to see deck 1 (0x90,
+         * 0x97, 0xB0) messages actually leave. */
+        for (size_t i = 0u; i < packets; ++i) {
+            ESP_LOGW(TAG, "  MIDI OUT [%u] %02X %02X %02X %02X",
+                     (unsigned)i, b[i * 4u], b[i * 4u + 1u], b[i * 4u + 2u],
+                     b[i * 4u + 3u]);
+        }
+    }
     if (rc == ESP_OK) {
         state->out_active = true;
     } else {
@@ -274,6 +353,12 @@ static void midi_out_callback(usb_transfer_t *transfer)
 {
     controller_state_t *state = (controller_state_t *)transfer->context;
     state->out_active = false;
+    if (s_midi_out_done_logged < MIDI_OUT_LOG_LIMIT) {
+        s_midi_out_done_logged++;
+        ESP_LOGW(TAG, "MIDI OUT done status=%d actual=%d/%d",
+                 (int)transfer->status, transfer->actual_num_bytes,
+                 transfer->num_bytes);
+    }
 
     const bool terminal =
         transfer->status == USB_TRANSFER_STATUS_NO_DEVICE ||
@@ -302,8 +387,47 @@ static void midi_out_callback(usb_transfer_t *transfer)
     }
 }
 
+static void close_wait_log(controller_state_t *state, const char *what)
+{
+    const TickType_t now = xTaskGetTickCount();
+    if (ticks_to_ms(now - state->close_last_log) < CONTROLLER_CLOSE_LOG_MS) {
+        return;
+    }
+    state->close_last_log = now;
+    ESP_LOGW(TAG, "recovery: close waiting on %s for %u ms "
+                  "(gone=%u uac_blockers=0x%02x in=%u out=%u claimed=%u "
+                  "opened=%u)",
+             what, (unsigned)ticks_to_ms(now - state->close_started),
+             state->device_gone ? 1u : 0u,
+             (unsigned)controller_usb_audio_stream_cleanup_blockers(),
+             state->in_active ? 1u : 0u, state->out_active ? 1u : 0u,
+             state->claimed ? 1u : 0u, state->opened ? 1u : 0u);
+}
+
 static void close_step(controller_state_t *state)
 {
+    const TickType_t now = xTaskGetTickCount();
+    if (!state->close_timing) {
+        state->close_timing = true;
+        state->close_forced = false;
+        state->close_started = now;
+        state->close_last_log = now;
+        ESP_LOGW(TAG, "recovery: closing controller (gone=%u uac=%u "
+                      "uac_blockers=0x%02x)",
+                 state->device_gone ? 1u : 0u,
+                 state->identity.usb_audio_active ? 1u : 0u,
+                 (unsigned)controller_usb_audio_stream_cleanup_blockers());
+    }
+    if (!state->close_forced &&
+        ticks_to_ms(now - state->close_started) >= CONTROLLER_CLOSE_FORCE_MS) {
+        state->close_forced = true;
+        state->midi_flush_attempted = false;
+        ESP_LOGW(TAG, "recovery: close stalled %u ms, forcing endpoint "
+                      "halt/flush (gone=%u)",
+                 (unsigned)ticks_to_ms(now - state->close_started),
+                 state->device_gone ? 1u : 0u);
+        controller_usb_audio_stream_force_flush();
+    }
     state->closing = true;
     __atomic_store_n(&s_accepting_out, false, __ATOMIC_RELEASE);
     if (!state->out_generation_closed) {
@@ -312,13 +436,14 @@ static void close_step(controller_state_t *state)
     }
     controller_usb_audio_stream_request_stop(state->device_gone);
     if (!controller_usb_audio_stream_poll_cleanup()) {
+        close_wait_log(state, "UAC cleanup");
         return;
     }
     if (state->out_queue) {
         (void)xQueueReset(state->out_queue);
     }
-    if (!state->device_gone && state->claimed && state->device &&
-        (state->in_active || state->out_active) &&
+    if ((!state->device_gone || state->close_forced) && state->claimed &&
+        state->device && (state->in_active || state->out_active) &&
         !state->midi_flush_attempted) {
         state->midi_flush_attempted = true;
         const uint8_t endpoints[] = {
@@ -346,16 +471,19 @@ static void close_step(controller_state_t *state)
         }
     }
     if (state->in_active || state->out_active) {
+        close_wait_log(state, "MIDI transfers");
         return;
     }
     if (state->in_transfer) {
         if (usb_host_transfer_free(state->in_transfer) != ESP_OK) {
+            close_wait_log(state, "MIDI IN free");
             return;
         }
         state->in_transfer = NULL;
     }
     if (state->out_transfer) {
         if (usb_host_transfer_free(state->out_transfer) != ESP_OK) {
+            close_wait_log(state, "MIDI OUT free");
             return;
         }
         state->out_transfer = NULL;
@@ -366,6 +494,7 @@ static void close_step(controller_state_t *state)
             state->identity.midi.interface_num);
         if (rc != ESP_OK) {
             ESP_LOGW(TAG, "release MIDI interface: %s", esp_err_to_name(rc));
+            close_wait_log(state, "MIDI release");
             return;
         }
         state->claimed = false;
@@ -375,6 +504,7 @@ static void close_step(controller_state_t *state)
             usb_host_device_close(state->client, state->device);
         if (rc != ESP_OK) {
             ESP_LOGW(TAG, "close controller device: %s", esp_err_to_name(rc));
+            close_wait_log(state, "device close");
             return;
         }
         state->opened = false;
@@ -383,6 +513,20 @@ static void close_step(controller_state_t *state)
 
     const bool was_connected =
         __atomic_exchange_n(&s_connected, false, __ATOMIC_ACQ_REL);
+    const bool was_gone = state->device_gone;
+    ESP_LOGW(TAG, "recovery: controller closed in %u ms (gone=%u forced=%u); "
+                  "root %u free for re-enumeration",
+             (unsigned)ticks_to_ms(now - state->close_started),
+             was_gone ? 1u : 0u, state->close_forced ? 1u : 0u,
+             (unsigned)state->recovery_root);
+    state->close_timing = false;
+    state->close_forced = false;
+    if (was_gone) {
+        state->awaiting_reattach = true;
+        state->detached_at = now;
+        state->last_rearm = now;
+        state->rearm_count = 0u;
+    }
     memset(&state->identity, 0, sizeof(state->identity));
     state->closing = false;
     state->device_gone = false;
@@ -397,6 +541,39 @@ static void close_step(controller_state_t *state)
         ESP_LOGI(TAG, "USB-MIDI controller disconnected");
     }
     submit_deferred_controller_recovery(state);
+}
+
+/* jc1060 diagnostic, v214: logged on every UAC start, not only on failure,
+ * so the raw interface/endpoint/class-specific bytes behind the selected
+ * format are always in the HIL log (DDJ-400 16 vs 24-bit question). Each
+ * descriptor is printed whole, up to 16 bytes. WARN level:
+ * CONFIG_LOG_DEFAULT_LEVEL=2 compiles out INFO. */
+static void dump_uac_descriptors(const usb_config_desc_t *config_desc)
+{
+    const uint8_t *raw = (const uint8_t *)config_desc;
+    const size_t total = config_desc->wTotalLength;
+    ESP_LOGW(TAG, "UAC desc dump total=%u:", (unsigned)total);
+    for (size_t off = 0u; off + 2u <= total;) {
+        const uint8_t dlen = raw[off];
+        if (dlen < 2u || off + dlen > total) {
+            break;
+        }
+        const uint8_t dtype = raw[off + 1u];
+        if (dtype == 0x04u || dtype == 0x05u || dtype == 0x24u ||
+            dtype == 0x25u) {
+            char hex[16u * 3u + 1u];
+            size_t pos = 0u;
+            for (size_t k = 0u; k < dlen && k < 16u; ++k) {
+                static const char digits[] = "0123456789abcdef";
+                hex[pos++] = digits[raw[off + k] >> 4];
+                hex[pos++] = digits[raw[off + k] & 0x0fu];
+                hex[pos++] = ' ';
+            }
+            hex[pos > 0u ? pos - 1u : 0u] = '\0';
+            ESP_LOGW(TAG, "  @%u len %u: %s", (unsigned)off, dlen, hex);
+        }
+        off += dlen;
+    }
 }
 
 static esp_err_t probe_device(controller_state_t *state, uint8_t address)
@@ -469,9 +646,16 @@ static esp_err_t probe_device(controller_state_t *state, uint8_t address)
     state->device = device;
     state->opened = true;
     state->closing = false;
+    s_midi_out_submit_logged = 0u;
+    s_midi_out_done_logged = 0u;
     state->device_gone = false;
     state->midi_flush_attempted = false;
     controller_usb_recovery_gate_cancel(&state->recovery_gate);
+    state->recovery_root =
+        info.parent.dev_hdl == NULL &&
+                info.parent.port_num < USB_HOST_RECOVERY_PORT_COUNT
+            ? info.parent.port_num
+            : CONTROLLER_ROOT_UNKNOWN;
     state->identity = (controller_usb_identity_t) {
         .vid = device_desc->idVendor,
         .pid = device_desc->idProduct,
@@ -529,22 +713,46 @@ static esp_err_t probe_device(controller_state_t *state, uint8_t address)
         return rc;
     }
 
-    if (state->identity.vid == FLX4_USB_VID &&
-        state->identity.pid == FLX4_USB_PID &&
-        state->identity.direct_root_child &&
-        state->identity.parent_port == 1u) {
+    const bool uac_device = state->identity.vid == FLX4_USB_VID &&
+        (state->identity.pid == FLX4_USB_PID ||
+         state->identity.pid == DDJ400_USB_PID);
+    const bool uac_port = state->identity.direct_root_child &&
+        (state->identity.parent_port == CONTROLLER_UAC_ROOT_PORT ||
+         state->identity.parent_port == CONTROLLER_UAC_LEGACY_PORT);
+    if (uac_device) {
+        /* WARN: CONFIG_LOG_DEFAULT_LEVEL=2 compiles out the INFO ready line,
+         * and a skipped UAC start used to leave no trace at all. */
+        ESP_LOGW(TAG, "UAC gate PID=0x%04X parent_port=%u direct_root=%u -> %s",
+                 state->identity.pid, state->identity.parent_port,
+                 state->identity.direct_root_child ? 1u : 0u,
+                 uac_port ? "start" : "skip");
+    }
+    if (uac_device && uac_port) {
+        const bool is_ddj400 = state->identity.pid == DDJ400_USB_PID;
+        dump_uac_descriptors(config_desc);
         const esp_err_t audio_rc = controller_usb_audio_stream_start(
             state->client, state->device, (const uint8_t *)config_desc,
             config_desc->wTotalLength, xTaskGetCurrentTaskHandle(),
             CONTROLLER_USB_ACTIVE_PRIORITY, state->config.task_priority);
         if (audio_rc != ESP_OK) {
-            ESP_LOGW(TAG, "FLX4 UAC unavailable; MIDI remains active: %s",
+            ESP_LOGW(TAG, "%s UAC unavailable; MIDI remains active: %s",
+                     is_ddj400 ? "DDJ-400" : "FLX4",
                      esp_err_to_name(audio_rc));
         } else {
             state->identity.usb_audio_active = true;
         }
     }
 
+    if (state->awaiting_reattach) {
+        state->awaiting_reattach = false;
+        ESP_LOGW(TAG, "recovery: controller re-attached after %u ms "
+                      "(addr=%u root=%u rearms=%u uac=%u)",
+                 (unsigned)ticks_to_ms(xTaskGetTickCount() -
+                                       state->detached_at),
+                 address, (unsigned)state->recovery_root,
+                 (unsigned)state->rearm_count,
+                 state->identity.usb_audio_active ? 1u : 0u);
+    }
     count_inc(&s_midi_connects);
     (void)__atomic_add_fetch(&s_out_generation, 1u, __ATOMIC_ACQ_REL);
     state->out_generation_closed = false;
@@ -569,6 +777,9 @@ static void client_event_callback(const usb_host_client_event_msg_t *event_msg,
     controller_state_t *state = (controller_state_t *)arg;
     switch (event_msg->event) {
     case USB_HOST_CLIENT_EVENT_NEW_DEV:
+        ESP_LOGW(TAG, "recovery: NEW_DEV addr=%u (opened=%u closing=%u)",
+                 (unsigned)event_msg->new_dev.address,
+                 state->opened ? 1u : 0u, state->closing ? 1u : 0u);
         if (!state->probe_queue ||
             xQueueSend(state->probe_queue, &event_msg->new_dev.address, 0) !=
                 pdTRUE) {
@@ -577,6 +788,8 @@ static void client_event_callback(const usb_host_client_event_msg_t *event_msg,
         break;
     case USB_HOST_CLIENT_EVENT_DEV_GONE:
         if (state->opened && event_msg->dev_gone.dev_hdl == state->device) {
+            ESP_LOGW(TAG, "recovery: DEV_GONE controller (uac_blockers=0x%02x)",
+                     (unsigned)controller_usb_audio_stream_cleanup_blockers());
             state->closing = true;
             state->device_gone = true;
             controller_usb_recovery_gate_cancel(&state->recovery_gate);
@@ -587,6 +800,33 @@ static void client_event_callback(const usb_host_client_event_msg_t *event_msg,
     default:
         break;
     }
+}
+
+static void rearm_root_if_silent(controller_state_t *state)
+{
+    if (!state->awaiting_reattach ||
+        state->recovery_root == CONTROLLER_ROOT_UNKNOWN) {
+        return;
+    }
+    const TickType_t now = xTaskGetTickCount();
+    const uint32_t wait_ms = state->rearm_count == 0u
+                                 ? CONTROLLER_REARM_FIRST_MS
+                                 : CONTROLLER_REARM_RETRY_MS;
+    if (ticks_to_ms(now - state->last_rearm) < wait_ms) {
+        return;
+    }
+    state->last_rearm = now;
+    state->rearm_count++;
+    /* The manager refuses (NOT_FINISHED) while an attach/enumeration is
+     * active and only power-cycles a disconnected root, so an unplugged
+     * controller just gets a fresh port; a stuck root is recovered. */
+    const esp_err_t rc = usb_host_manager_request_recovery(
+        state->recovery_root, USB_HOST_RECOVERY_REASON_ENUMERATION);
+    ESP_LOGW(TAG, "recovery: no controller on root %u %u ms after unplug; "
+                  "re-arm #%u: %s",
+             (unsigned)state->recovery_root,
+             (unsigned)ticks_to_ms(now - state->detached_at),
+             (unsigned)state->rearm_count, esp_err_to_name(rc));
 }
 
 static void controller_task(void *arg)
@@ -626,12 +866,13 @@ static void controller_task(void *arg)
         }
         if (!s_state.opened) {
             submit_deferred_controller_recovery(&s_state);
+            rearm_root_if_silent(&s_state);
         }
         controller_usb_audio_stream_stats_t audio_stats = {0};
         controller_usb_audio_stream_get_stats(&audio_stats);
         if (s_state.opened && s_state.identity.usb_audio_active &&
             audio_stats.faulted) {
-            begin_controller_fault_recovery(&s_state, "FLX4 UAC stream",
+            begin_controller_fault_recovery(&s_state, "UAC stream",
                                              ESP_FAIL);
             close_step(&s_state);
             continue;
@@ -667,6 +908,7 @@ esp_err_t controller_usb_host_init(const controller_usb_host_config_t *config)
     }
 
     memset(&s_state, 0, sizeof(s_state));
+    s_state.recovery_root = CONTROLLER_ROOT_UNKNOWN;
     controller_usb_recovery_gate_init(&s_state.recovery_gate);
     s_state.config = *config;
     s_state.out_queue = xQueueCreate(config->midi_out_queue_depth,
@@ -818,6 +1060,14 @@ esp_err_t controller_usb_host_write_audio(const int16_t *master_samples,
 {
     return controller_usb_audio_stream_write(
         master_samples, headphone_samples, frame_count, source_sample_rate);
+}
+
+bool controller_usb_host_audio_pace_ready(size_t frame_count,
+                                         uint32_t source_sample_rate,
+                                         bool *ready)
+{
+    return controller_usb_audio_stream_pace_ready(frame_count,
+                                                  source_sample_rate, ready);
 }
 
 void controller_usb_host_get_audio_stats(

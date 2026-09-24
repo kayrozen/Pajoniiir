@@ -2,6 +2,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -118,6 +119,9 @@ esp_err_t controller_usb_host_write_audio(const int16_t *master_samples,
                                           const int16_t *headphone_samples,
                                           size_t frame_count,
                                           uint32_t source_sample_rate);
+bool controller_usb_host_audio_pace_ready(size_t frame_count,
+                                         uint32_t source_sample_rate,
+                                         bool *ready);
 void controller_usb_host_get_audio_stats(
     controller_usb_host_audio_stats_t *stats_out);
 

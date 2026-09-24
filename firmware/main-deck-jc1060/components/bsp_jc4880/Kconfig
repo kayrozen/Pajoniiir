@@ -1,0 +1,23 @@
+menu "Pajoniiir JC1060 BSP (jc4880 shim)"
+
+config BSP_PCM5102A_MAIN_OUT
+    bool "Enable PCM5102A main I2S output"
+    default y
+    help
+        Upstream M2.2 gate (audio_engine.c): when enabled the engine takes
+        bsp_audio_get_main_i2s_tx() and writes MAIN to the external PCM5102A
+        DAC. Without it the main sink is a stub returning
+        ESP_ERR_NOT_SUPPORTED and playback cannot pace.
+
+config PAJ_MAIN_OUT_USB
+    bool "Route MAIN output to the DDJ UAC sink instead of the PCM5102A"
+    default n
+    help
+        When enabled the audio engine still pushes master+phones to the
+        DDJ-FLX4 over UAC (4-channel), but the PCM5102A I2S MAIN path is
+        withheld (bsp_audio_get_main_i2s_tx() returns NULL). When disabled,
+        MAIN plays on the PCM5102A RCA output exactly like upstream M2.2.
+        Headphone cue always goes through the DDJ UAC path; the onboard
+        ES8311 codec is not used.
+
+endmenu

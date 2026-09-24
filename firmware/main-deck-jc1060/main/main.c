@@ -16,6 +16,7 @@
 
 #include "bsp/board.h"
 #include "bsp/display.h"
+#include "ddj_tone.h"
 #include "log_screen.h"
 #include "bsp/touch.h"
 #include "bsp/audio.h"
@@ -151,6 +152,10 @@ void app_main(void)
      * p4_local_controller flow (manager ready -> controller_usb_host_init).
      * Profile/runtime layers not ported yet: MIDI/connection logged. */
     controller_bootstrap_start();
+
+    /* v179: DDJ-400 UAC bring-up tone - 440 Hz master / 880 Hz phones.
+     * Writes into the UAC ring; retries harmlessly while no stream is up. */
+    ddj_tone_start();
 
     /* v149 J0 spike: usb_storage DISABLED (it would install a second host
      * lib). usb_spike owns BOTH ports in ONE usb_host_install(BIT0|BIT1)

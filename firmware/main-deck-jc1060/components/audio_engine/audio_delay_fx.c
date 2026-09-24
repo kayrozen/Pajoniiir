@@ -1,0 +1,199 @@
+#include "audio_delay_fx.h"
+
+#include <string.h>
+
+/* 2*pi*4.5 kHz — cutoff of the one-pole damping filter in the feedback path.
+ * Each repeat passes through it once, so the echo darkens per generation
+ * (tape-style) instead of repeating at full bandwidth. */
+#define AUDIO_DELAY_FX_DAMP_OMEGA 28274u
+/* How long the tail keeps ringing after the effect is switched off. */
+#define AUDIO_DELAY_FX_TAIL_SECONDS 2u
+/* Gain ramps move 1/64th of the remaining distance per frame (~1.5 ms
+ * time constant at 44.1 kHz). */
+#define AUDIO_DELAY_FX_SMOOTH_SHIFT 6
+static float q15_mul_float(float sample, uint16_t gain_q15)
+{
+    return sample * ((float)gain_q15 / 32768.0f);
+}
+
+static uint16_t smooth_q15(uint16_t current, uint16_t target)
+{
+    int32_t delta = (int32_t)target - (int32_t)current;
+    int32_t step = delta / (1 << AUDIO_DELAY_FX_SMOOTH_SHIFT);
+    if (step == 0 && delta != 0) {
+        step = delta > 0 ? 1 : -1;
+    }
+    return (uint16_t)((int32_t)current + step);
+}
+
+void audio_delay_fx_init(audio_delay_fx_t *fx,
+                         float *left,
+                         float *right,
+                         uint32_t capacity_frames,
+                         uint32_t sample_rate)
+{
+    if (!fx) return;
+    memset(fx, 0, sizeof(*fx));
+    fx->left = left;
+    fx->right = right;
+    fx->capacity_frames = capacity_frames;
+    fx->sample_rate = sample_rate;
+    fx->allocated = left && right && capacity_frames > 1u && sample_rate > 0u;
+    audio_delay_fx_reset(fx);
+}
+
+void audio_delay_fx_reset(audio_delay_fx_t *fx)
+{
+    if (!fx) return;
+    fx->write_index = 0;
+    fx->fb_lp[0] = 0;
+    fx->fb_lp[1] = 0;
+    fx->wet_cur_q15 = 0;
+    fx->feedback_cur_q15 = 0;
+    fx->tail_frames_remaining = 0;
+    if (fx->left && fx->capacity_frames > 0u) {
+        memset(fx->left, 0, fx->capacity_frames * sizeof(fx->left[0]));
+    }
+    if (fx->right && fx->capacity_frames > 0u) {
+        memset(fx->right, 0, fx->capacity_frames * sizeof(fx->right[0]));
+    }
+}
+
+void audio_delay_fx_configure(audio_delay_fx_t *fx, const audio_delay_fx_config_t *config)
+{
+    if (!fx || !config) return;
+    bool was_enabled = fx->config.enabled;
+    bool was_ringing = fx->tail_frames_remaining > 0u;
+    audio_delay_fx_mode_t previous_mode = fx->config.mode;
+    audio_delay_fx_config_t next = *config;
+    if (next.mode != AUDIO_DELAY_FX_MODE_ECHO &&
+        next.mode != AUDIO_DELAY_FX_MODE_DELAY) {
+        next.mode = AUDIO_DELAY_FX_MODE_ECHO;
+    }
+    if (next.wet_q15 > 32767u) next.wet_q15 = 32767u;
+    if (next.feedback_q15 > 24576u) next.feedback_q15 = 24576u;
+    if (next.mode == AUDIO_DELAY_FX_MODE_DELAY) {
+        /* DELAY is a single full-band tap; ECHO owns the damped feedback
+         * behaviour.  Enforce that distinction inside the DSP as well as at
+         * the audio-engine API boundary. */
+        next.feedback_q15 = 0u;
+    }
+
+    if (!next.enabled && (was_enabled || was_ringing)) {
+        /* The tail belongs to the configuration that filled the line. Control
+         * changes can publish another disabled command while it is ringing
+         * (for example after changing target, beat or depth); do not let that
+         * command retime or recolour an already buffered ECHO/DELAY tail. */
+        next.mode = fx->config.mode;
+        next.delay_ms = fx->config.delay_ms;
+        next.wet_q15 = fx->config.wet_q15;
+        next.feedback_q15 = fx->config.feedback_q15;
+    }
+
+    if (next.enabled && (!was_enabled || next.mode != previous_mode)) {
+        /* Fresh engage: drop any stale tail and start the gains at their
+         * targets. A live ECHO/DELAY mode change also resets the shared line
+         * so old feedback cannot leak into a one-shot delay (or vice versa). */
+        audio_delay_fx_reset(fx);
+        fx->wet_cur_q15 = next.wet_q15;
+        fx->feedback_cur_q15 = next.feedback_q15;
+    } else if (!next.enabled && was_enabled && fx->allocated) {
+        /* Switch-off: ECHO keeps its bounded feedback tail. DELAY only needs
+         * enough processing for the one pending tap to leave the line. */
+        fx->tail_frames_remaining = previous_mode == AUDIO_DELAY_FX_MODE_DELAY
+            ? fx->delay_frames
+            : fx->sample_rate * AUDIO_DELAY_FX_TAIL_SECONDS;
+    }
+
+    fx->config = next;
+
+    uint64_t frames = ((uint64_t)fx->sample_rate * (uint64_t)fx->config.delay_ms + 999u) / 1000u;
+    if (frames < 1u) frames = 1u;
+    if (fx->capacity_frames > 0u && frames >= fx->capacity_frames) {
+        frames = fx->capacity_frames - 1u;
+    }
+    fx->delay_frames = (uint32_t)frames;
+
+    uint32_t fs = fx->sample_rate ? fx->sample_rate : 44100u;
+    fx->damp_alpha_q15 = (uint16_t)((32768u * AUDIO_DELAY_FX_DAMP_OMEGA) /
+                                    (AUDIO_DELAY_FX_DAMP_OMEGA + fs));
+}
+
+static float damp_feedback_sample(audio_delay_fx_t *fx, float delayed,
+                                  uint8_t channel)
+{
+    fx->fb_lp[channel] += (delayed - fx->fb_lp[channel]) *
+                          ((float)fx->damp_alpha_q15 / 32768.0f);
+    return fx->fb_lp[channel];
+}
+
+audio_dsp_frame_t audio_delay_fx_process_dsp_frame(audio_delay_fx_t *fx,
+                                                   audio_dsp_frame_t in)
+{
+    if (!fx || !fx->allocated || fx->delay_frames == 0u) {
+        return in;
+    }
+    bool active = fx->config.enabled;
+    bool ringing = fx->tail_frames_remaining > 0u;
+    if (!active && !ringing) {
+        return in;
+    }
+
+    fx->wet_cur_q15 = smooth_q15(fx->wet_cur_q15, fx->config.wet_q15);
+    fx->feedback_cur_q15 = smooth_q15(fx->feedback_cur_q15, fx->config.feedback_q15);
+
+    uint32_t read_index = fx->write_index >= fx->delay_frames
+        ? fx->write_index - fx->delay_frames
+        : fx->write_index + fx->capacity_frames - fx->delay_frames;
+    float delayed_l = fx->left[read_index];
+    float delayed_r = fx->right[read_index];
+
+    float out_l = in.left + q15_mul_float(delayed_l, fx->wet_cur_q15);
+    float out_r = in.right + q15_mul_float(delayed_r, fx->wet_cur_q15);
+
+    float fb_l = q15_mul_float(damp_feedback_sample(fx, delayed_l, 0),
+                               fx->feedback_cur_q15);
+    float fb_r = q15_mul_float(damp_feedback_sample(fx, delayed_r, 1),
+                               fx->feedback_cur_q15);
+    /* While ringing out, the input no longer feeds the line — only the
+     * damped feedback keeps circulating until the tail window closes. */
+    float write_l = active ? in.left + fb_l : fb_l;
+    float write_r = active ? in.right + fb_r : fb_r;
+    fx->left[fx->write_index] = write_l;
+    fx->right[fx->write_index] = write_r;
+    fx->write_index++;
+    if (fx->write_index >= fx->capacity_frames) {
+        fx->write_index = 0u;
+    }
+
+    if (!active && ringing) {
+        fx->tail_frames_remaining--;
+    }
+
+    return (audio_dsp_frame_t) {
+        .left = out_l,
+        .right = out_r,
+    };
+}
+
+audio_mixer_frame_t audio_delay_fx_process_frame(audio_delay_fx_t *fx,
+                                                 audio_mixer_frame_t in)
+{
+    return audio_mixer_pcm_from_dsp(audio_delay_fx_process_dsp_frame(
+        fx, audio_mixer_dsp_from_pcm(in, 1.0f)));
+}
+
+bool audio_delay_fx_is_allocated(const audio_delay_fx_t *fx)
+{
+    return fx && fx->allocated;
+}
+
+bool audio_delay_fx_is_ringing(const audio_delay_fx_t *fx)
+{
+    return fx && fx->tail_frames_remaining > 0u;
+}
+
+uint32_t audio_delay_fx_delay_ms(const audio_delay_fx_t *fx)
+{
+    return fx ? fx->config.delay_ms : 0u;
+}

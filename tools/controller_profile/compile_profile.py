@@ -29,6 +29,7 @@ MAX_INPUTS = 320        # CP_MAX_INPUTS
 MAX_OUTPUTS = 160       # CP_MAX_OUTPUTS
 MAX_PAIR_SLOTS = 40     # CP_MAX_PAIR_SLOTS
 MAX_PROFILE_SIZE = 16384  # CPM_MAX_PROFILE_SIZE
+MAX_INIT_SYSEX = 64       # CP_MAX_INIT_SYSEX (jc1060 parser)
 
 # control_link.h CTRL_TYPE_*
 TYPE_BUTTON = 0x01
@@ -357,6 +358,24 @@ def compile_outputs(outputs):
     return entries
 
 
+def compile_init_sysex(raw):
+    """Optional init_sysex: one complete SysEx message (F0 .. F7) sent to the
+    controller when the profile activates. Stored after the output entries;
+    its length goes in the formerly reserved header u16 at offset 30, so a
+    profile without init_sysex stays byte-identical to the previous format."""
+    if raw is None:
+        return b""
+    data = bytes(num(b) for b in raw)
+    if len(data) < 2 or data[0] != 0xF0 or data[-1] != 0xF7:
+        raise ValueError("init_sysex must start with 0xF0 and end with 0xF7")
+    if any(b > 0x7F for b in data[1:-1]):
+        raise ValueError("init_sysex payload bytes must be 0x00..0x7F")
+    if len(data) > MAX_INIT_SYSEX:
+        raise ValueError("init_sysex too long (%d > %d bytes)" %
+                         (len(data), MAX_INIT_SYSEX))
+    return data
+
+
 def compile_profile(profile):
     if profile.get("schema") != "p4-controller-profile-v1":
         raise ValueError("unsupported schema: %r" % profile.get("schema"))
@@ -382,13 +401,16 @@ def compile_profile(profile):
     if caps.get("pitch_14bit"):
         flags |= PF_PITCH_14BIT
 
+    init_sysex = compile_init_sysex(profile.get("init_sysex"))
+
     body = b"".join(e.pack() for e in entries)
     body += b"".join(o.pack() for o in outputs)
+    body += init_sysex
 
     profile_size = HEADER_SIZE + len(body)
     tail = struct.pack("<HHIHHBBH", num(profile["vid"]), num(profile["pid"]),
                        flags, len(entries), len(outputs), pair_slots,
-                       int(profile.get("decks", 2)), 0)
+                       int(profile.get("decks", 2)), len(init_sysex))
     if profile_size > MAX_PROFILE_SIZE:
         raise ValueError("profile too large (%d > %d bytes)" %
                          (profile_size, MAX_PROFILE_SIZE))
@@ -403,7 +425,7 @@ def dump(blob):
     if blob[:4] != S3CP_MAGIC:
         raise ValueError("bad magic")
     version, header_size, profile_size, crc = struct.unpack_from("<HHII", blob, 4)
-    vid, pid, flags, in_count, out_count, slots, decks, _ = \
+    vid, pid, flags, in_count, out_count, slots, decks, sysex_len = \
         struct.unpack_from("<HHIHHBBH", blob, 16)
     actual_crc = zlib.crc32(blob[16:profile_size]) & 0xFFFFFFFF
     print("S3CP v%d size=%d crc=0x%08X (%s)" %
@@ -437,6 +459,9 @@ def dump(blob):
                "cc " if kind == OUT_CC_VALUE else "note", status, data1,
                offv, onv, blinkv))
         off += OUTPUT_ENTRY_SIZE
+    if sysex_len:
+        print("  init_sysex[%d] %s" %
+              (sysex_len, " ".join("%02X" % b for b in blob[off:off + sysex_len])))
 
 
 def main():

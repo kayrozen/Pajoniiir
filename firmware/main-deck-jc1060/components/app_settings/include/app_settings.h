@@ -18,6 +18,8 @@ typedef struct {
     uint8_t cue_mode;       // 0 = stereo master, 1 = split mono (L=master, R=cue)
     uint8_t master_trim_preset; // 0 = 0 dB, 1 = -3 dB, 2 = -6 dB
     uint8_t wifi_remote;    // 0 = Wi-Fi remote off (default), 1 = on (SoftAP + web UI)
+    uint8_t main_out_usb;   // 0 = MAIN on PCM5102A I2S, 1 = MAIN routed to the DDJ UAC sink
+    uint8_t ui_blackout_play; // v204 test: 1 = skip all LVGL/UI work while any deck plays
 } app_settings_t;
 
 #define APP_SETTINGS_AUDIO_OUT_SPEAKER 0u
@@ -46,6 +48,11 @@ void app_settings_set_time_remain(uint8_t remain);
 void app_settings_set_cue_mode(uint8_t mode);
 void app_settings_set_master_trim_preset(uint8_t preset);
 void app_settings_set_wifi_remote(uint8_t on);
+// Select the MAIN output sink: 0 = PCM5102A I2S DAC, 1 = DDJ UAC (USB).
+void app_settings_set_main_out_usb(uint8_t on);
+// v204 play-crash test mode: 1 = the LVGL task stops ui_update() and
+// lv_timer_handler() while any deck plays (screen and touch freeze until PAUSE).
+void app_settings_set_ui_blackout_play(uint8_t on);
 
 /* ── Pull-OTA service network ─────────────────────────────────────────────
  *

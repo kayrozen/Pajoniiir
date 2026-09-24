@@ -46,11 +46,31 @@ esp_err_t controller_usb_audio_stream_start(
 void controller_usb_audio_stream_request_stop(bool device_gone);
 bool controller_usb_audio_stream_poll_cleanup(void);
 bool controller_usb_audio_stream_is_quiesced(void);
+/* v217 recovery diagnostics. Bitmask of what keeps poll_cleanup() from
+ * finishing (CONTROLLER_UAC_BLOCK_*), and a forced endpoint halt/flush for a
+ * stop that stalls with isochronous transfers still in flight, including
+ * after the device is gone. */
+#define CONTROLLER_UAC_BLOCK_CLAIMED        (1u << 0)
+#define CONTROLLER_UAC_BLOCK_CONTROL        (1u << 1)
+#define CONTROLLER_UAC_BLOCK_CONTROL_ACTIVE (1u << 2)
+#define CONTROLLER_UAC_BLOCK_ISOC_ACTIVE    (1u << 3)
+#define CONTROLLER_UAC_BLOCK_WRITE_ACTIVE   (1u << 4)
+#define CONTROLLER_UAC_BLOCK_STOPPING       (1u << 5)
+#define CONTROLLER_UAC_BLOCK_DEVICE_GONE    (1u << 6)
+uint32_t controller_usb_audio_stream_cleanup_blockers(void);
+void controller_usb_audio_stream_force_flush(void);
 
 esp_err_t controller_usb_audio_stream_write(const int16_t *master_samples,
                                             const int16_t *headphone_samples,
                                             size_t frame_count,
                                             uint32_t source_sample_rate);
+/* v216 consumer pacing: returns false when the stream is not accepting audio
+ * (caller keeps its own pacing). Otherwise *ready tells whether frame_count
+ * source frames fit in the ring now; the first call switches the stream to
+ * consumer-paced writes (no clocked dup/trim) until the next start. */
+bool controller_usb_audio_stream_pace_ready(size_t frame_count,
+                                           uint32_t source_sample_rate,
+                                           bool *ready);
 void controller_usb_audio_stream_get_stats(
     controller_usb_audio_stream_stats_t *out_stats);
 

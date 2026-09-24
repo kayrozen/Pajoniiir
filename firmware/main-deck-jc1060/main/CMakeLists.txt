@@ -1,23 +1,5 @@
-idf_component_register(SRCS "main.c" "usb_spike.c" "usb_tu_app.c" "eth_bringup.c" "wifi_console.c" "ota_update.c" "log_screen.c" "controller_bootstrap.c"
-                    EMBED_FILES "tone4ch.wav"
-                    INCLUDE_DIRS "."
-                    REQUIRES
-                        bsp_jc1060p470
-                        driver
-                        esp_lcd
-                        lvgl
-                        nvs_flash
-                        esp_wifi
-                        esp_eth
-                        esp_event
-                        app_update
-                        esp_https_ota
-                        tinyusb
-                        esp_hw_support
-                        esp_hosted
-                        usb
-                        hal
-                        soc
-                        usb_storage
-                        controller_usb_host
+idf_component_register(
+    SRCS "app_main.c" "tcm_heap_guard.c" "eth_bringup.c"
+    INCLUDE_DIRS "."
+    REQUIRES esp_eth p4_ota_pull control_link deck_core bsp_jc4880 library audio_engine audio_recorder ui usb_storage app_settings media_io_gate wifi_link web_server service_log controller_profile_manager p4_local_controller log freertos firmware_health p4_ota
 )

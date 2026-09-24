@@ -155,6 +155,15 @@ LED names mirror `control_link.h`: `cue`, `play`, `pfl`, `vu_meter`,
 `hot_cue_pads`, `pad_fx1_pads`, `pad_fx2_pads`, `beat_jump_pads`,
 `beat_loop_pads`, `beat_jump_shift_helpers`.
 
+### Optional `init_sysex`
+
+`"init_sysex": [240, 0, 64, 5, 0, 0, 2, 6, 0, 3, 1, 247]` — one complete
+SysEx message (first byte `0xF0`, last `0xF7`, payload `0x00..0x7F`, at most
+64 bytes) that the JC1060 P4 sends to the controller when the profile
+activates, before the first LED snapshot. Omit it when the controller needs
+no init message; the compiled blob is then byte-identical to the previous
+format.
+
 ## profile.s3bin (S3CP v2)
 
 Version 2 invalidates older binaries whose numeric LED vocabulary can alias
@@ -181,9 +190,12 @@ bytes from offset 16 to the end of the file.
 | 26 | 2 | output_count |
 | 28 | 1 | pair_slot_count |
 | 29 | 1 | decks |
-| 30 | 2 | reserved (0) |
+| 30 | 2 | init_sysex_len (0 = none; was reserved) |
 
-Input entries follow the header; output entries follow the inputs.
+Input entries follow the header; output entries follow the inputs; the
+`init_sysex_len` SysEx bytes follow the outputs. Only the JC1060 parser and
+profile manager accept a non-zero `init_sysex_len`; the S3 and main-deck-p4
+copies still reject such a profile on size.
 
 ### Input entry — 16 bytes
 

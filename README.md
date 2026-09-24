@@ -7,8 +7,9 @@ performance.
 
 Canonical repository: `https://github.com/dvucinozd/Pajoniiir.git`. The former
 `dvucinozd/ESP32-DDJ-FLX4` URL is deprecated and retained only as a GitHub
-redirect. The branch inventory was audited on 2026-07-26; only `master`
-remains locally and on `origin`.
+redirect. A branch audit on 2026-07-26 cleaned up all helper branches, and the
+active development now lives on the `codex/ddj400-jc1060-integration` branch
+(local and on `origin`); `master` remains the stable release baseline.
 
 ![Pajoniiir](docs/images/122.jpg)
 
@@ -67,9 +68,8 @@ layer. The detailed ownership and data flow are documented in
   classic RIFF/WAVE PCM16 mono/stereo.
 - FLX4 transport, jog/vinyl scratch, tempo and Master Tempo, mixer/EQ,
   headphone cue, hot cues, loops, beat jump/sync, Pad FX and Beat FX control.
-  Beat FX Filter and Echo have recorded hardware acceptance; Flanger and the
-  new one-shot Delay are software-tested and deployed, with focused physical
-  audio/routing smoke still pending.
+  All Beat FX (Filter, Echo, Flanger and the one-shot Delay) have recorded
+  hardware acceptance (2026-07-24).
 - Simultaneous PCM5102A RCA MAIN output and FLX4 USB headphone cue.
 - P4-owned FLX4 LED feedback with reconnect and board-reboot resynchronization.
 - LVGL Overview, Library (paginated 8-row table with PREV/NEXT), Hot Cues and
@@ -83,20 +83,24 @@ layer. The detailed ownership and data flow are documented in
 
 ## Upcoming Targets
 
-The following integrations are **work in progress** (uncommitted):
+The following integration runs on the active
+`codex/ddj400-jc1060-integration` branch (committed):
 
-- **Pioneer DDJ-400**: MIDI-CI parser with full mapping for transport, 6 hot
-  cues (A-F), jog, pitch, EQ/filter, manual loop, beat jump, 13 Pad FX and
-  Beat FX. Differs from the FLX4 in having 6 hot cues instead of 8, no LCD, no
-  Smart CFX and dedicated physical loop buttons. See
-  `controllers/pioneer_ddj_400/`.
-- **Guition JC1060P470C 7" display**: new ESP32-P4 target with JD9165
-  MIPI-DSI 1024x600 panel, GT911 capacitive touch and ES8311 audio codec.
-  Hardware bring-up COMPLETE on hardware (v117, ESP-IDF 6.0.2): display
-  colours (v69 INVOFF fix), clean audio (v57 DMA2D fix), USB host DDJ via
-  TinyUSB, and Ethernet (RMII + IP101GR, DHCP working, TCP debug console
-  :2333). Wi-Fi (ESP32-C6 via esp_hosted) parked under IDF 6.0.2 - reference
-  plan on IDF 5.5.5. LVGL UI porting is in progress. See
+- **Pioneer DDJ-400 on the JC1060 target**: controller support via a
+  data-driven profile compiled from the Mixxx FLX4 mapping XML (which is
+  "based on DDJ-400 mapping"); the profile is installed as
+  `/sd/controllers/pioneer_ddj_400/profile.s3bin` using
+  `tools/controller_profile/compile_profile.py` and was confirmed on a real
+  DDJ-400 through HIL testing. The earlier `MIDI_MAP_RESEARCH.md` /
+  `ddj400_midi_ci` research is **invalid** (invented addresses) and is kept
+  only as an archived warning. MIDI, LED and UAC audio paths run through the
+  same `controller_*` components as the FLX4.
+- **JC4880P443C_I_W / JC1060 7" display** ESP32-P4 target: hardware bring-up
+  COMPLETE (display, touch, Ethernet, USB host). Since then: USB MSC media
+  mounting with hub-port routing (v160-v169), end-to-end pull OTA over
+  Ethernet (v126) with flicker-free PSRAM XIP (v142-v147), and a working
+  USB-audio (UAC) path to the DDJ-400 (44.1 kHz, 4-channel, 24-bit, hot DSP
+  code relocated to internal RAM, v211-v215). See
   [`firmware/main-deck-jc1060/BRING_UP_GUIDE.md`](firmware/main-deck-jc1060/BRING_UP_GUIDE.md)
   and [`docs/recherche/eth-jc1060p470-phy-is-busy.md`](docs/recherche/eth-jc1060p470-phy-is-busy.md).
 
@@ -121,30 +125,34 @@ The Hot Cues tab is implemented but does not yet have an archived screenshot.
 ```text
 controllers/                 Compiled and source controller profiles
   pioneer_ddj_flx4/          DDJ-FLX4 profile (production, hardware-verified)
-  pioneer_ddj_400/           DDJ-400 MIDI-CI parser and mapping research (WIP)
+  pioneer_ddj_400/           DDJ-400 profile (SD-deployed, HIL-verified; older
+                             MIDI-CI research documents are invalid)
   hercules_djcontrol_inpulse_500/  Hercules Inpulse 500 profile (host-qualified)
   generic_midi_ci/           Generic profile path for host testing
 firmware/
   control-board-s3/          ESP32-S3 host/translator/audio-bridge firmware
   main-deck-p4/              ESP32-P4 playback/audio/UI firmware (JC4880 4.3")
-  main-deck-jc1060/          ESP32-P4 target for JC1060P470 7" 1024x600 (WIP)
+  main-deck-jc1060/          ESP32-P4 target for JC1060 7" 1024x600 (DDJ-400
+                             integration branch)
   common/                    Shared firmware components
 docs/                        Product, protocol, validation and design records
 tests/                       PC-side regression tests
-tools/                       Profile compiler, OTA packager and support tools
+tools/                       HIL capture/build tools (hil.sh), profile
+                             compiler, OTA packager and support tools
 ```
 
 ## Build and Test
 
 Required baseline: **ESP-IDF v6.0.2** and its matching Espressif Python and
 toolchain environment. Host tests additionally require native GCC/Make and
-PowerShell 5.1 (ili noviji) na Windowsima, odnosno standardni shell na Linuxu.
+PowerShell 5.1 (or newer) on Windows, or a standard shell on Linux.
 
-A standard ESP-IDF installation can be initialized on Windows with:
+A standard ESP-IDF installation is initialized on Windows with the Espressif
+profile (v6.0.2 lives at `C:\Espressif\v6.0.2\esp-idf` — **not** under
+`frameworks\` or `.espressif\`):
 
 ```powershell
-$env:IDF_PATH = "C:\Espressif\frameworks\esp-idf-v6.0.2"
-. "$env:IDF_PATH\export.ps1"
+. C:\Espressif\tools\Microsoft.v6.0.2.PowerShell_profile.ps1
 ```
 
 Verify the selected environment before configuring either target:
@@ -194,6 +202,10 @@ Run the headless LVGL navigation and exact-framebuffer screenshot gate:
 ```powershell
 .\tests\ui_simulator\run_ui_simulator_e2e.ps1
 ```
+
+For hardware-in-the-loop work (serial capture, build, OTA serve) the repo
+ships `tools/hil.sh`; see its header and
+[Startup Checklist](docs/STARTUP_CHECKLIST.md) for the first-flash procedure.
 
 The first run fetches the pinned LVGL source into the ignored `.cache`
 directory. The gate covers Overview Deck 1/2 selection, Library, Hot Cues,

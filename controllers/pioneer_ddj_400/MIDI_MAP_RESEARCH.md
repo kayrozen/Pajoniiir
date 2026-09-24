@@ -1,5 +1,10 @@
 # Pioneer DDJ-400 - MIDI Mapping Research
 
+> **FAUX : ne pas utiliser.** Les VID/PID et les adresses de ce document sont
+> contredits par le vrai matériel (VID 0x2B73 / PID 0x0026, PLAY 0x90/0x0B,
+> 8 pads). La source correcte est la map Mixxx FLX4 : voir `README.md` et
+> `profile.json`.
+
 ## Sources Consultées
 - Mixxx Controller Mapping (open source)
 - Reaper/Traktor MIDI maps communautaires

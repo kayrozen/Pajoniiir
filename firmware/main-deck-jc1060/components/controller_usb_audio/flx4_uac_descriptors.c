@@ -11,6 +11,7 @@
 #define USB_SUBCLASS_AUDIOSTREAMING  0x02u
 
 #define UAC_AS_FORMAT_TYPE 0x02u
+#define UAC_FORMAT_TYPE_I  0x01u
 
 #define USB_EP_DIR_IN    0x80u
 #define USB_EP_XFER_MASK 0x03u
@@ -43,6 +44,10 @@ static bool format_has_rate(const flx4_uac_playback_format_t *fmt, uint32_t rate
     if (!fmt) {
         return false;
     }
+    if (fmt->sample_rate_continuous) {
+        return fmt->sample_rate_count == 2u &&
+               rate >= fmt->sample_rates[0] && rate <= fmt->sample_rates[1];
+    }
     for (uint8_t i = 0; i < fmt->sample_rate_count; ++i) {
         if (fmt->sample_rates[i] == rate) {
             return true;
@@ -63,13 +68,16 @@ static uint32_t packet_bytes_for_rate(const flx4_uac_playback_format_t *fmt,
 
 static bool format_has_supported_packetization(const flx4_uac_playback_format_t *fmt)
 {
-    if (!fmt || fmt->bits_per_sample != 16u || fmt->bytes_per_sample != 2u ||
+    if (!fmt ||
+        !((fmt->bits_per_sample == 16u && fmt->bytes_per_sample == 2u) ||
+          (fmt->bits_per_sample == 24u && fmt->bytes_per_sample == 3u)) ||
         (fmt->channels != 2u && fmt->channels != 4u)) {
         return false;
     }
-    for (uint8_t i = 0; i < fmt->sample_rate_count; ++i) {
-        const uint32_t rate = fmt->sample_rates[i];
-        if ((rate == 44100u || rate == 48000u) &&
+    static const uint32_t rates[] = { 44100u, 48000u };
+    for (size_t i = 0; i < sizeof(rates) / sizeof(rates[0]); ++i) {
+        const uint32_t rate = rates[i];
+        if (format_has_rate(fmt, rate) &&
             packet_bytes_for_rate(fmt, rate) <= fmt->max_packet_size) {
             return true;
         }
@@ -138,15 +146,32 @@ bool flx4_uac_parse_playback_formats(const uint8_t *config_desc,
                 current.alternate_setting = config_desc[off + 3u];
             }
         } else if (in_audio_streaming_alt && type == USB_DESC_TYPE_CS_INTERFACE && len >= 8u) {
+            /* UAC1 Type I format descriptor (Frmts 2.2.5): bFormatType @3,
+             * bNrChannels @4, bSubframeSize @5, bBitResolution @6,
+             * bSamFreqType @7, rates @8. Only the first Type I descriptor of
+             * an alt setting counts; Type II/III use a different layout and
+             * a malformed width leaves the alt incomplete (never streamed)
+             * rather than guessed. */
             const uint8_t subtype = config_desc[off + 2u];
-            if (subtype == UAC_AS_FORMAT_TYPE) {
-                current.channels = config_desc[off + 4u];
-                current.bytes_per_sample = config_desc[off + 5u];
-                current.bits_per_sample = config_desc[off + 6u];
+            if (subtype == UAC_AS_FORMAT_TYPE &&
+                config_desc[off + 3u] == UAC_FORMAT_TYPE_I &&
+                current.channels == 0u) {
+                const uint8_t subframe = config_desc[off + 5u];
+                const uint8_t resolution = config_desc[off + 6u];
+                if (subframe >= 1u && subframe <= 4u && resolution != 0u &&
+                    resolution <= (uint8_t)(subframe * 8u)) {
+                    current.channels = config_desc[off + 4u];
+                    current.bytes_per_sample = subframe;
+                    current.bits_per_sample = resolution;
+                }
 
                 const uint8_t rate_count = config_desc[off + 7u];
-                const size_t rate_bytes = (size_t)rate_count * 3u;
-                if (rate_count != 0u && len >= 8u + rate_bytes) {
+                if (rate_count == 0u && len >= 14u) {
+                    current.sample_rate_continuous = true;
+                    (void)add_rate(&current, rd24(&config_desc[off + 8u]));
+                    (void)add_rate(&current, rd24(&config_desc[off + 11u]));
+                } else if (rate_count != 0u &&
+                           len >= 8u + (size_t)rate_count * 3u) {
                     for (uint8_t i = 0; i < rate_count; ++i) {
                         (void)add_rate(&current, rd24(&config_desc[off + 8u + ((size_t)i * 3u)]));
                     }
@@ -158,6 +183,11 @@ bool flx4_uac_parse_playback_formats(const uint8_t *config_desc,
             if ((ep & USB_EP_DIR_IN) == 0u && transfer_type == USB_EP_XFER_ISOC) {
                 current.endpoint_addr = ep;
                 current.max_packet_size = rd16(&config_desc[off + 4u]);
+                current.endpoint_attributes = config_desc[off + 3u];
+                current.sync_address = len >= 9u ? config_desc[off + 8u] : 0u;
+            } else if ((ep & USB_EP_DIR_IN) != 0u &&
+                       transfer_type == USB_EP_XFER_ISOC) {
+                current.in_endpoint_addr = ep;
             }
         }
 

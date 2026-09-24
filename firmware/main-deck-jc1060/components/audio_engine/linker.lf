@@ -1,0 +1,22 @@
+# v206: keep the per-frame audio DSP out of PSRAM. With
+# CONFIG_SPIRAM_XIP_FROM_PSRAM all .text runs from PSRAM via the shared L2
+# cache; the output task's mix loop stalled on instruction fetch (~40k
+# cycles/frame, interrupts masked). noflash = .text in IRAM, .rodata in DRAM.
+# ~19 KB total. ae_output_task and its per-frame callbacks are IRAM_ATTR
+# (AE_RT_ATTR) in audio_engine.c.
+[mapping:audio_engine_rt]
+archive: libaudio_engine.a
+entries:
+    audio_output_mixer (noflash)
+    audio_mixer (noflash)
+    audio_resampler (noflash)
+    audio_eq (noflash)
+    audio_filter (noflash)
+    audio_smart_cfx (noflash)
+    audio_pad_fx (noflash)
+    audio_delay_fx (noflash)
+    audio_flanger_fx (noflash)
+    audio_keylock (noflash)
+    audio_scratch (noflash)
+    audio_pcm_timeline (noflash)
+    audio_pcm_ring (noflash)

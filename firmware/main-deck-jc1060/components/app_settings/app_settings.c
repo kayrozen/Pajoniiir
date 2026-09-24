@@ -32,6 +32,8 @@ static portMUX_TYPE s_cfg_mux = portMUX_INITIALIZER_UNLOCKED;
     .cue_mode      = 0,                          \
     .master_trim_preset = 0,                     \
     .wifi_remote   = 0,                          \
+    .main_out_usb  = 1,                          \
+    .ui_blackout_play = 0,                       \
 }
 
 static app_settings_t s_cfg = {
@@ -41,6 +43,8 @@ static app_settings_t s_cfg = {
     .cue_mode      = 0,
     .master_trim_preset = 0,
     .wifi_remote   = 0,
+    .main_out_usb  = 1,
+    .ui_blackout_play = 0,
 };
 
 static char s_ota_ssid[APP_SETTINGS_OTA_SSID_CAP];
@@ -167,6 +171,8 @@ esp_err_t app_settings_init(void)
         if (nvs_get_u8(handle, "cue_mode", &value) == ESP_OK && value <= 1) next.cue_mode = value;
         if (nvs_get_u8(handle, "master_trim", &value) == ESP_OK && value <= 2) next.master_trim_preset = value;
         if (nvs_get_u8(handle, "wifi_rem", &value) == ESP_OK && value <= 1) next.wifi_remote = value;
+        if (nvs_get_u8(handle, "main_usb", &value) == ESP_OK && value <= 1) next.main_out_usb = value;
+        if (nvs_get_u8(handle, "ui_blk", &value) == ESP_OK && value <= 1) next.ui_blackout_play = value;
         load_ota_config(handle, ota_ssid, ota_pass, ota_url);
 
         uint8_t stored_schema = 0u;
@@ -221,6 +227,8 @@ DEFINE_U8_SETTER(app_settings_set_time_remain, time_remain, "time_rem", (void)0)
 DEFINE_U8_SETTER(app_settings_set_cue_mode, cue_mode, "cue_mode", if (value > 1) value = 0)
 DEFINE_U8_SETTER(app_settings_set_master_trim_preset, master_trim_preset, "master_trim", if (value > 2) value = 0)
 DEFINE_U8_SETTER(app_settings_set_wifi_remote, wifi_remote, "wifi_rem", value = value ? 1 : 0)
+DEFINE_U8_SETTER(app_settings_set_main_out_usb, main_out_usb, "main_usb", value = value ? 1 : 0)
+DEFINE_U8_SETTER(app_settings_set_ui_blackout_play, ui_blackout_play, "ui_blk", value = value ? 1 : 0)
 
 /* ── Backlight: live now, persisted once the slider settles ──────────────── *
  *

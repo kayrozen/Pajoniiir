@@ -1,146 +1,144 @@
-# SDK Configuration defaults for JC1060P470C_I_W_Y draw-bit bring-up example
-
-# Target ESP32-P4
+# === upstream M2.2 defaults (base) ===
 CONFIG_IDF_TARGET="esp32p4"
-
-# Production board uses pre-v3 silicon
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+CONFIG_ESP32P4_REV_MIN_FULL=100
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+CONFIG_FREERTOS_HZ=1000
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+CONFIG_LOG_DEFAULT_LEVEL=2
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MODE_HEX=y
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_SPIRAM_FETCH_INSTRUCTIONS=y
+CONFIG_SPIRAM_RODATA=y
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y
+CONFIG_SPIRAM_FLASH_LOAD_TO_PSRAM=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=256
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+CONFIG_USB_HOST_HUBS_SUPPORTED=y
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_MAX_LFN=255
+CONFIG_FATFS_API_ENCODING_UTF_8=y
+CONFIG_LV_COLOR_DEPTH_16=y
+CONFIG_LV_FONT_MONTSERRAT_12=y
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_16=y
+CONFIG_LV_FONT_MONTSERRAT_18=y
+CONFIG_LV_FONT_MONTSERRAT_24=y
+CONFIG_LV_FONT_MONTSERRAT_28=y
+CONFIG_LV_USE_CLIB_MALLOC=y
+CONFIG_SLAVE_IDF_TARGET_ESP32C6=y
+CONFIG_ESP_HOSTED_CP_TARGET_ESP32C6=y
+CONFIG_ESP_HOSTED_P4_DEV_BOARD_FUNC_BOARD=y
+CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
+CONFIG_ESP_HOSTED_SDIO_SLOT_1=y
+CONFIG_ESP_HOSTED_SDIO_4_BIT_BUS=y
+CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y
+CONFIG_WIFI_RMT_ENABLE_WPA3_SAE=y
+CONFIG_WIFI_RMT_SOFTAP_SAE_SUPPORT=y
+CONFIG_WIFI_RMT_STATIC_RX_BUFFER_NUM=16
+CONFIG_WIFI_RMT_DYNAMIC_RX_BUFFER_NUM=64
+CONFIG_WIFI_RMT_DYNAMIC_TX_BUFFER_NUM=64
+CONFIG_WIFI_RMT_AMPDU_TX_ENABLED=y
+CONFIG_WIFI_RMT_TX_BA_WIN=32
+CONFIG_WIFI_RMT_AMPDU_RX_ENABLED=y
+CONFIG_WIFI_RMT_RX_BA_WIN=32
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65534
+CONFIG_LWIP_TCP_WND_DEFAULT=65534
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=64
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=64
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
+CONFIG_LWIP_TCP_SACK_OUT=y
+CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=512
+CONFIG_BSP_PCM5102A_MAIN_OUT=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_22=y
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_CHECK_BOOT=y
+CONFIG_ESP_COREDUMP_MAX_TASKS_NUM=8
+CONFIG_ESP_COREDUMP_LOGS=n
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_LOG_MAXIMUM_LEVEL_INFO=y
+CONFIG_AUDIO_SCRATCH_ENABLED=y
+# === JC1060 fork overrides ===
+CONFIG_IDF_TARGET="esp32p4"
 CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
 CONFIG_ESP32P4_REV_MIN_100=y
 CONFIG_ESP32P4_REV_MIN_FULL=100
 CONFIG_IDF_EXPERIMENTAL_FEATURES=y
-
-# 16MB octal PSRAM in HEX mode (needed for the DPI framebuffer ~1.2 MB)
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MODE_HEX=y
 CONFIG_SPIRAM_SPEED_200M=y
 CONFIG_SPIRAM_SIZE_OVERRIDE=16
-
-# Cache-writeback C2M ops (DSI framebuffer flush) run inside a critical
-# section with interrupts disabled - for 400KB..1.2MB that is 0.6..2.5 ms
-# with the USB DWC2 ISR masked, which makes the periodic channel miss its
-# SOF window (silent iso interval skip = audible glitch). Chunking lets
-# interrupts breathe between chunks.
 CONFIG_ESP_MM_CACHE_MSYNC_C2M_CHUNKED_OPS=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
-# v71 tried 20 MHz (EspControl value) - C6 SDIO timeouts 0x107 -> boot loop.
-# 40 MHz is the stable value on this board.
 CONFIG_ESP_HOSTED_SDIO_CLOCK_FREQ_KHZ=40000
-# v84: the ESPHome C6 slave (2.12.12) has the CustomRpc ESP-NOW overlay
-# compiled in and emits peer-data traffic; without these host options the
-# RX stream desyncs ("Dropping packet(s) from stream") and RPCs hang.
-# Exact values from esphome/components/esp32_hosted/__init__.py.
 CONFIG_ESP_HOSTED_ENABLE_PEER_DATA_TRANSFER=y
 CONFIG_ESP_HOSTED_MAX_CUSTOM_MSG_HANDLERS=8
-# v75: C6 2.12.12 firmware boots slower than 2.3.0 - 5 s init timeout made
-# esp_hosted abort ("Resetting myself") and boot-loop the board.
 CONFIG_ESP_HOSTED_HOST_RESTART_NO_COMMUNICATION_WITH_SLAVE_TIMEOUT=20
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
-
-# Audio codec support (includes ES8311 device in esp_codec_dev)
 CONFIG_CODEC_ES8311_SUPPORT=y
-
-# USB host: allow hubs (DDJ-400 + USB mass storage behind one powered hub)
 CONFIG_USB_HOST_HUBS_SUPPORTED=y
-# DDJ-400 is a composite audio+MIDI+HID device: its config descriptor
-# exceeds the 256-byte default enum buffer. Raise the control transfer
-# buffer so it enumerates.
 CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1024
-
-# ESP-Hosted: Wi-Fi/BT via the on-board ESP32-C6 (SDIO slot 1: D0-3=14-17,
-# CLK=18, CMD=19 - same pinout as the P4 Function EV board). C6 reset on
-# GPIO54, CHIP_PU active-high -> reset line asserted when low.
 CONFIG_ESP_HOSTED_CP_TARGET_ESP32C6=y
 CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
 CONFIG_ESP_HOSTED_P4_DEV_BOARD_FUNC_BOARD=y
 CONFIG_ESP_HOSTED_SDIO_RESET_GPIO=54
-# v84: EspControl uses active_high: true for this board's reset (GPIO54) -
-# "High->Low->High triggers reset" (CHIP_PU ends HIGH = C6 enabled).
 CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_HIGH=y
-# C6 boots in parallel with the P4 (released from reset at board init) and is
-# ready well before esp_wifi_init - do not re-reset it there, or the 1.5 s
-# card-init window closes before the C6 finishes booting.
 CONFIG_ESP_HOSTED_SLAVE_RESET_ONLY_IF_NECESSARY=y
-# v81 tried RX_NONE (per-packet) -> boot loop. Streaming (default) is the
-# only mode that boots with the ESPHome C6 2.12.12 slave; the RX drops and
-# RPC hangs under it remain under investigation.
 CONFIG_ESP_HOSTED_SDIO_OPTIMIZATION_RX_STREAMING_MODE=y
-# v87 (V4): mempool SRAM = assert sdio_mempool_create (documented failure:
-# our app needs the PSRAM mempool, unlike the light EspControl image).
 CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y
-# v88 (V2): packet stats to prove/disprove the RX stall signature (#243:
-# s2h in frozen while h2s out ok progresses).
 CONFIG_ESP_HOSTED_PKT_STATS=y
 CONFIG_ESP_HOSTED_PKT_STATS_INTERVAL_SEC=2
-# v104 A/B: test with default 100 Hz tick (the working vendor example runs at
-# 100 Hz tick during the v104 A/B test; restored to 1000 Hz in v106
 CONFIG_FREERTOS_HZ=1000
-# v99: 16 KB - the main task runs UI/log/console/ETH bring-up (main-deck-p4
-# documents the same 16 KB; 3584 overflowed with the vprintf tees + MDIO scan
-# and corrupted the EMAC handle -> Load access fault in esp_eth_driver_install).
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
-# v131: UART0 on the MX1.25 4P debug connector (GPIO37/38) as primary
-# console, USB_SERIAL_JTAG kept as secondary - both ports output the log.
-# v132: REVERTED to the USB_SERIAL_JTAG primary console - flashing safety
-# first. UART0 (GPIO37/38) is served by an additive vprintf tee instead
-# (log_screen.c dbg_uart), no Kconfig console change involved.
-# CONFIG_ESP_CONSOLE_UART_CUSTOM is not set (v132: vprintf tee instead)
-# CONFIG_ESP_CONSOLE_UART_TX_GPIO=37
-# CONFIG_ESP_CONSOLE_UART_RX_GPIO=38
 CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
 CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
-
-# FatFS: LFN required by the vendored fatfs component (blk_ofs in FF_DIR);
-# a bare regenerate picks LFN_NONE and breaks the build (v131).
 CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_API_ENCODING_UTF_8=y
-
-# OTA: dual-slot with rollback - new image must prove itself (30 s uptime)
-# before being marked valid, else bootloader falls back to the other slot.
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
-# OTA LAN bring-up: allow plain HTTP (production uses signed HTTPS)
 CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y
-
-# Compiler: PERF like the production deck firmware (real-time audio + LVGL
-# concurrently; debug optimization leaves too little headroom).
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
-
-# Log level WARN: ESP_LOGI in the audio/USB path costs latency.
-# v78: MAXIMUM_LEVEL=3 (Info) so per-tag esp_log_level_set(TAG, INFO) can
-# raise wifi_console (scan diagnostics). DEFAULT stays Warn (2) - no global
-# log spam, audio performance unchanged (runtime per-tag level checks only).
 CONFIG_LOG_DEFAULT_LEVEL_WARN=y
 CONFIG_LOG_DEFAULT_LEVEL=2
 CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
-
-# Route the ROM/build console to USB-Serial-JTAG (same connector as flashing)
-# so the bring-up log is visible on the host USB port.
 CONFIG_ESP_SYSTEM_USE_FRAME_POINTER=y
 CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y
 CONFIG_BOOTLOADER_COMPILER_OPTIMIZATION_SIZE=y
 CONFIG_ESP_BROWNOUT_DET=n
-
-# v142: OTA download flickers the DSI panel - flash writes stall the MSPI.
-# Smaller write chunks + longer erase yields keep the DSI fed.
 CONFIG_SPI_FLASH_WRITE_CHUNK_SIZE=512
 CONFIG_SPI_FLASH_ERASE_YIELD_DURATION_MS=40
 CONFIG_SPI_FLASH_ERASE_YIELD_TICKS=2
-# v144: execute firmware from PSRAM - during flash writes (OTA) the code
-# and ISRs keep running from PSRAM instead of stalling on the suspended
-# flash cache; this was starving the MIPI-DSI DMA (screen flicker) and
-# throttling downloads 100x (4 kB/s vs 1 MB/s without flash writes).
 CONFIG_SPIRAM_XIP_FROM_PSRAM=y
-
-# v157: allow runtime DEBUG logs from the USB host stack (HCD/hub/USBH) -
-# with LOG_MAXIMUM_LEVEL=2 the port transitions were compiled out entirely.
 CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
-
-# v160: console moves to UART0 (GPIO37/38 tee already wired). USB_SERIAL_JTAG
-# must no longer claim PHY0 - the upstream manager needs the FS controller,
-# and BOOT-mode flashing stays available regardless of the console choice.
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=n
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 CONFIG_ESP_CONSOLE_UART_NUM=0
 CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+# === JC1060 v185b: upstream M2.2 early-boot options NOT valid on this board ===
+# (crash before first log line -> bootloader rollback to v184)
+# CONFIG_SPIRAM_FETCH_INSTRUCTIONS is not set
+# CONFIG_SPIRAM_RODATA is not set
+# CONFIG_SPIRAM_FLASH_LOAD_TO_PSRAM is not set
+# === v185c TEMP DEBUG: route console (ROM+bootloader+panic) to GPIO37/38 so
+# early-boot crashes of the v185 image are visible on the captured UART0.
+# Fork v131 proven config; revert after the v185 crash is diagnosed.
+CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+CONFIG_ESP_CONSOLE_UART_TX_GPIO=37
+CONFIG_ESP_CONSOLE_UART_RX_GPIO=38
+
+# v190: INFO logs for heap diagnostics
+CONFIG_LOG_DEFAULT_LEVEL=3
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=64

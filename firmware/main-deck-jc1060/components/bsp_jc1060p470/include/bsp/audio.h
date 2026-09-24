@@ -30,7 +30,7 @@ typedef struct {
  * @param config Audio configuration
  * @return ESP_OK on success
  */
-esp_err_t bsp_audio_init(const bsp_audio_config_t* config);
+esp_err_t bsp_audio_init_cfg(const bsp_audio_config_t* config);
 
 /**
  * @brief Get I2S transmit channel
@@ -44,7 +44,7 @@ i2s_chan_handle_t bsp_audio_get_i2s_tx_chan(void);
  * 
  * @return Codec device handle
  */
-esp_codec_dev_handle_t bsp_audio_get_codec_dev(void);
+esp_codec_dev_handle_t bsp_audio_get_codec_dev_cfg(void);
 
 /**
  * @brief Set audio volume
