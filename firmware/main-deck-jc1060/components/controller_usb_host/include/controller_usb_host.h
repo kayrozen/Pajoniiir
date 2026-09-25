@@ -41,6 +41,9 @@ typedef struct {
     BaseType_t task_core_id;
     UBaseType_t midi_out_queue_depth;
     int max_event_messages;
+    /* v238: root the controller hangs on. Both roots come back unpowered
+     * after a USB host restart; the controller task re-powers this one. */
+    uint8_t root_port_index;
 } controller_usb_host_config_t;
 
 typedef enum {

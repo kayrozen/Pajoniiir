@@ -209,22 +209,33 @@ bool bsp_audio_get_speaker_pa_enabled(void)
     return s_speaker_pa;
 }
 
+#define BSP_SD_MOUNT_ATTEMPTS 5
+
 esp_err_t bsp_sd_init(void)
 {
     /* Upstream's bsp_jc4880 retries the mount: SDMMC ACMD41 can surface a
      * spurious send_op_cond timeout (0x107) right after power-up. A single
      * attempt turns that transient into a fatal ESP_ERROR_CHECK abort in
-     * app_main. Retry with a short settle delay like upstream does. */
+     * app_main. Retry with a short settle delay like upstream does.
+     * v233: bsp_sd_mount() releases the SDMMC slot on every failure and
+     * retries at default speed; the settle grows per attempt (0.2..1.0 s).
+     * The caller must treat a failure as "no SD", not abort. */
     sdmmc_card_t *card = NULL;
     esp_err_t rc = ESP_FAIL;
-    for (int attempt = 1; attempt <= 5; ++attempt) {
+    for (int attempt = 1; attempt <= BSP_SD_MOUNT_ATTEMPTS; ++attempt) {
         rc = bsp_sd_mount("/sd", &card);
         if (rc == ESP_OK) {
+            if (attempt > 1) {
+                ESP_LOGW("bsp_sd", "SD mounted on attempt %d/%d", attempt,
+                         BSP_SD_MOUNT_ATTEMPTS);
+            }
             break;
         }
-        ESP_LOGW("bsp_sd", "SD mount attempt %d/5 failed (%s)", attempt,
-                 esp_err_to_name(rc));
-        vTaskDelay(pdMS_TO_TICKS(200));
+        ESP_LOGW("bsp_sd", "SD mount attempt %d/%d failed (%s)", attempt,
+                 BSP_SD_MOUNT_ATTEMPTS, esp_err_to_name(rc));
+        if (attempt < BSP_SD_MOUNT_ATTEMPTS) {
+            vTaskDelay(pdMS_TO_TICKS(200 * attempt));
+        }
     }
     s_sd_up = (rc == ESP_OK);
     return rc;

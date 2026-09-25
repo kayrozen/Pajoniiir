@@ -51,6 +51,9 @@ typedef enum {
     CP_IN_CC14_LSB = 5,
     CP_IN_CC7_ABS = 6,
     CP_IN_NOTE_STATE_PAIR = 7,
+    /* v232: emits base_value on press, nothing on release (one position of
+     * a multi-position selector). */
+    CP_IN_NOTE_SELECT = 8,
 } cp_raw_type_t;
 
 /* Input entry flags. */

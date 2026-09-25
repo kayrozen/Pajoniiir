@@ -94,6 +94,7 @@ emits one semantic event. `event` names come from the vocabulary below.
 | `cc14` | `event`, `status`, `msb`, `lsb`, `replay` (bool) | 14-bit CC pair. Compiler emits two table entries sharing one pairing slot; the runtime emits `value = msb<<7 \| lsb` only when both halves have been seen. |
 | `cc7_abs` | `event`, `status`, `data1`, `replay` (bool) | 7-bit absolute → `value = data2 & 0x7F`. |
 | `state_pair` | `event`, `members` (2× `{status,data1}`), `values` (4 entries, `null` = no emit) | Two buttons share latched pressed-state bits; on every edge the runtime emits `values[member0_bit \| member1_bit<<1]`. Used for FLX4 Beat FX target CH1/CH2/BOTH. |
+| `note_select` | `event`, `status`, `data1`, `value` | One position of a multi-position selector: emits `value` on press, nothing on release. v232, **JC1060 parser only** (raw type 8; the S3 parser rejects it). Used for DDJ-400 Beat FX CH1/CH2/MASTER (`94 10`/`94 11`/`94 14`). |
 
 `replay: true` marks absolute controls whose last complete value the S3
 re-emits after a P4 heartbeat/reconnect recovery (input snapshot replay). It

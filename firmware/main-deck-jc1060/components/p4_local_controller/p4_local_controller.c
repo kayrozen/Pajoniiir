@@ -320,6 +320,7 @@ static void local_bootstrap_task(void *arg)
         .task_core_id = 1,
         .midi_out_queue_depth = 256u,
         .max_event_messages = 8,
+        .root_port_index = LOCAL_USB1_ROOT_INDEX,
     };
     for (;;) {
         rc = controller_usb_host_init(&usb_config);

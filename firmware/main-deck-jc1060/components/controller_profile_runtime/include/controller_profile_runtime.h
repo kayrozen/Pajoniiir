@@ -22,6 +22,14 @@ bool controller_profile_runtime_activate(const uint8_t *blob, size_t len,
                                          uint16_t vid, uint16_t pid);
 void controller_profile_runtime_clear(void);
 bool controller_profile_runtime_active(void);
+
+/* v232: called (outside the runtime lock) after a profile is activated or an
+ * active one is cleared. Set once at boot, before controllers attach. */
+typedef void (*controller_profile_runtime_change_cb_t)(void);
+void controller_profile_runtime_set_change_cb(
+    controller_profile_runtime_change_cb_t cb);
+/* True when the active profile maps some input to this semantic event. */
+bool controller_profile_runtime_has_input(uint8_t type, uint8_t id);
 bool controller_profile_runtime_map(uint8_t status, uint8_t data1,
                                     uint8_t data2, uint8_t *type,
                                     uint8_t *id, int16_t *value);

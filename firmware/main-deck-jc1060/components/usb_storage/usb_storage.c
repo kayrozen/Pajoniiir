@@ -50,6 +50,20 @@ static const char *TAG = "usb_storage";
 #define USB_STORAGE_REQUEST_ROOT_RECOVERY(why) (false)
 #endif
 
+/* v238: full Host Library restart (usb_host_manager). The shared dual-USB
+ * adapter provides these; the standalone owner never restarts its host. */
+#ifndef USB_STORAGE_HOST_RESTART_PENDING
+#define USB_STORAGE_HOST_RESTART_JOIN() ((void)0)
+#define USB_STORAGE_HOST_RESTART_PENDING() (false)
+#define USB_STORAGE_HOST_RESTART_GENERATION() (0u)
+#define USB_STORAGE_HOST_RESTART_RELEASE(generation) ((void)(generation))
+#define USB_STORAGE_HOST_RESTART_WAIT(generation) \
+    ((void)(generation), ESP_OK)
+#endif
+#define HOST_RESTART_RELEASE_TIMEOUT_MS 4000u
+#define HOST_RESTART_POLL_MS            20u
+#define HOST_RESTART_REINSTALL_RETRY_MS 1000u
+
 static TaskHandle_t             s_storage_task;
 static TaskHandle_t             s_usb_lib_task;
 static usb_storage_event_cb_t   s_cb;
@@ -71,6 +85,10 @@ static atomic_int s_last_mount_result;
 static atomic_uint_fast32_t s_releases;
 static atomic_int s_last_unmount_result;
 static atomic_int s_last_uninstall_result;
+/* v238: usb_lib_task asks storage_task to drop the drive for a host restart;
+ * storage_task, the sole owner of s_mount/s_msc_dev, confirms. */
+static atomic_bool s_host_restarting;
+static atomic_bool s_host_restart_released;
 
 static usb_storage_session_t desired_snapshot(void)
 {
@@ -301,6 +319,65 @@ static void msc_event_cb(const msc_host_event_t *event, void *arg)
     }
 }
 
+/* v238: storage side of a Host Library restart. The MSC driver's client
+ * must be deregistered (msc_host_uninstall) before the manager can
+ * uninstall, and msc_host_uninstall needs every MSC device uninstalled
+ * first, which storage_task does. Afterwards everything is set up again
+ * as at boot, root recovery included. */
+static void host_restart_participate(const msc_host_driver_config_t *msc_cfg)
+{
+    const uint32_t generation = USB_STORAGE_HOST_RESTART_GENERATION();
+    ESP_LOGW(TAG, "host restart: releasing the drive and the MSC driver");
+    atomic_store(&s_host_restart_released, false);
+    atomic_store(&s_host_restarting, true);
+    notify_storage_owner();
+    const TickType_t deadline =
+        xTaskGetTickCount() + pdMS_TO_TICKS(HOST_RESTART_RELEASE_TIMEOUT_MS);
+    while (!atomic_load(&s_host_restart_released) &&
+           (int32_t)(deadline - xTaskGetTickCount()) > 0) {
+        vTaskDelay(pdMS_TO_TICKS(HOST_RESTART_POLL_MS));
+    }
+    esp_err_t rc = ESP_ERR_TIMEOUT;
+    if (atomic_load(&s_host_restart_released)) {
+        rc = msc_host_uninstall();
+    }
+    if (rc != ESP_OK) {
+        /* The manager keeps the old stack; so does storage. */
+        ESP_LOGW(TAG, "host restart: MSC driver not released: %s",
+                 esp_err_to_name(rc));
+        atomic_store(&s_host_restarting, false);
+        notify_storage_owner();
+        while (USB_STORAGE_HOST_RESTART_PENDING()) {
+            vTaskDelay(pdMS_TO_TICKS(HOST_RESTART_POLL_MS));
+        }
+        return;
+    }
+    USB_STORAGE_HOST_RESTART_RELEASE(generation);
+
+    rc = USB_STORAGE_HOST_RESTART_WAIT(generation);
+    if (rc != ESP_OK) {
+        ESP_LOGE(TAG, "host restart: USB host not back: %s",
+                 esp_err_to_name(rc));
+    }
+    bool logged = false;
+    while ((rc = msc_host_install(msc_cfg)) != ESP_OK) {
+        if (!logged) {
+            ESP_LOGE(TAG, "host restart: msc_host_install: %s",
+                     esp_err_to_name(rc));
+            logged = true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(HOST_RESTART_REINSTALL_RETRY_MS));
+    }
+    /* The drive enumerates again with a new address and a new CONNECTED. */
+    portENTER_CRITICAL(&s_state_mux);
+    usb_storage_session_reset(&s_session);
+    portEXIT_CRITICAL(&s_state_mux);
+    atomic_store(&s_host_restarting, false);
+    notify_storage_owner();
+    root_port_power_cycle("host restart");
+    ESP_LOGW(TAG, "host restart: MSC driver reinstalled");
+}
+
 static void usb_lib_task(void *arg)
 {
     (void)arg;
@@ -319,6 +396,7 @@ static void usb_lib_task(void *arg)
     };
     ESP_ERROR_CHECK(msc_host_install(&msc_cfg));
 
+    USB_STORAGE_HOST_RESTART_JOIN();
     root_port_power_cycle("initial bring-up");
     ESP_LOGI(TAG, "USB host + MSC installed; waiting for a drive on the HS USB port");
 
@@ -336,6 +414,17 @@ static void usb_lib_task(void *arg)
                                                   &flags);
         if (rc == ESP_OK && (flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS)) {
             usb_host_device_free_all();
+        }
+
+        if (USB_STORAGE_HOST_RESTART_PENDING()) {
+            host_restart_participate(&msc_cfg);
+            session = desired_snapshot();
+            usb_storage_recovery_init(&recovery,
+                                      session.connected,
+                                      session.epoch,
+                                      (uint32_t)xTaskGetTickCount(),
+                                      1u);
+            continue;
         }
 
         session = desired_snapshot();
@@ -532,6 +621,22 @@ static void storage_task(void *arg)
     TickType_t next_attempt = 0;
 
     for (;;) {
+        if (atomic_load(&s_host_restarting)) {
+            if (s_announced_mounted || s_mount || s_msc_dev) {
+                ESP_LOGW(TAG, "host restart: unmounting the drive");
+            }
+            publish_unmounted();
+            if (s_mount || s_msc_dev) {
+                release_device();
+            }
+            atomic_store(&s_host_restart_released, true);
+            retry_ms = MOUNT_RETRY_INITIAL_MS;
+            next_attempt = 0;
+            (void)ulTaskNotifyTake(pdTRUE,
+                                  pdMS_TO_TICKS(RECONCILE_POLL_MS));
+            continue;
+        }
+
         usb_storage_session_t desired = desired_snapshot();
 
         if (!desired.connected) {

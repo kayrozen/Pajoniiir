@@ -21,6 +21,7 @@
 #include "sdkconfig.h"
 #if CONFIG_CONTROLLER_PROFILE_MANAGER
 #include "controller_profile_manager.h"
+#include "controller_profile_runtime.h"
 #endif
 #include "p4_local_controller.h"
 #include "freertos/task.h"
@@ -280,6 +281,19 @@ static bool on_recording_toggle(bool enable)
 }
 #endif  /* CONFIG_AUDIO_RECORDER_ENABLED */
 
+#if CONFIG_CONTROLLER_PROFILE_MANAGER
+// v232: a profile without a Smart CFX control (DDJ-400) keeps the channel
+// FILTER knobs always live; built-in FLX4 / FLX4 profile keep the gate.
+static void on_controller_profile_change(void)
+{
+    bool needs = !controller_profile_runtime_active() ||
+                 controller_profile_runtime_has_input(CTRL_TYPE_BUTTON,
+                                                     CTRL_ID_SMART_CFX);
+    audio_engine_set_channel_filter_needs_smart_cfx(needs);
+    ESP_LOGW(TAG, "channel filter %s", needs ? "gated by Smart CFX" : "always live");
+}
+#endif
+
 // Called from the USB storage task when the Rekordbox drive mounts/unmounts.
 static void on_usb_storage_event(bool mounted)
 {
@@ -357,7 +371,15 @@ void app_main(void)
     ESP_ERROR_CHECK(bsp_display_init());
     ESP_ERROR_CHECK(bsp_touch_init());
     ESP_ERROR_CHECK(bsp_audio_init());
-    ESP_ERROR_CHECK(bsp_sd_init());
+    // v233: a missing/unreadable microSD must never abort boot (cold-boot
+    // 0x107 used to end in ESP_ERROR_CHECK). Degraded mode: built-in
+    // controller map, USB library only, no service journal or recordings.
+    const esp_err_t sd_rc = bsp_sd_init();
+    if (sd_rc != ESP_OK) {
+        ESP_LOGE(TAG, "microSD unavailable (%s): running without SD - "
+                      "built-in controller map, USB library only",
+                 esp_err_to_name(sd_rc));
+    }
 
     // ── Structured microSD service journal ───────────────────────────────────
     {
@@ -368,7 +390,9 @@ void app_main(void)
             part = fh.partition_label;
         }
         service_log_init(ver, part, reset_reason_str());
-        service_log_note(SERVICE_LOG_SD_MOUNTED, SERVICE_LOG_INFO, "/sd ready");
+        if (sd_rc == ESP_OK) {
+            service_log_note(SERVICE_LOG_SD_MOUNTED, SERVICE_LOG_INFO, "/sd ready");
+        }
         service_log_event(SERVICE_LOG_RESET_REASON, SERVICE_LOG_INFO,
                           3u, (uint32_t)esp_reset_reason(),
                           (uint32_t)esp_rom_get_reset_reason(0),
@@ -379,6 +403,7 @@ void app_main(void)
 #if CONFIG_CONTROLLER_PROFILE_MANAGER
     // Controller profiles live on the SD/TF card; a missing directory is
     // normal (no profiles yet) and must not block boot.
+    controller_profile_runtime_set_change_cb(on_controller_profile_change);
     ESP_ERROR_CHECK(controller_profile_manager_init());
     esp_err_t profile_rc = controller_profile_manager_scan_storage();
     if (profile_rc != ESP_OK && profile_rc != ESP_ERR_NOT_FOUND) {

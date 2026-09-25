@@ -35,6 +35,16 @@ static void *rt_scratch_alloc(size_t n)
 static cp_profile_t s_profile;
 static cp_runtime_t s_runtime;
 static bool s_active;
+static controller_profile_runtime_change_cb_t s_change_cb;
+
+static void notify_change(void)
+{
+    /* Called without RT_LOCK so the callback may query the runtime. */
+    controller_profile_runtime_change_cb_t cb = s_change_cb;
+    if (cb) {
+        cb();
+    }
+}
 
 void controller_profile_runtime_init(void)
 {
@@ -87,6 +97,7 @@ bool controller_profile_runtime_activate(const uint8_t *blob, size_t len,
             s_profile.vid, s_profile.pid, (unsigned)s_profile.input_count,
             (unsigned)s_profile.output_count,
             (unsigned)s_profile.init_sysex_len);
+    notify_change();
     return true;
 }
 
@@ -98,6 +109,7 @@ void controller_profile_runtime_clear(void)
     RT_UNLOCK();
     if (was_active) {
         RT_LOGW("dynamic profile cleared");
+        notify_change();
     }
 }
 
@@ -107,6 +119,29 @@ bool controller_profile_runtime_active(void)
     bool active = s_active;
     RT_UNLOCK();
     return active;
+}
+
+void controller_profile_runtime_set_change_cb(
+    controller_profile_runtime_change_cb_t cb)
+{
+    s_change_cb = cb;
+}
+
+bool controller_profile_runtime_has_input(uint8_t type, uint8_t id)
+{
+    bool found = false;
+    RT_LOCK();
+    if (s_active) {
+        for (uint16_t i = 0; i < s_profile.input_count; i++) {
+            if (s_profile.inputs[i].semantic_type == type &&
+                s_profile.inputs[i].semantic_id == id) {
+                found = true;
+                break;
+            }
+        }
+    }
+    RT_UNLOCK();
+    return found;
 }
 
 bool controller_profile_runtime_map(uint8_t status, uint8_t data1, uint8_t data2,

@@ -7,6 +7,7 @@
 #include "controller_audio_resampler.h"
 #include "controller_audio_ring.h"
 #include "esp_log.h"
+#include "esp_memory_utils.h"
 #include "flx4_uac_descriptors.h"
 #include "flx4_uac_packetizer.h"
 
@@ -67,6 +68,15 @@
  * GET_CUR) no longer blocks playback. Order is SET_CUR (3) then GET_CUR (4);
  * the pre-SET_CUR GET_CUR is skipped because it NAKed forever in v219. */
 #define STREAM_RATE_CONTROL 1
+
+/* v239: every start after the first one of this boot sends SET_INTERFACE
+ * alt 0 (step 5) before the streaming alt (step 1), so an in-place UAC
+ * restart or a re-probe without unplug leaves the device's zero-bandwidth
+ * setting first, like a host driver reopening the stream. The first start
+ * keeps the proven boot sequence. A failed step 5 is logged and skipped. */
+#define STREAM_RESET_ALT_ON_RESTART 1
+#define STEP_SET_ALT 1u
+#define STEP_SET_ALT_ZERO 5u
 
 /* v221 diagnostic: bit n set = USB channel n carries audio, clear = digital
  * silence. Slot order MASTER L/R (0-1), PHONES L/R (2-3) matches the DDJ-400
@@ -172,6 +182,42 @@ static int16_t s_packet_dump_src[STREAM_PACKET_DUMP_BYTES / 3u];
 static uint32_t s_packet_dump_state; /* 0 armed, 1 captured, 2 logged */
 /* Monotonic per-boot identity for each successfully primed UAC stream. */
 static uint32_t s_stream_epoch;
+
+/* v239 start trace: every start is numbered (seq) and each step of its
+ * sequence (claim, URB allocs, control steps, prime, fault, cleanup) is
+ * logged with its rc and the ms since the start. The isoc callback never
+ * logs a healthy stream: it records the first completed URB and the first
+ * failed packet, and controller_usb_audio_stream_log_trace() prints them
+ * from the controller task. */
+static uint32_t s_start_seq;
+static TickType_t s_start_tick;
+static TickType_t s_ready_tick;
+static uint32_t s_isoc_done;
+static esp_err_t s_fault_rc;
+static bool s_cleanup_logged;
+static bool s_release_fail_logged;
+#define TRACE_ARMED 0u
+#define TRACE_CAPTURED 1u
+#define TRACE_LOGGED 2u
+static uint32_t s_trace_first_done_state;
+static uint32_t s_trace_first_done_ms;
+static int s_trace_first_done_status;
+static uint32_t s_trace_bad_pkt_state;
+static uint32_t s_trace_bad_pkt_ms;
+static uint32_t s_trace_bad_pkt_urbs;
+static int s_trace_bad_pkt_index;
+static int s_trace_bad_pkt_status;
+static int s_trace_bad_pkt_actual;
+static int s_trace_bad_pkt_wanted;
+
+static uint32_t seq_ms(TickType_t since)
+{
+    return (uint32_t)((xTaskGetTickCount() - since) * portTICK_PERIOD_MS);
+}
+
+#define SEQ_LOGW(fmt, ...)                                                \
+    ESP_LOGW(TAG, "UAC seq %u +%u ms: " fmt, (unsigned)s_start_seq,        \
+             (unsigned)seq_ms(s_start_tick), ##__VA_ARGS__)
 
 static void lower_to_transition_priority(void)
 {
@@ -294,8 +340,18 @@ static bool has_active_isoc(void)
     return false;
 }
 
-static void mark_fault(bool configuration_failure)
+/* Runs in the controller task (USB callbacks included); the stream is dead
+ * once it faults, so the log no longer competes with isoc resubmission. */
+static void mark_fault(bool configuration_failure, const char *site,
+                       esp_err_t rc)
 {
+    SEQ_LOGW("FAULT at %s: %s (%s failure; streaming %u ms, %u isoc URBs "
+             "completed)",
+             site, esp_err_to_name(rc),
+             configuration_failure ? "configuration" : "transfer",
+             s_streaming ? (unsigned)seq_ms(s_ready_tick) : 0u,
+             (unsigned)s_isoc_done);
+    s_fault_rc = rc;
     s_faulted = true;
     set_accepting(false);
     s_streaming = false;
@@ -393,9 +449,24 @@ static void isoc_callback(usb_transfer_t *transfer)
         return;
     }
     if (transfer->status != USB_TRANSFER_STATUS_COMPLETED) {
-        ESP_LOGW(TAG, "isochronous status=%d", (int)transfer->status);
-        mark_fault(false);
+        ESP_LOGW(TAG, "isochronous status=%d (URB %d, pkt0 status=%d "
+                      "actual=%d/%d)",
+                 (int)transfer->status, index,
+                 transfer->num_isoc_packets > 0
+                     ? (int)transfer->isoc_packet_desc[0].status : -1,
+                 transfer->num_isoc_packets > 0
+                     ? transfer->isoc_packet_desc[0].actual_num_bytes : -1,
+                 transfer->num_isoc_packets > 0
+                     ? transfer->isoc_packet_desc[0].num_bytes : -1);
+        mark_fault(false, "isoc URB status", ESP_FAIL);
         return;
+    }
+    s_isoc_done++;
+    if (s_trace_first_done_state == TRACE_ARMED) {
+        s_trace_first_done_ms = seq_ms(s_ready_tick);
+        s_trace_first_done_status = (int)transfer->status;
+        __atomic_store_n(&s_trace_first_done_state, TRACE_CAPTURED,
+                         __ATOMIC_RELEASE);
     }
     /* HCD reports a completed URB even if individual ISO packets were skipped
      * or failed. Count loss before prepare_and_submit overwrites descriptors.
@@ -407,6 +478,17 @@ static void isoc_callback(usb_transfer_t *transfer)
         const bool completed = transfer->isoc_packet_desc[i].status ==
                                USB_TRANSFER_STATUS_COMPLETED;
         if (!completed || actual != wanted) {
+            if (s_trace_bad_pkt_state == TRACE_ARMED) {
+                s_trace_bad_pkt_ms = seq_ms(s_ready_tick);
+                s_trace_bad_pkt_urbs = s_isoc_done;
+                s_trace_bad_pkt_index = i;
+                s_trace_bad_pkt_status =
+                    (int)transfer->isoc_packet_desc[i].status;
+                s_trace_bad_pkt_actual = actual;
+                s_trace_bad_pkt_wanted = wanted;
+                __atomic_store_n(&s_trace_bad_pkt_state, TRACE_CAPTURED,
+                                 __ATOMIC_RELEASE);
+            }
             __atomic_add_fetch(&s_packet_failures, 1u, __ATOMIC_RELAXED);
             const unsigned missing = !completed || actual < 0 || actual > wanted
                 ? (unsigned)wanted : (unsigned)(wanted - actual);
@@ -419,8 +501,25 @@ static void isoc_callback(usb_transfer_t *transfer)
         const esp_err_t rc = prepare_and_submit(transfer);
         if (rc != ESP_OK) {
             ESP_LOGW(TAG, "isochronous resubmit: %s", esp_err_to_name(rc));
-            mark_fault(false);
+            mark_fault(false, "isoc resubmit", rc);
         }
+    }
+}
+
+static const char *step_name(uint8_t step)
+{
+    switch (step) {
+    case STEP_SET_ALT:
+        return "SET_INTERFACE alt N";
+    case 2u:
+    case 4u:
+        return "GET_CUR rate";
+    case 3u:
+        return "SET_CUR rate";
+    case STEP_SET_ALT_ZERO:
+        return "SET_INTERFACE alt 0";
+    default:
+        return "?";
     }
 }
 
@@ -428,12 +527,13 @@ static esp_err_t submit_control_step(uint8_t step)
 {
     usb_setup_packet_t *setup = (usb_setup_packet_t *)s_control->data_buffer;
     memset(setup, 0, sizeof(*setup));
-    if (step == 1u) {
+    if (step == STEP_SET_ALT || step == STEP_SET_ALT_ZERO) {
         setup->bmRequestType = USB_BM_REQUEST_TYPE_DIR_OUT |
                                USB_BM_REQUEST_TYPE_TYPE_STANDARD |
                                USB_BM_REQUEST_TYPE_RECIP_INTERFACE;
         setup->bRequest = USB_B_REQUEST_SET_INTERFACE;
-        setup->wValue = s_format.alternate_setting;
+        setup->wValue =
+            step == STEP_SET_ALT ? s_format.alternate_setting : 0u;
         setup->wIndex = s_format.interface_num;
         setup->wLength = 0u;
         s_control->num_bytes = sizeof(*setup);
@@ -479,6 +579,12 @@ static esp_err_t submit_control_step(uint8_t step)
     if (rc != ESP_OK) {
         s_control_active = false;
     }
+    /* Rate steps are submitted while the stream already runs in this task;
+     * only their failures are logged (UART output delays isoc resubmits). */
+    if (rc != ESP_OK || step == STEP_SET_ALT || step == STEP_SET_ALT_ZERO) {
+        SEQ_LOGW("control step %u (%s) submit: %s", step, step_name(step),
+                 esp_err_to_name(rc));
+    }
     return rc;
 }
 
@@ -502,11 +608,23 @@ static void control_callback(usb_transfer_t *transfer)
         return;
     }
     const uint8_t step = s_control_step;
+    if (step == STEP_SET_ALT_ZERO) {
+        /* v239: best effort; the streaming alt is selected either way. */
+        SEQ_LOGW("control step %u (%s) status=%d%s", step, step_name(step),
+                 (int)transfer->status,
+                 transfer->status == USB_TRANSFER_STATUS_COMPLETED
+                     ? "" : " (ignored)");
+        const esp_err_t rc = submit_control_step(STEP_SET_ALT);
+        if (rc != ESP_OK) {
+            mark_fault(true, "control step 1 submit", rc);
+        }
+        return;
+    }
     const bool rate_step = step >= 2u;
     if (transfer->status != USB_TRANSFER_STATUS_COMPLETED && !rate_step) {
         ESP_LOGW(TAG, "control step %u status=%d", step,
                  (int)transfer->status);
-        mark_fault(true);
+        mark_fault(true, "control step 1 status", ESP_FAIL);
         return;
     }
     if (transfer->status != USB_TRANSFER_STATUS_COMPLETED) {
@@ -536,8 +654,9 @@ static void control_callback(usb_transfer_t *transfer)
      * v223 sequence: SET_INTERFACE (1), prime, then SET_CUR (3) and, only if
      * it completed, GET_CUR (4). Rate steps never fault the stream. */
     uint8_t next = 0u;
-    if (step == 1u) {
-        ESP_LOGW(TAG, "control step 1 complete, priming isochronous queue");
+    if (step == STEP_SET_ALT) {
+        SEQ_LOGW("control step 1 complete (alt %u), priming isochronous "
+                 "queue", s_format.alternate_setting);
         prime_and_ready();
         if (!s_streaming || !STREAM_RATE_CONTROL) {
             return;
@@ -557,30 +676,43 @@ static void control_callback(usb_transfer_t *transfer)
     }
 }
 
+static esp_err_t alloc_isoc(unsigned index)
+{
+    const size_t bytes =
+        (size_t)s_format.max_packet_size * STREAM_PACKETS_PER_TRANSFER;
+    const esp_err_t rc = usb_host_transfer_alloc(
+        bytes, STREAM_PACKETS_PER_TRANSFER, &s_isoc[index]);
+    if (rc == ESP_OK) {
+        s_isoc[index]->callback = isoc_callback;
+    }
+    return rc;
+}
+
 static void prime_and_ready(void)
 {
     if (s_streaming) {
         return;
     }
-    bool all_submitted = true;
+    /* v237: the URBs come from controller_usb_audio_stream_start(); this
+     * runs from the step-1 control callback, too late for the controller's
+     * DMA reserve. Allocation here is only a fallback. */
+    s_ready_tick = xTaskGetTickCount();
+    s_isoc_done = 0u;
     for (unsigned i = 0u; i < STREAM_TRANSFER_COUNT; ++i) {
-        const size_t bytes =
-            (size_t)s_format.max_packet_size * STREAM_PACKETS_PER_TRANSFER;
-        if (!s_isoc[i] && usb_host_transfer_alloc(
-                bytes, STREAM_PACKETS_PER_TRANSFER, &s_isoc[i]) != ESP_OK) {
-            all_submitted = false;
-            break;
+        esp_err_t rc = ESP_OK;
+        if (!s_isoc[i]) {
+            rc = alloc_isoc(i);
         }
-        s_isoc[i]->callback = isoc_callback;
-        if (prepare_and_submit(s_isoc[i]) != ESP_OK) {
-            all_submitted = false;
-            break;
+        if (rc == ESP_OK) {
+            rc = prepare_and_submit(s_isoc[i]);
         }
-    }
-    if (!all_submitted) {
-        ESP_LOGW(TAG, "failed to prime UAC isochronous queue");
-        mark_fault(true);
-        return;
+        if (rc != ESP_OK) {
+            ESP_LOGW(TAG, "failed to prime UAC isochronous queue: URB %u "
+                          "%s: %s",
+                     i, s_isoc[i] ? "submit" : "alloc", esp_err_to_name(rc));
+            mark_fault(true, s_isoc[i] ? "prime submit" : "prime alloc", rc);
+            return;
+        }
     }
 
     s_control_step = 0u;
@@ -596,14 +728,15 @@ static void prime_and_ready(void)
      * format fields come from the attached device's own descriptors. */
     ESP_LOGW(TAG,
              "UAC ready intf=%u alt=%u ep=0x%02X mps=%u %u Hz %uch/%u-bit "
-             "(%u B/sample, pkt %u)",
+             "(%u B/sample, pkt %u) seq %u +%u ms",
              s_format.interface_num, s_format.alternate_setting,
              s_format.endpoint_addr, (unsigned)s_format.max_packet_size,
              (unsigned)STREAM_RATE_HZ, (unsigned)STREAM_CHANNELS,
              (unsigned)s_format.bits_per_sample,
              (unsigned)s_format.bytes_per_sample,
              (unsigned)(STREAM_MAX_PACKET_FRAMES * STREAM_CHANNELS *
-                        s_format.bytes_per_sample));
+                        s_format.bytes_per_sample),
+             (unsigned)s_start_seq, (unsigned)seq_ms(s_start_tick));
 #if STREAM_CHANNEL_MASK != 0xFu
     ESP_LOGW(TAG, "UAC CHANNEL MASK 0x%X (other channels silent)",
              (unsigned)STREAM_CHANNEL_MASK);
@@ -629,11 +762,27 @@ esp_err_t controller_usb_audio_stream_start(
         return ESP_ERR_INVALID_ARG;
     }
     if (!controller_usb_audio_stream_is_quiesced()) {
+        ESP_LOGW(TAG, "UAC start refused: previous stream not quiesced "
+                      "(blockers 0x%02x)",
+                 (unsigned)controller_usb_audio_stream_cleanup_blockers());
         return ESP_ERR_INVALID_STATE;
     }
+    s_start_seq++;
+    s_start_tick = xTaskGetTickCount();
+    s_isoc_done = 0u;
+    s_fault_rc = ESP_OK;
+    s_cleanup_logged = false;
+    s_release_fail_logged = false;
+    __atomic_store_n(&s_trace_first_done_state, TRACE_ARMED, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_trace_bad_pkt_state, TRACE_ARMED, __ATOMIC_RELEASE);
+    SEQ_LOGW("start dev=%p (%s start of this boot, %u streams primed so "
+             "far)",
+             (void *)device, s_start_seq == 1u ? "first" : "repeat",
+             (unsigned)__atomic_load_n(&s_stream_epoch, __ATOMIC_ACQUIRE));
     if (!select_stream_format(config_descriptor, config_descriptor_length,
                               &s_format)) {
         s_config_failures++;
+        SEQ_LOGW("no usable playback format");
         return ESP_ERR_NOT_SUPPORTED;
     }
 
@@ -660,7 +809,7 @@ esp_err_t controller_usb_audio_stream_start(
         if (!controller_audio_ring_init(&s_ring, s_ring_storage,
                                         STREAM_RING_FRAMES, STREAM_CHANNELS,
                                         STREAM_RATE_HZ)) {
-            mark_fault(true);
+            mark_fault(true, "ring init", ESP_FAIL);
             return ESP_FAIL;
         }
     } else {
@@ -672,6 +821,13 @@ esp_err_t controller_usb_audio_stream_start(
     esp_err_t rc = usb_host_interface_claim(
         client, device, s_format.interface_num, s_format.alternate_setting);
     if (rc != ESP_OK) {
+        /* v235: the claim allocates the isochronous pipe (two 512-byte
+         * qTD lists, 512-aligned, internal DMA RAM); a replug hit NO_MEM
+         * here with no trace of which interface/alt failed. */
+        SEQ_LOGW("claim ifc %u alt %u ep 0x%02x mps %u: %s",
+                 s_format.interface_num, s_format.alternate_setting,
+                 s_format.endpoint_addr, s_format.max_packet_size,
+                 esp_err_to_name(rc));
         s_config_failures++;
         s_configuring = false;
         s_client = NULL;
@@ -679,17 +835,48 @@ esp_err_t controller_usb_audio_stream_start(
         return rc;
     }
     s_claimed = true;
+    SEQ_LOGW("claim ifc %u alt %u ep 0x%02x mps %u: ESP_OK",
+             s_format.interface_num, s_format.alternate_setting,
+             s_format.endpoint_addr, s_format.max_packet_size);
+
+    /* v237: the isoc URBs (3 x mps*4 B of USB DMA memory; v240: PSRAM with
+     * CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM) are allocated here,
+     * in the caller's allocation burst, instead of in prime_and_ready()
+     * after SET_INTERFACE: on a replug that later allocation hit NO_MEM in a
+     * fragmented DMA heap and faulted the stream. A failure now returns
+     * synchronously, so the controller retries the start. */
+    for (unsigned i = 0u; i < STREAM_TRANSFER_COUNT; ++i) {
+        rc = alloc_isoc(i);
+        if (rc != ESP_OK) {
+            ESP_LOGW(TAG, "UAC isoc URB %u alloc (%u B): %s", i,
+                     (unsigned)(s_format.max_packet_size *
+                                STREAM_PACKETS_PER_TRANSFER),
+                     esp_err_to_name(rc));
+            mark_fault(true, "isoc URB alloc", rc);
+            return rc;
+        }
+    }
 
     /* v219: room for a full EP0 MPS on the GET_CUR IN data stage. */
     rc = usb_host_transfer_alloc(sizeof(usb_setup_packet_t) + 64u, 0,
                                  &s_control);
+    SEQ_LOGW("%u isoc URBs (%u B, %s) + control URB alloc: %s",
+             (unsigned)STREAM_TRANSFER_COUNT,
+             (unsigned)(s_format.max_packet_size *
+                        STREAM_PACKETS_PER_TRANSFER),
+             esp_ptr_external_ram(s_isoc[0]->data_buffer) ? "PSRAM"
+                                                          : "internal",
+             esp_err_to_name(rc));
     if (rc == ESP_OK) {
         s_control->callback = control_callback;
-        rc = submit_control_step(1u);
+        const bool reset_alt =
+            STREAM_RESET_ALT_ON_RESTART && s_start_seq > 1u;
+        rc = submit_control_step(reset_alt ? STEP_SET_ALT_ZERO
+                                           : STEP_SET_ALT);
     }
     if (rc != ESP_OK) {
         ESP_LOGW(TAG, "UAC configuration start: %s", esp_err_to_name(rc));
-        mark_fault(true);
+        mark_fault(true, "configuration start", rc);
         return rc;
     }
     return ESP_OK;
@@ -701,7 +888,10 @@ void controller_usb_audio_stream_request_stop(bool device_gone)
     s_streaming = false;
     s_configuring = false;
     s_stopping = s_claimed || s_control || s_control_active;
-    s_device_gone = s_device_gone || device_gone;
+    /* v234: only poll_cleanup()'s stopping path clears this, so a DEV_GONE
+     * that lands after cleanup finished latched a stale 0x40 blocker (seen on
+     * the next probe's close log). Nothing left to stop: nothing to latch. */
+    s_device_gone = s_stopping && (s_device_gone || device_gone);
     lower_to_transition_priority();
 }
 
@@ -710,21 +900,27 @@ bool controller_usb_audio_stream_poll_cleanup(void)
     if (!s_stopping) {
         return controller_usb_audio_stream_is_quiesced();
     }
+    if (!s_cleanup_logged) {
+        s_cleanup_logged = true;
+        SEQ_LOGW("stop: gone=%u faulted=%u fault=%s blockers=0x%02x",
+                 s_device_gone ? 1u : 0u, s_faulted ? 1u : 0u,
+                 esp_err_to_name(s_fault_rc),
+                 (unsigned)controller_usb_audio_stream_cleanup_blockers());
+    }
     if (!s_device_gone && s_claimed && s_device && has_active_isoc() &&
         !s_flush_attempted) {
         s_flush_attempted = true;
         const esp_err_t halt_rc =
             usb_host_endpoint_halt(s_device, s_format.endpoint_addr);
+        esp_err_t flush_rc = ESP_ERR_INVALID_STATE;
         if (halt_rc == ESP_OK || halt_rc == ESP_ERR_INVALID_STATE) {
-            const esp_err_t flush_rc =
+            flush_rc =
                 usb_host_endpoint_flush(s_device, s_format.endpoint_addr);
-            if (flush_rc != ESP_OK && flush_rc != ESP_ERR_INVALID_STATE) {
-                ESP_LOGW(TAG, "UAC endpoint flush: %s",
-                         esp_err_to_name(flush_rc));
-            }
-        } else {
-            ESP_LOGW(TAG, "UAC endpoint halt: %s", esp_err_to_name(halt_rc));
         }
+        SEQ_LOGW("stop: ep 0x%02x halt=%s flush=%s",
+                 s_format.endpoint_addr, esp_err_to_name(halt_rc),
+                 halt_rc == ESP_OK || halt_rc == ESP_ERR_INVALID_STATE
+                     ? esp_err_to_name(flush_rc) : "skipped");
     }
     if (s_control_active || has_active_isoc() ||
         (__atomic_load_n(&s_write_gate, __ATOMIC_ACQUIRE) & WRITE_ACTIVE)) {
@@ -745,14 +941,23 @@ bool controller_usb_audio_stream_poll_cleanup(void)
         }
         s_control = NULL;
     }
+    const bool was_claimed = s_claimed;
     if (s_claimed) {
         const esp_err_t rc = usb_host_interface_release(
             s_client, s_device, s_format.interface_num);
         if (rc != ESP_OK) {
+            if (!s_release_fail_logged) {
+                s_release_fail_logged = true;
+                SEQ_LOGW("stop: release ifc %u: %s (retried every pass)",
+                         s_format.interface_num, esp_err_to_name(rc));
+            }
             return false;
         }
         s_claimed = false;
     }
+    SEQ_LOGW("stop done: URBs freed, ifc %u %s",
+             s_format.interface_num,
+             was_claimed ? "released" : "was not claimed");
 
     s_client = NULL;
     s_device = NULL;
@@ -1012,8 +1217,37 @@ void controller_usb_audio_stream_get_stats(
     out_stats->packet_failures = __atomic_load_n(&s_packet_failures, __ATOMIC_RELAXED);
     out_stats->packet_lost_frames = __atomic_load_n(&s_packet_lost_frames, __ATOMIC_RELAXED);
     out_stats->stream_epoch = __atomic_load_n(&s_stream_epoch, __ATOMIC_ACQUIRE);
+    out_stats->start_seq = s_start_seq;
+    out_stats->fault_rc = s_fault_rc;
     out_stats->claimed = s_claimed;
     out_stats->configuring = s_configuring;
     out_stats->streaming = s_streaming;
     out_stats->faulted = s_faulted;
+}
+
+void controller_usb_audio_stream_log_trace(void)
+{
+    /* A blocking UART line in the controller task while streaming delays the
+     * isoc resubmits; the trace is printed once the stream has stopped. */
+    if (s_streaming) {
+        return;
+    }
+    if (__atomic_load_n(&s_trace_first_done_state, __ATOMIC_ACQUIRE) ==
+        TRACE_CAPTURED) {
+        SEQ_LOGW("first isoc URB completed %u ms after priming (status %d)",
+                 (unsigned)s_trace_first_done_ms, s_trace_first_done_status);
+        __atomic_store_n(&s_trace_first_done_state, TRACE_LOGGED,
+                         __ATOMIC_RELEASE);
+    }
+    if (__atomic_load_n(&s_trace_bad_pkt_state, __ATOMIC_ACQUIRE) ==
+        TRACE_CAPTURED) {
+        SEQ_LOGW("first failed isoc packet %u ms after priming, after %u "
+                 "good URBs: pkt %d status=%d actual=%d/%d",
+                 (unsigned)s_trace_bad_pkt_ms,
+                 (unsigned)s_trace_bad_pkt_urbs, s_trace_bad_pkt_index,
+                 s_trace_bad_pkt_status, s_trace_bad_pkt_actual,
+                 s_trace_bad_pkt_wanted);
+        __atomic_store_n(&s_trace_bad_pkt_state, TRACE_LOGGED,
+                         __ATOMIC_RELEASE);
+    }
 }

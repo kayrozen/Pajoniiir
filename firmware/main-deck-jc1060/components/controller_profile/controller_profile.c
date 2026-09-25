@@ -103,7 +103,7 @@ int cp_profile_parse(const uint8_t *data, size_t len, cp_profile_t *out)
         for (int b = 0; b < 4; b++) {
             e->lut[b] = (int8_t)p[12 + b];
         }
-        if (e->raw_type > CP_IN_NOTE_STATE_PAIR) {
+        if (e->raw_type > CP_IN_NOTE_SELECT) {
             return CP_ERR_BOUNDS;
         }
         bool needs_slot = e->raw_type == CP_IN_CC14_MSB ||
@@ -206,6 +206,12 @@ bool cp_runtime_process(const cp_profile_t *profile, cp_runtime_t *rt,
         case CP_IN_NOTE_VALUE:
             out->value = (int16_t)(e->base_value |
                                    (pressed ? (int16_t)e->press_mask : 0));
+            return true;
+        case CP_IN_NOTE_SELECT:
+            if (!pressed) {
+                return false;
+            }
+            out->value = e->base_value;
             return true;
         case CP_IN_CC_REL64: {
             int16_t delta = rel64_delta(data2);

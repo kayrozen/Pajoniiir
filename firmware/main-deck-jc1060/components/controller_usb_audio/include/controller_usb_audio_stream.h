@@ -29,6 +29,9 @@ typedef struct {
     uint32_t packet_failures;
     uint64_t packet_lost_frames;
     uint32_t stream_epoch;
+    /* v239: number of starts this boot, and the rc behind the last fault. */
+    uint32_t start_seq;
+    int32_t fault_rc;
     bool claimed;
     bool configuring;
     bool streaming;
@@ -76,6 +79,12 @@ bool controller_usb_audio_stream_pace_ready(size_t frame_count,
 uint32_t controller_usb_audio_stream_take_pace_low_water(void);
 void controller_usb_audio_stream_get_stats(
     controller_usb_audio_stream_stats_t *out_stats);
+/* v239: prints the start trace captured by the isoc callback (first
+ * completed URB, first failed packet), once each per start, and only while
+ * the stream is not running (UART output must not delay isoc resubmits).
+ * Controller task only: the stats getters above are also read from audio/UI
+ * tasks. */
+void controller_usb_audio_stream_log_trace(void);
 
 #ifdef __cplusplus
 }

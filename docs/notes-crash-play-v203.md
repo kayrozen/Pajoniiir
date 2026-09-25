@@ -958,3 +958,606 @@ visiblement de la position réelle.
 - `tests/ui_position_interpolator` (copie P4) suppose une extrapolation
   illimitée avec un snapshot figé. Il échoue donc contre la copie JC1060 ;
   il ne la vise pas, et la copie P4 n'est pas modifiée.
+
+## v232 : FILTER de voie et sélecteur Beat FX sur DDJ-400 (2026-09-24)
+
+- Symptôme : les potards FILTER des deux voies n'ont aucun effet.
+- Adresses MIDI : correctes. `B6 17/37` → `mixer.ch1_filter` et `B6 18/38` →
+  `mixer.ch2_filter`, identiques au XML Mixxx FLX4 et au XML Mixxx DDJ-400.
+  Test hôte : `B6 17 40` + `B6 37 00` → `CTRL_ID_CH1_FILTER` = 8192. Ensuite
+  deck_core → `audio_engine_set_filter()`.
+- Cause : dans `ae_output`, `.filter_enabled = smart_cfx_enabled`. Le DSP
+  filtre de voie ne tourne que si Smart CFX est actif. C'est un bouton FLX4
+  (`96 00`) que la DDJ-400 n'a pas, et `s_smart_cfx_enabled` démarre à
+  false.
+- Correctif, dérivé du profil (sans VID/PID) :
+  - `controller_profile_runtime` gagne un callback de changement (activate /
+    clear) et `controller_profile_runtime_has_input(type, id)` ;
+  - `app_main` enregistre `on_controller_profile_change()`. Il fixe
+    `audio_engine_set_channel_filter_needs_smart_cfx(!active || has_input(BUTTON, SMART_CFX))`
+    et logue une ligne WARN `channel filter gated by Smart CFX` /
+    `always live` ;
+  - `ae_output` : `filter_enabled = smart_cfx || !needs_smart_cfx`, soit une
+    lecture atomique de bool par bloc, sans allocation et sans changement de
+    pacing ni de priorité. FILTER centré = bypass (zone morte ±96 raw). Coût
+    CPU quand le filtre est tourné : le même biquad que Smart CFX sur FLX4 ;
+  - FLX4 intégré et profil FLX4 SD : inchangés, toujours derrière Smart CFX.
+- Beat FX CH SELECT (signalé en cours de v232, « FX sur le master ») :
+  - la DDJ-400 envoie `94 10` (CH1), `94 11` (CH2) et `94 14` (MASTER) :
+    XML Mixxx `Pioneer-DDJ-400.midi.xml`, quirx `beatFxChannel`. Le
+    `state_pair` hérité de la FLX4 attendait `95 11`, donc seul CH1
+    fonctionnait ;
+  - nouveau type d'entrée `note_select` (raw 8, parseur JC1060 seulement) :
+    émet `value` à l'appui, rien au relâchement ;
+  - profil : CH1 → 0, CH2 → 1, MASTER → 2 (CH1&CH2). Le P4 n'a pas de
+    Beat FX sur le bus master : l'effet est appliqué par deck, avant le
+    fader. Écho/Delay suivent donc les faders de voie ;
+  - `profile.s3bin` régénéré : 6176 octets, SHA-256
+    `b1b4ea2194a75bde750e122e6cad1fc865214116d92e9b89f70f4a0c9b696906`.
+    Les fixtures FLX4, generic et Hercules sont identiques octet pour octet.
+- Vérification :
+  - test scratchpad `t_v232` (parseur et runtime JC1060, PC_TEST) : filtre
+    CH1 mappé ; target 0/1/2 à l'appui, rien au relâchement ; `has_input`
+    SMART_CFX = false pour la DDJ-400 et true pour la FLX4 ; callback appelé
+    à activate et à clear, pas sur un clear redondant ;
+  - `audio_engine.c` : même nombre de diagnostics stubs avant et après ;
+  - callback `app_main` : `-fsyntax-only -Werror` OK ;
+  - `git diff --check` OK. Pas de build firmware.
+
+## v233 — profil SD rejeté en silence, reboot au débranchement de la DDJ
+
+- A, profil SD ignoré (`uses built-in map`, aucun log d'ouverture) :
+  - cause : régression v232. Le type raw 8 (`note_select`) a été ajouté au
+    parseur, mais pas au garde-fou du manager SD
+    (`CPM_MAX_RAW_TYPE` restait 7). `controller_profile_meta_parse` rejetait
+    donc le `profile.s3bin` de 6176 octets au scan de boot, sans aucun log ;
+  - chemin et moment corrects : `/sd/controllers/<id>/profile.s3bin`, scanné
+    par `controller_profile_manager_scan_storage()` juste après
+    `bsp_sd_init()` (boot ~2 s), bien avant la résolution du descripteur
+    (6,6 s) ;
+  - le champ `scale` réutilise les octets réservés 10-11 de l'entrée de
+    sortie : aucune taille ne change. L'ancien fichier de 6160 octets était
+    valide et le reste ;
+  - fix : `CPM_MAX_RAW_TYPE` passe à 8. Chaque rejet est maintenant logué
+    (`ctrl_profile: profile rejected: ...`) : taille hors bornes, magic,
+    version/header, octets lus vs taille d'en-tête, CRC calculé vs attendu,
+    compteurs, taille attendue, type raw trop récent (avec l'entrée MIDI),
+    slot de paire, type de sortie. S'y ajoutent l'échec d'ouverture (chemin +
+    errno), l'échec d'`opendir`, un résumé WARN
+    `N controller profile(s) in /sd/controllers, M valid` et, pour chaque
+    fichier, `OK` ou `INVALID`. `uses built-in map` indique aussi le nombre
+    de profils du registre et le nombre d'invalides.
+- B, débrancher la DDJ reboote la tablette :
+  - backtrace (ELF v232, SHA `e44a6054e`) : `controller_task` →
+    `close_step` (controller_usb_host.c:504) → `usb_host_device_close` →
+    `usbh_dev_close` usbh.c:1334
+    `assert(num_ctrl_xfers_inflight == 0)`. Vu deux fois (lignes ~54956 et
+    ~55753 de `serial_all.log`), après `USBH: Dev 1 EP 0 Error`, avec l'étape
+    de contrôle UAC 4 encore en attente (`uac_blockers=0x2f`) ;
+  - cause : course dans esp-usb. `handle_ep0_dequeue()` appelle le callback
+    du transfert de contrôle, ce qui réveille `controller_usb` (priorité 6,
+    CPU1), avant de décrémenter `num_ctrl_xfers_inflight`. Le daemon
+    `usb_hostd` est en priorité 4 sur CPU1. Le callback UAC libère
+    `s_control_active`, `poll_cleanup` réussit, puis `close_step` ferme le
+    device avant que le daemon ait terminé la décrémentation ;
+  - fix, sans toucher au fork : `close_step` note le tick où le cleanup UAC
+    (seul utilisateur de EP0) se termine. `usb_host_device_close()` n'est
+    appelé qu'après `CONTROLLER_CLOSE_EP0_SETTLE_MS` (20 ms), en rendant la
+    main à la boucle client entre-temps, bloquée dans
+    `usb_host_client_handle_events`. Le chemin audio n'est pas touché ;
+- C, abort au boot sans SD (ligne 54593, boot POWERON) :
+  - symptôme : SD attempt 1 en `ESP_ERR_TIMEOUT` (CMD6 high-speed switch,
+    0x107), attempts 2-5 en `slot is not available`, puis
+    `ESP_ERROR_CHECK(bsp_sd_init())` fait l'abort ;
+  - cause : ESP-Hosted (SDIO, slot 1) et la microSD (slot 0) partagent un
+    seul contrôleur SDMMC, et `bsp_sd_mount` utilise un init factice.
+    En cas d'échec, le helper FATFS appelle `sdmmc_host_deinit_slot(0)`, qui
+    retire le slot puis supprime le contrôleur s'il ne reste aucun slot.
+    Le pointeur `s_ctlr` du driver legacy n'est pas remis à NULL : chaque
+    retry ajoute alors le slot à un contrôleur libéré. Un modèle hôte du
+    driver IDF 6.0.2 reproduit exactement le log terrain quand le slot
+    ESP-Hosted est absent ;
+  - fix `bsp_sd.c` :
+    - `host.deinit_p` = `sdmmc_host_release_slot` : ne libère que si un slot
+      est enregistré, et suit la suppression du contrôleur au dernier slot
+      (`s_ctlr_live`, sans jamais relire le pointeur pendant) ;
+    - `host.init` = `sdmmc_host_init_shared` : factice tant qu'ESP-Hosted
+      possède le contrôleur, puis vrai `sdmmc_host_init()` s'il a disparu ;
+    - retries à `SDMMC_FREQ_DEFAULT`, ce qui évite le CMD6 ;
+  - `bsp_sd_init` : 5 tentatives, délai 200/400/600/800 ms ;
+  - `app_main` : plus d'`ESP_ERROR_CHECK`. Log E
+    `microSD unavailable (...): running without SD - built-in controller map, USB library only`
+    et le boot continue. Tous les usages de `/sd` (journal, recorder,
+    trackcache, profils, web) testent déjà la présence de la carte ;
+  - vérifié sur le modèle hôte : v232 reproduit l'échec, v233 monte à la
+    tentative 2 sans use-after-free, le slot ESP-Hosted reste intact quand
+    il est présent, et une carte toujours en échec rend 0x107 proprement ;
+  - si le slot ESP-Hosted était vraiment absent, le Wi-Fi SDIO de ce boot ne
+    fonctionnait déjà pas. v233 recrée le contrôleur pour la SD
+    uniquement ; à surveiller.
+- Vérification :
+  - test scratchpad `t_v233` : le manager v233 accepte les fichiers de 6176
+    et 6160 octets, alors que le manager v232 marquait celui de 6176 octets
+    invalide. Une copie avec logs activés affiche les bons messages (CRC,
+    dossier vide, nom invalide, racine absente). Compilé en
+    `-Wformat=2 -Werror` ;
+  - `controller_usb_host.c` : diagnostics stubs identiques avant et après ;
+  - boucle `bsp_sd_init` et bloc `app_main` compilés isolément en
+    `-Wall -Wextra -Werror` et exécutés (montage à la tentative 3, puis
+    échec total → boot continue) ;
+  - pas de build firmware ni de test matériel.
+
+## v234 — la DDJ ne revient pas au rebranchement (2026-09-24)
+
+- Symptôme (HIL v233) : débranchement propre à 175,5 s (`DEV_GONE`, fermé en
+  57 ms), re-arm #1 à 180,6 s, `NEW_DEV addr=5` à 182,5 s, puis
+  `recovery: closing controller (gone=0 uac=0 uac_blockers=0x40)` et plus
+  aucun `NEW_DEV` ; re-arms #2 à #31 toutes les 15 s sans effet.
+- Cause, d'après le log complet :
+  - la fermeture ne vient pas d'une requête en attente. `probe_device`
+    échoue au claim de l'interface MIDI :
+    `USBH: EP Alloc error: ESP_ERR_NO_MEM` →
+    `Claiming interface error: ESP_ERR_NO_MEM`. Son chemin d'erreur ferme
+    notre handle (`close_step`), d'où le log « closing controller » ;
+  - le `NO_MEM` vient de la liste qTD du pipe
+    (`heap_caps_aligned_calloc(512, …, MALLOC_CAP_DMA | INTERNAL)`,
+    `hcd_dwc.c`) : la RAM interne DMA est épuisée. Le diag preload donne
+    environ 18 Ko de RAM interne libre en lecture sur v229 à v233, contre
+    91 Ko au premier probe du boot ;
+  - le périphérique reste énuméré sur root 0 : pas de nouveau `NEW_DEV`.
+    Le manager ne coupe qu'un root déconnecté
+    (`pajoniiir_hcd_port_power_off_if_disconnected` → `NOT_FINISHED`), donc
+    chaque re-arm est refusé. Le log « recovery suppressed » était en INFO,
+    filtré, et le refus ressemblait à un succès silencieux ;
+  - `0x40` = `CONTROLLER_UAC_BLOCK_DEVICE_GONE` (`controller_usb_audio`).
+    Le `DEV_GONE` est arrivé après la fin du cleanup UAC
+    (`uac_blockers=0x00`) : `request_stop(true)` a mémorisé un flag que
+    seul le chemin « stopping » efface. Il est cosmétique et ne ferme rien.
+- Fix :
+  - `controller_usb_host.c` : un probe qui échoue après énumération (claim,
+    alloc URB, submit) arme un re-probe de la même adresse, avec un backoff
+    de 250 ms doublé jusqu'à 5 s. Il s'arrête sur succès, ou quand l'open
+    rend `NOT_FOUND`/`INVALID_STATE` (appareil parti). Pendant le re-probe,
+    `rearm_root_if_silent` ne demande plus de power-cycle (il serait
+    refusé). Chaque échec logue l'étape, la RAM interne et DMA
+    free/largest (tentatives 1-3 puis une sur 12). Un succès logue
+    `probe addr=N succeeded on retry K` ;
+  - `controller_usb_audio_stream.c` : `request_stop` ne mémorise
+    `device_gone` que s'il reste quelque chose à arrêter (plus de 0x40
+    périmé) ;
+  - `usb_host_manager.c` : « recovery suppressed » passe en WARN.
+- Hors fix : la RAM interne DMA reste le vrai goulot. Si le re-probe logue
+  `DMA free` proche de 0 pendant longtemps, il faudra trouver le
+  consommateur interne. Aucun changement audio, pacing ou priorité ici.
+- Vérification : les trois fichiers modifiés passent un contrôle de syntaxe
+  hôte `-Wall -Wextra` (vrais headers `usb`, stubs FreeRTOS/esp_err/heap) :
+  - `controller_usb_host.c` et `controller_usb_audio_stream.c` : propres,
+    `-Werror` ;
+  - `usb_host_manager.c` : seule erreur préexistante,
+    `fifo_settings_per_port`, ajouté au build par le patch cmake du fork.
+
+  Pas de build firmware ni de test matériel.
+
+## v235 — pas d'audio après rebranchement (2026-09-24)
+
+- Symptôme (HIL v234) : débranchement propre à 46,4 s, puis au
+  rebranchement `NEW_DEV addr=5`, MIDI OK et
+  `re-attached after 5574 ms (... uac=0)`. Le HB UAC reste ensuite en
+  `rc=0x103 claimed=0 cfg_fail=1` : pas d'audio jusqu'au reboot.
+- Cause, d'après le log : ce n'est pas une course avec l'ancien handle, qui
+  était fermé depuis 5 s (`closed in 44 ms`). Le claim UAC (ifc 1 alt 2)
+  échoue sur la même allocation qu'en v234 :
+  `USBH: EP Alloc error: ESP_ERR_NO_MEM` → `Claiming interface error` →
+  `DDJ-400 UAC unavailable; MIDI remains active: ESP_ERR_NO_MEM`. Le pipe
+  isochrone demande deux listes qTD de 512 octets, alignées sur 512, en RAM
+  interne DMA. Cette fois le MIDI est passé et l'UAC non. Le start n'était
+  jamais retenté.
+- Fix :
+  - `controller_usb_host.c` : un start UAC qui échoue (sauf
+    `NOT_SUPPORTED`/`INVALID_ARG`, aucun format utilisable) est retenté
+    avec le même backoff que le re-probe v234 : 250 ms doublé jusqu'à 5 s.
+    Il s'arrête sur succès, ou à la fermeture du contrôleur (DEV_GONE,
+    faute) ; un nouveau probe repart de zéro ;
+  - si un start a échoué après son claim, on attend que `poll_cleanup` ait
+    libéré l'interface (quiesced) avant de retenter, sans compter
+    d'essai ;
+  - chaque échec logue `UAC start addr=N: <err> ... retry #K in D ms`,
+    avec la RAM interne et DMA free/largest (essais 1-3 puis un sur 12).
+    Une réussite logue `recovery: UAC start addr=N succeeded on retry K` ;
+  - `controller_usb_audio_stream.c` : un claim refusé logue
+    `UAC claim ifc I alt A ep 0xEE mps M: <err>`. Les échecs de
+    SET_INTERFACE et des étapes de débit loguaient déjà
+    `control step N status=S`.
+- Limite : le retry ne crée pas de RAM. Si les logs montrent `DMA largest`
+  durablement sous ~1 Ko, il faudra une réserve DMA gardée à la
+  déconnexion, ou trouver le consommateur interne.
+- Vérification :
+  - `controller_usb_host.c` et `controller_usb_audio_stream.c` passent un
+    contrôle de syntaxe hôte `-Wall -Wextra -Wformat=2 -Werror` ;
+  - test scratchpad `t_v235`, qui inclut `controller_usb_host.c` avec
+    stubs : 6 échecs `NO_MEM` donnent les délais 250/500/1000/2000/4000/5000
+    ms, puis succès au 7e start avec `usb_audio_active`. Pendant l'attente
+    quiesced, aucun start n'est lancé ni compté. `NOT_SUPPORTED` n'est pas
+    retenté ;
+  - pas de build firmware ni de test matériel.
+
+## v236 — réserve DMA interne pour le rebranchement (2026-09-24)
+
+- Symptôme (HIL v235) : au rebranchement, le probe échoue en boucle au claim
+  MIDI (stage 7 = `INTERFACE_CLAIM`) :
+  `probe addr=5: ESP_ERR_NO_MEM ... internal free=37679 largest=7168, DMA free=23779 largest=2304`.
+  Ni MIDI ni audio. Le retry UAC v235 n'est jamais atteint.
+- Cause : la RAM interne DMA est fragmentée. Chaque buffer d'endpoint
+  réserve une liste qTD alignée sur 512 (`heap_caps_aligned_calloc`,
+  `hcd_dwc.c`), soit environ 0,8 Ko contigu en INTR et 1 Ko en ISOC.
+  Un bloc de 2304 octets ne tient pas les quatre listes du claim MIDI, et
+  les URB isoc UAC font 2304 octets chacun. Au boot, les allocations USB se
+  sont dispersées entre celles du reste du système ; libérées à l'unplug,
+  elles laissent des trous trop petits.
+- Choix : réserve prise une fois au boot, découpée en morceaux.
+  - Un pool statique dédié demanderait de modifier le fork esp-usb, hors
+    périmètre : ses allocateurs appellent `heap_caps_*` avec des caps
+    fixes.
+  - Une réserve prise seulement au DEV_GONE arriverait trop tard : le heap
+    est déjà fragmenté à ce moment-là.
+- Fix (`controller_usb_host.c`) :
+  - `controller_usb_host_init` prend 6 morceaux de 2560 octets en
+    `MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL`, environ 15 Ko. Un morceau
+    contient un URB isoc de 2304 octets ou deux listes qTD alignées dans le
+    pire cas. Six couvrent les environ 12 Ko de la DDJ-400 : 4 listes INTR,
+    2 ISOC, 3 URB isoc et les petits URB ;
+  - la réserve est libérée juste avant le claim MIDI, première allocation
+    DMA du probe. Les échecs antérieurs (open, descripteurs, appareil non
+    MIDI, clé USB) ne la touchent pas ;
+  - elle est reprise à la fin de chaque fermeture (unplug, faute, échec de
+    probe) : les buffers du contrôleur, placés dans ces trous, s'y
+    recoalescent. Si elle est incomplète, elle est complétée toutes les
+    1 s tant qu'aucun contrôleur n'est ouvert (log seulement si le compte
+    change) ;
+  - logs : `USB DMA reserve N/6 chunks ...` (boot, fermeture, complément),
+    `USB DMA reserve: N chunks released for the claim`, et
+    `controller closed ... DMA freed ~X B`, qui mesure ce que tenait le
+    contrôleur et sert à caler la taille.
+- Empreinte : contrôleur branché, la réserve est remplacée par ses propres
+  allocations, donc le régime permanent ne change pas. Contrôleur absent,
+  environ 15 Ko restent tenus, ce qui correspond au régime « branché »
+  validé (environ 18 Ko libres). Pas de libération après X s : la réserve
+  servirait justement au rebranchement suivant.
+- Risques : au boot, il y a 15 Ko de RAM interne DMA en moins entre
+  `controller_usb_host_init` et le premier claim ; à surveiller.
+  L'énumération elle-même (EP0 et URB d'énumération) n'est pas couverte ;
+  elle est passée en v234 et v235. Si `DMA freed` dépasse nettement 15 Ko,
+  augmenter `CONTROLLER_DMA_RESERVE_CHUNKS`.
+- Vérification :
+  - `controller_usb_host.c` passe un contrôle de syntaxe hôte
+    `-Wall -Wextra -Wformat=2 -Werror` ;
+  - test scratchpad `t_v236` : remplissage partiel au boot (4/6),
+    complément silencieux s'il ne change rien, complément à 6/6, libération
+    totale et idempotente, reprise après fermeture ;
+  - `t_v235` repasse ;
+  - pas de build firmware ni de test matériel.
+
+## v237 — faute UAC au rebranchement, port root mort ensuite (2026-09-24)
+
+- Constat HIL v236 :
+  - la réserve libère 2 morceaux, le probe passe, `re-attached uac=1`, puis
+    `control step 1 complete` ;
+  - 360 ms plus tard : `failed to prime UAC isochronous queue` →
+    `UAC stream fault (ESP_FAIL)` → fermeture (blockers 0x23) ;
+  - `fault power-cycle request root 0: ESP_OK`, puis
+    `USB0 recovery suppressed: attach/enumeration is active`, et plus aucun
+    NEW_DEV.
+- Boot et rebranchement ont la même séquence : claim MIDI, claim UAC,
+  SET_INTERFACE (step 1), prime, SET_CUR/GET_CUR (steps 3/4). La différence
+  est la mémoire :
+  - `prime_and_ready()` alloue les 3 URB isoc (3 × 2304 octets DMA interne)
+    depuis le callback du step 1, donc après la fin du burst du probe ;
+  - au boot, le plus grand bloc DMA faisait 11-15 Ko ; au rebranchement,
+    les morceaux restants de la réserve libérée avaient déjà été pris par de
+    petites allocations (`SPIRAM_MALLOC_ALWAYSINTERNAL`) ;
+  - l'allocation échoue avec NO_MEM, et le prime appelle `mark_fault(true)`.
+  - Ni le step 4 ni le claim sur un appareil déjà configuré ne sont en cause :
+    le step 1 se termine, et le step 3 n'est jamais soumis.
+- Port mort : la recovery du manager n'éteint qu'un root déconnecté
+  (`usb_host_lib_power_off_root_port_if_idle_by_index`). Après la faute, la
+  DDJ reste énumérée et plus aucun client ne la possède : requête refusée,
+  pas de déconnexion, donc pas de NEW_DEV. C'est le cas que la recovery
+  upstream de `usb_storage` couvre (cycle forcé, répété).
+- Fix (`controller_usb_audio_stream.c`) :
+  - les URB isoc sont alloués dans `controller_usb_audio_stream_start()`,
+    juste après le claim et donc dans le burst du probe ou du retry. Un échec
+    y est synchrone (`UAC isoc URB i alloc (2304 B): ...`) et passe par le
+    retry UAC v235, pas par une faute de stream ;
+  - `prime_and_ready()` ne fait plus que soumettre. L'allocation y reste
+    comme repli, et l'échec est journalisé avec l'URB, l'étape et le rc.
+- Fix (`controller_usb_host.c`), réserve DMA juste-à-temps :
+  - `dma_reserve_release(why)` ouvre un burst ;
+  - `dma_reserve_settle(why)` le ferme à la fin du probe (après le start
+    UAC) et reprend `(libéré − consommé) / 2560` morceaux ;
+  - le retry UAC libère ce qui est tenu, puis reprend le reste ;
+  - l'empreinte totale ne dépasse pas celle de la réserve au boot ;
+  - `USB DMA reserve: probe took ~N B, k/6 chunks re-taken` montre la
+    consommation réelle.
+- Fix (`controller_usb_host.c`), recovery du root selon le pattern upstream
+  `usb_storage` :
+  - power-off forcé (`usb_host_manager_set_root_power_by_index(root,false)`),
+    150 ms, puis power-on. INVALID_STATE est réessayé toutes les 20 ms
+    pendant 1 s maximum, le temps que le daemon traite la déconnexion ;
+  - répété toutes les 900 ms, puis toutes les 30 s après 8 cycles, jusqu'à
+    ce qu'un appareil soit probé sur ce root. Un NEW_DEV sur le root
+    stockage ne l'arrête pas ;
+  - armé immédiatement après la fermeture sur faute, et 900 ms après un
+    débranchement. Il remplace la requête one-shot et le re-arm idle-only
+    5 s/15 s (`rearm_root_if_silent` supprimé) ;
+  - exécuté après la file des probes, contrôleur fermé uniquement ;
+  - logs : `power-cycling root N`, `power-cycle #k off=... on=...` et
+    `power-cycle loop stopped after k cycles (NEW_DEV probed on it)`.
+- Risques :
+  - un cycle forcé pendant une énumération lente (plus de 900 ms) la coupe.
+    La cadence lente de 30 s laisse de toute façon la place ;
+  - le task contrôleur bloque environ 150-1150 ms par cycle, seulement quand
+    il est fermé.
+- Correctif structurel non appliqué (sdkconfig interdit ici) :
+  `CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=y` sortirait ces buffers de
+  la RAM interne fragmentée.
+- Vérification :
+  - syntaxe hôte `-Werror` OK sur `controller_usb_host.c`,
+    `controller_usb_host_routed.c` et `controller_usb_audio_stream.c` ;
+  - test scratchpad `t_v237` : settle partiel, puis nul, puis limité par un
+    malloc qui échoue ; cadence 900 ms ×8 puis 30 s ; retry du POWER_ON
+    borné ; root inconnu ignoré ; arrêt uniquement sur un probe du bon root ;
+    faute armée immédiatement ;
+  - test `t_v237u` sur le stream : NO_MEM synchrone sans soumission ni
+    fuite, prime sans allocation ;
+  - `t_v235` et `t_v236` repassent ;
+  - pas de build firmware ni de test matériel.
+
+## v238 — redémarrage complet du host USB (2026-09-24)
+
+- Résultat HIL v237 : le power-cycle forcé du root ne marche pas sur ce
+  fork. Les cycles #1-4 donnent off=OK on=OK, puis #5-#9 donnent
+  on=ESP_ERR_INVALID_STATE en boucle. Aucun NEW_DEV ne suit le
+  rebranchement : après un power-off forcé, ce root n'émet plus
+  d'événement de connexion. Piste abandonnée.
+- Fix : escalade vers un cycle complet du Host Library, comme au boot. Le
+  même `usb_host_config_t` est réinstallé, ce qui recrée aussi le hub
+  virtuel ; c'est la seule voie prouvée pour réénumérer ici.
+- `usb_host_manager` :
+  - API `usb_host_manager_request_host_restart(why)`, non bloquante.
+    Participants : `..._restart_participant_register(name)`,
+    `..._host_restart_pending()`, `..._host_generation()`,
+    `..._host_restart_release(id, gen)` et `..._wait_host_restart(gen)` ;
+  - la requête passe l'état READY -> RESTARTING et réveille le daemon par
+    `usb_host_lib_unblock()`. Le restart s'exécute sur le daemon (CPU1,
+    prio 4), là où `usb_host_install` doit allouer les interruptions DWC ;
+  - séquence :
+    1. attente bornée (5 s), avec `handle_events` qui continue de tourner,
+       que chaque participant libère son client. Le client topologie se
+       désinscrit seul ;
+    2. log `released=0x../0x.. clients= devices=`, plus le nom de chaque
+       participant qui n'a pas libéré ;
+    3. `usb_host_device_free_all()`, puis attente d'ALL_FREE (2 s) ;
+    4. `usb_host_uninstall()`, réessayé pendant 1 s tant qu'il reste des
+       flags en attente ;
+    5. réinstallation (3 tentatives) et nouvelle tâche topologie. La
+       génération est incrémentée en dernier ;
+  - un restart ne peut pas être forcé si un client est encore inscrit :
+    `usb_host_uninstall()` renverrait INVALID_STATE, et le handle du client
+    pointerait ensuite vers de la mémoire libérée. Dans ce cas, le détail
+    est journalisé, l'ancien stack est gardé et la topologie est relancée
+    dessus. Les participants se réinscrivent sur ce qui existe ;
+  - `host_call_enter/exit` compte les appels Host Library faits hors du
+    daemon (power root, info, recovery). Le daemon attend zéro avant
+    l'uninstall. La recovery par root est suspendue tant que l'état n'est
+    pas READY.
+- Contrôleur (`controller_usb_host.c`) :
+  - après 3 power-cycles sans probe sur le root, un restart host est
+    demandé (`full USB host restart k/3`), au plus 3 fois par épisode. Les
+    power-cycles, la réserve DMA et les retries v234-v237 restent ;
+  - `host_restart_participate()` ferme le contrôleur s'il est ouvert, puis
+    désinscrit le client, libère, attend, se réinscrit, vide la file des
+    probes (anciennes adresses) et rallume
+    `config.root_port_index` (nouveau champ, `LOCAL_USB1_ROOT_INDEX`) ;
+  - le prochain power-cycle attend 5 s, le temps que le stack réinstallé
+    énumère.
+- Stockage (`usb_storage.c`, hooks `USB_STORAGE_HOST_RESTART_*`, no-op hors
+  adaptateur partagé) :
+  - `storage_task`, seul propriétaire, démonte et libère la clé ;
+  - `usb_lib_task` fait `msc_host_uninstall()`, puis libère et attend ;
+  - ensuite `msc_host_install()`, reset de la session et recovery du root 1
+    (`host restart`), exactement comme au boot. Remontage de la
+    bibliothèque : environ 5 s ;
+  - si la libération dépasse 4 s, le stockage garde tout (le manager
+    abandonne le restart).
+- Audio : aucun changement dans le mix, ni en pacing ni en priorité. Le
+  restart ne tourne que sur CPU1 (daemon prio 4, tâche contrôleur).
+- Risques :
+  - un morceau lu depuis la clé USB est coupé par le démontage ;
+  - la pile du daemon (4096) porte maintenant aussi uninstall et
+    réinstallation, à surveiller au premier HIL ;
+  - avec un client non libéré, pas de restart (voir ci-dessus).
+- Vérification :
+  - syntaxe hôte `-Werror` OK sur `usb_host_manager.c` (hors champ
+    `fifo_settings_per_port` ajouté par le patch du fork),
+    `controller_usb_host_routed.c` et `usb_storage_shared.c` ;
+    `usb_storage.c` compile aussi seul, avec les macros par défaut ;
+  - test `t_v238` (contrôleur) : escalade après 3 cycles, puis
+    participation complète (timeout d'attente et échecs de register
+    réessayés), désinscription refusée, budget de 3 restarts, restart
+    refusé qui retombe sur le power-cycle ;
+  - test `t_v238m` (manager, faux Host Library) :
+    - restart nominal : ALL_FREE attendu, uninstall réessayé, réinstallation
+      et génération +1 ;
+    - requête en double refusée ;
+    - power root refusé pendant le restart ;
+    - release d'une génération passée ignoré ;
+    - participant absent : abandon, ancien stack gardé ;
+    - échec de réinstallation : FAILED ;
+  - `t_v235`, `t_v236` et `t_v237` repassent (t_v237 avec restart refusé) ;
+  - pas de build firmware ni de test matériel.
+
+## v239 — retour à v237 + réserve DMA, ré-ouverture du stream UAC (2026-09-24)
+
+- Rejet v238 (opérateur) : le restart complet du host démonte la clé MSC et
+  la bibliothèque ne revient pas. Le morceau en lecture est perdu :
+  inacceptable. L'escalade est désactivée, le code reste en place :
+  - `CONTROLLER_HOST_RESTART_ENABLED 0` : aucune requête
+    `usb_host_manager_request_host_restart()`, pas de participant
+    contrôleur ;
+  - le code manager et stockage v238 reste compilé, mais personne ne
+    demande de restart. Le stockage reste inscrit comme participant, sans
+    effet.
+- Relecture de la trace v236 : après l'unplug, la réserve DMA est libérée,
+  le probe réussit (`uac=1`), puis `control step 1 complete, priming
+  isochronous queue` à 28,6 s, et 360 ms plus tard `UAC stream fault
+  (ESP_FAIL)`, ce qui ferme tout le contrôleur. L'énumération n'est donc pas
+  en cause : c'est la (ré)ouverture du stream.
+  - `cfg_fail=1` : faute de configuration. Après le step 1, seul le prime
+    (alloc ou submit des URB isoc) peut la produire. Les steps 3/4 (rate)
+    sont ignorés en cas d'échec et ne font jamais de faute. Un claim
+    refusé est synchrone et aurait donné `uac=0`.
+  - Le log du prime v236 n'avait pas de code retour, donc la cause exacte
+    (NO_MEM ou INVALID_STATE/INVALID_SIZE du HCD) n'est pas prouvée.
+  - `usb_host_client_handle_events` traite les événements puis rend la
+    main : la faute est détectée quasi immédiatement. Les 360 ms sont
+    compatibles avec le retard de la console UART bloquante (7-10 ms par
+    ligne).
+  - Le HIL v237 n'a probablement jamais testé un re-attach UAC : le
+    power-cycle forcé, armé 900 ms après l'unplug, tuait le root avant.
+  - Après un unplug physique, la DDJ-400 repart hors tension, sans état
+    d'interface résiduel. Cet état ne compte que pour un close sans unplug
+    (retry in-place, re-probe). SET_CONFIGURATION 0 est exclu : usbh
+    possède la configuration.
+- Changements (`controller_usb_audio_stream.c`) :
+  - chaque start porte un numéro `UAC seq N`. Chaque étape est loggée avec
+    son rc et un horodatage relatif :
+    - `start dev=` (premier start ou répétition) ;
+    - claim `ifc/alt/ep/mps` ;
+    - alloc des 3 URB isoc et de l'URB control ;
+    - submit du step 5 (`SET_INTERFACE alt 0`) et du step 1
+      (`SET_INTERFACE alt N`), avec leur status ;
+    - `control step 1 complete (alt N)` ;
+    - prime, avec URB, alloc/submit et rc ;
+    - `UAC ready ... seq N +ms` ;
+  - `FAULT at <site>: <rc> (... streaming N ms, N isoc URBs completed)`.
+    Sites : isoc URB status, isoc resubmit, control step 1 submit/status,
+    prime submit/alloc, ring init, isoc URB alloc, configuration start. Le
+    rc est exposé dans `stats.fault_rc` et `stats.start_seq` ;
+  - `isoc_callback` capture sans logger le premier URB terminé et le
+    premier paquet en échec (index, status, actual/wanted).
+    `controller_usb_audio_stream_log_trace()` les imprime une fois, depuis
+    la tâche contrôleur, et seulement quand le stream ne tourne pas : aucun
+    log UART ne retarde les resubmits ;
+  - `stop: gone/faulted/fault/blockers`, `stop: ep halt/flush` et
+    `stop done: URBs freed, ifc N released|was not claimed` montrent si
+    l'ancien handle a vraiment libéré l'interface. Un échec de release est
+    loggé une seule fois ;
+  - `STREAM_RESET_ALT_ON_RESTART 1` : à partir du 2e start depuis le boot,
+    la séquence commence par `SET_INTERFACE alt 0` (step 5) puis
+    `alt N`. Un STALL sur alt 0 est ignoré. Le premier start du boot
+    (chemin qui marche) est inchangé : alt N directement ;
+  - on garde de v237 l'alloc des URB dans `stream_start` (réserve DMA).
+- Changements (`controller_usb_host.c`) :
+  - `CONTROLLER_ROOT_CYCLE_ENABLED 0` : plus de power-cycle forcé du root
+    (il le tuait en v237). Après un unplug, on attend NEW_DEV
+    (`root power-cycle disabled (v239), waiting for NEW_DEV`) ;
+  - une faute UAC ne ferme plus le contrôleur. `restart_uac_in_place()`
+    arrête seulement le stream, puis le retry v235 le relance quand il est
+    quiesced, avec libération et settle de la réserve DMA. Log : `UAC
+    stream fault (rc, seq N) ... restarting the stream in place in N ms,
+    MIDI stays up` ;
+  - une faute MIDI/contrôleur sans unplug ferme puis re-probe la même
+    adresse (`re-probing addr=N in N ms (device still enumerated)`) ;
+  - backoff par série de fautes : 250 ms, doublé jusqu'à 5 s, remis à zéro
+    après 30 s sans faute ou à l'unplug. Compteurs séparés pour UAC et
+    contrôleur.
+- Audio : rien ne change dans le mix, le pacing ou les priorités. Les
+  nouveaux logs tournent hors streaming, sauf les fautes (stream déjà mort).
+- À chercher dans le log HIL : `UAC seq`, `FAULT at`, `stop:`, `first isoc
+  URB`, `first failed isoc packet`, `restarting the stream in place`,
+  `re-probing addr`, `SET_INTERFACE alt 0`.
+- Risques :
+  - si la faute est structurelle (DMA ou HCD), le stream redémarre en
+    boucle, avec au plus un essai toutes les 5 s. MIDI et la clé MSC ne sont
+    pas touchés ;
+  - sans power-cycle, un root réellement bloqué n'a plus de recovery
+    automatique ;
+  - alt 0 avant alt N n'est pas encore validé sur la DDJ-400.
+- Vérification :
+  - syntaxe hôte `-Werror` OK sur `controller_usb_host_routed.c` (macros à
+    0, et variante à 1) et sur `controller_usb_audio_stream.c` ;
+  - `t_v239u` (stream) : premier start en alt N direct, trace muette
+    pendant le streaming puis imprimée après stop, start répété alt 0 ->
+    alt N -> prime, STALL sur alt 0 ignoré, STALL sur alt N en faute avec
+    rc, échec de submit au prime avec `fault_rc=INVALID_STATE`, start
+    suivant propre ;
+  - `t_v239c` (contrôleur) : backoff 250 ms -> 5 s puis reset, restart UAC
+    in-place sans close (ignoré si gone ou closing), re-probe de la même
+    adresse, pas de power-cycle armé à l'unplug ;
+  - `t_v235` et `t_v236` repassent tels quels. `t_v237` repasse avec
+    `ROOT_CYCLE_ENABLED=1` ; `t_v238` repasse avec les deux macros à 1.
+    `t_v237u` échoue par construction (son 2e start attend l'ancien alt N
+    direct), couvert par `t_v239u` ;
+  - pas de build firmware ni de test matériel.
+
+## v240 — buffers DMA USB en PSRAM (2026-09-25)
+
+- Résultat HIL v239 : diagnostic net. Après le replug, la boucle de restart
+  in-place tourne (seq 13-16). À chaque essai, `claim ifc 1 alt 2 ep 0x01
+  mps 576: ESP_OK` puis `FAULT at isoc URB alloc: ESP_ERR_NO_MEM`, stop
+  propre, retry 5 s, indéfiniment. MIDI et clé MSC restent sains. Cause :
+  heap DMA interne trop fragmenté après l'unplug pour les URB isoc, même
+  avec la réserve (6 x 2560 B).
+- Fix (approuvé par l'opérateur) : `CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=y`
+  dans `sdkconfig.defaults`.
+  - Le flag existe dans le fork épinglé (`esp-usb` `cc65dc26`,
+    `host/usb/Kconfig`, `depends on IDF_TARGET_ESP32P4 && SPIRAM`). Il
+    bascule `DATA_BUFFER_CAPS` (`usb_private.c`, données de tous les URB)
+    et `XFER_DESC_LIST_CAPS` (`hcd_dwc.c`, listes qTD des pipes) sur
+    `MALLOC_CAP_DMA | MALLOC_CAP_CACHE_ALIGNED | MALLOC_CAP_SPIRAM`. La
+    frame list par port reste interne ; elle est allouée une seule fois,
+    à l'installation.
+  - `esp_heap_adjust_alignment_to_hw()` retire `MALLOC_CAP_DMA` quand
+    `MALLOC_CAP_SPIRAM` est demandé (aucune région n'a les deux caps) et
+    aligne taille et adresse sur la ligne de cache. Vérifié dans les
+    sources IDF 5.5.4 disponibles localement ; 6.0.2 non présent sur la
+    machine de revue.
+  - La cohérence de cache est déjà gérée : sur P4
+    (`SOC_CACHE_INTERNAL_MEM_VIA_L1CACHE`), le HCD fait `esp_cache_msync`
+    sur chaque buffer, en interne comme en PSRAM.
+  - Portée globale : MIDI, UAC et MSC (bulk) passent en PSRAM, ce qui
+    enlève aussi les buffers MSC du heap DMA interne.
+- `controller_usb_host.c` : la réserve DMA interne n'a plus rien à
+  protéger. Avec le flag, `CONTROLLER_DMA_RESERVE_ENABLED 0`, ce qui rend
+  environ 15 KB de RAM interne. Au boot, un log l'indique : `USB DMA
+  reserve off: USB-DWC buffers in PSRAM`. Sans le flag (sdkconfig non
+  régénéré), la réserve v236/v237 reste active telle quelle.
+- `controller_usb_audio_stream.c` : le log d'alloc indique où sont les
+  buffers : `3 isoc URBs (2304 B, PSRAM|internal)`.
+- Impact isochrone :
+  - le flux OUT fait 576 B/ms, soit environ 0,6 MB/s, négligeable face au
+    débit PSRAM à 200 MHz ;
+  - le DWC lit chaque paquet via AHB pendant la frame. Les pics de latence
+    PSRAM (DSI/PPA/LVGL) sont de l'ordre de la µs, contre une frame de
+    1 ms ;
+  - la file garde 3 URB x 4 paquets d'avance ;
+  - côté CPU, l'écriture des échantillons dans le buffer et le msync sont
+    du même ordre qu'en interne (P4 passe aussi par le cache pour
+    l'interne) ;
+  - aucun changement de mix, de pacing ou de priorité.
+- Risques :
+  - le sdkconfig local contient `# CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM
+    is not set`, que les defaults ne remplacent pas. Il faut supprimer
+    `sdkconfig` avant le build, sinon le flag est ignoré. Le log de boot et
+    `PSRAM|internal` le montrent ;
+  - Kconfig le signale comme « minor performance degradation ». Le débit
+    de lecture MSC depuis la clé est à vérifier pendant la lecture ;
+  - l'underrun isoc sous forte charge PSRAM (UI) reste à valider en HIL.
+- Vérification :
+  - syntaxe hôte `-Werror` OK, `controller_usb_host_routed.c` avec et sans
+    le flag, et `controller_usb_audio_stream.c` ;
+  - `t_v240` : réserve active sans le flag (6 chunks, release/settle),
+    aucune allocation avec le flag ;
+  - `t_v239u` (avec `PSRAM` dans le log), `t_v239c`, `t_v235` et `t_v236`
+    repassent ;
+  - pas de build firmware ni de test matériel.

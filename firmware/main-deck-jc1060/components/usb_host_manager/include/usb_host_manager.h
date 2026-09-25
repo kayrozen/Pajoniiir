@@ -49,6 +49,9 @@ typedef struct {
     uint32_t recovery_successes;
     uint32_t recovery_suppressed_active;
     uint32_t recovery_failures;
+    uint32_t host_restarts;
+    uint32_t host_restart_failures;
+    uint32_t host_generation;
     unsigned peripheral_map;
     bool fs_phy_override_requested;
     uint8_t fs_phy_index;
@@ -77,6 +80,32 @@ esp_err_t usb_host_manager_request_recovery(
     usb_host_recovery_reason_t reason);
 esp_err_t usb_host_manager_get_library_info(usb_host_lib_info_t *info_out);
 void usb_host_manager_get_diagnostics(usb_host_manager_diagnostics_t *diag_out);
+
+/* v238: full Host Library restart (usb_host_uninstall + usb_host_install
+ * with the boot config, which also re-creates the virtual root hub). The
+ * forced root power-cycle produces no connection event on this fork, so a
+ * wedged device can only be re-enumerated this way.
+ *
+ * Every task owning a Host Library client registers once as a participant.
+ * While usb_host_manager_host_restart_pending() is true it closes its
+ * devices, deregisters its client, calls ..._host_restart_release() with the
+ * generation it saw, then waits in ..._wait_host_restart() and registers a
+ * new client. The daemon waits a bounded time for every participant; it
+ * cannot uninstall while a client is still registered and keeps the old
+ * stack in that case. Both roots come back unpowered (root_port_unpowered):
+ * each participant re-powers its own root after the restart. */
+#define USB_HOST_MANAGER_RESTART_PARTICIPANTS_MAX 4u
+
+esp_err_t usb_host_manager_restart_participant_register(const char *name,
+                                                        uint32_t *id_out);
+esp_err_t usb_host_manager_request_host_restart(const char *why);
+bool usb_host_manager_host_restart_pending(void);
+uint32_t usb_host_manager_host_generation(void);
+void usb_host_manager_host_restart_release(uint32_t id, uint32_t generation);
+/* ESP_OK once the generation moved past `generation` with a ready stack,
+ * ESP_ERR_INVALID_STATE if the reinstall failed, ESP_ERR_TIMEOUT. */
+esp_err_t usb_host_manager_wait_host_restart(uint32_t generation,
+                                             TickType_t timeout);
 
 #ifdef __cplusplus
 }

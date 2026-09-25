@@ -1,0 +1,205 @@
+W (1691) spi_flash: Detected boya flash chip but using generic dESP-ROM:esp32p4-eco2-20240710
+Build:Jul 10 2024
+rst:0xc (SW_CPU_RESET),boot:0x30f (SPI_FAST_FLASH_BOOT)
+Core0 Saved PC:0x4ff00cec
+Core1 Saved PC:0x4ff06e3c
+SPI mode:DIO, clock div:1
+load:0x4ff33ce0,len:0x510
+load:0x4ff28ed0,len:0xc34
+load:0x4ff2bbd0,len:0x3388
+entry 0x4ff28ed0
+W (1693) spi_flash: Detected boya flash chip but using generic driver. For optimal functionality, enable `SPI_FLASH_SUPPORT_BOYA_CHIP` in menuconfig
+ESP_ERROR_CHECK failed: esp_err_t 0x102 (ESP_ERR_INVALID_ARG) at 0x4803002a
+file: "./main/app_main.c" line 351
+func: app_main
+expression: bsp_touch_init()
+ESP-ROM:esp32p4-eco2-20240710
+Build:Jul 10 2024
+rst:0xc (SW_CPU_RESET),boot:0x30f (SPI_FAST_FLASH_BOOT)
+Core0 Saved PC:0x4ff00cec
+Core1 Saved PC:0x4ff06e3c
+SPI mode:DIO, clock div:1
+load:0x4ff33ce0,len:0x510
+load:0x4ff28ed0,len:0xc34
+load:0x4ff2bbd0,len:0x3388
+entry 0x4ff28ed0
+W (1695) spi_flash: Detected boya flash chip but using generic driver. For optimal functionality, enable `SPI_FLASH_SUPPORT_BOYA_CHIP` in menuconfig
+ESP_ERROR_CHECK failed: esp_err_t 0x102 (ESP_ERR_INVALID_ARG) at 0x4803002a
+file: "./main/app_main.c" line 351
+func: app_main
+expression: bsp_touch_init()
+ESP-ROM:esp32p4-eco2-20240710
+Build:Jul 10 2024
+rst:0xc (SW_CPU_RESET),boot:0x30f (SPI_FAST_FLASH_BOOT)
+Core0 Saved PC:0x4ff00cec
+Core1 Saved PC:0x4ff06e3c
+SPI mode:DIO, clock div:1
+load:0x4ff33ce0,len:0x510
+load:0x4ff28ed0,len:0xc34
+load:0x4ff2bbd0,len:0x3388
+entry 0x4ff28ed0
+W (1693) spi_flash: Detected boya flash chip but using generic driver. For optimal functionality, enable `SPI_FLASH_SUPPORT_BOYA_CHIP` in menuconfig
+ESP_ERROR_CHECK failed: esp_err_t 0x102 (ESP_ERR_INVALID_ARG) at 0x4803002a
+file: "./main/app_main.c" line 351
+func: app_main
+expression: bsp_touch_init()
+ESP-ROM:esp32p4-eco2-20240710
+Build:Jul 10 2024
+rst:0xc (SW_CPU_RESET),boot:0x30f (SPI_FAST_FLASH_BOOT)
+Core0 Saved PC:0x4ff00cec
+Core1 Saved PC:0x4ff06e3c
+SPI mode:DIO, clock div:1
+load:0x4ff33ce0,len:0x510
+load:0x4ff28ed0,len:0xc34
+load:0x4ff2bbd0,len:0x3388
+entry 0x4ff28ed0
+W (1693) spi_flash: Detected boya flash chip but using generic driver. For optimal functionality, enable `SPI_FLASH_SUPPORT_BOYA_CHIP` in menuconfig
+ESP_ERROR_CHECK failed: esp_err_t 0x102 (ESP_ERR_INVALID_ARG) at 0x4803002a
+file: "./main/app_main.c" line 351
+func: app_main
+expression: bsp_touch_init()
+ESP-ROM:esp32p4-eco2-20240710
+Build:Jul 10 2024
+rst:0xc (SW_CPU_RESET),boot:0x30f (SPI_FAST_FLASH_BOOT)
+Core0 Saved PC:0x4ff00cec
+Core1 Saved PC:0x4ff06e3c
+SPI mode:DIO, clock div:1
+load:0x4ff33ce0,len:0x510
+load:0x4ff28ed0,len:0xc34
+load:0x4ff2bbd0,len:0x3388
+entry 0x4ff28ed0
+W (1693) spi_flash: Detected boya flash chip but using generic driver. For optimal functionality, enable `SPI_FLASH_SUPPORT_BOYA_CHIP` in menuconfig
+ESP_ERROR_CHECK failed: esp_err_t 0x102 (ESP_ERR_INVALID_ARG) at 0x4803002a
+file: "./main/app_main.c" line 351
+func: app_main
+expression: bsp_touch_init()
+ESP-ROM:esp32p4-eco2-20240710
+Build:Jul 10 2024
+rst:0xc (SW_CPU_RESET),boot:0x30f (SPI_FAST_FLASH_BOOT)
+Core0 Saved PC:0x4ff00cec
+Core1 Saved PC:0x4ff06e3c
+SPI mode:DIO, clock div:1
+load:0x4ff33ce0,len:0x510
+load:0x4ff28ed0,len:0xc34
+load:0x4ff2bbd0,len:0x3388
+entry 0x4ff28ed0
+W (1693) spi_flash: Detected boya flash chip but using generic driver. For optimal functionality, enable `SPI_FLASH_SUPPORT_BOYA_CHIP` in menuconfig
+ESP_ERROR_CHECK failed: esp_err_t 0x102 (ESP_ERR_INVALID_ARG) at 0x4803002a
+file: "./main/app_main.c" line 351
+func: app_main
+expression: bsp_touch_init()
+ESP-ROM:esp32p4-eco2-20240710
+Build:Jul 10 2024
+rst:0xc (SW_CPU_RESET),boot:0x30f (SPI_FAST_FLASH_BOOT)
+Core0 Saved PC:0x4ff00cec
+Core1 Saved PC:0x4ff06e3c
+SPI mode:DIO, clock div:1
+load:0x4ff33ce0,len:0x510
+load:0x4ff28ed0,len:0xc34
+load:0x4ff2bbd0,len:0x3388
+entry 0x4ff28ed0
+W (1693) spi_flash: Detected boya flash chip but using generic driver. For optimal functionality, enable `SPI_FLASH_SUPPORT_BOYA_CHIP` in menuconfig
+ESP_ERROR_CHECK failed: esp_err_t 0x102 (ESP_ERR_INVALID_ARG) at 0x4803002a
+file: "./main/app_main.c" line 351
+func: app_main
+expression: bsp_touch_init()
+ESP-ROM:esp32p4-eco2-20240710
+Build:Jul 10 2024
+rst:0xc (SW_CPU_RESET),boot:0x30f (SPI_FAST_FLASH_BOOT)
+Core0 Saved PC:0x4ff00cec
+Core1 Saved PC:0x4ff06e3c
+SPI mode:DIO, clock div:1
+load:0x4ff33ce0,len:0x510
+load:0x4ff28ed0,len:0xc34
+load:0x4ff2bbd0,len:0x3388
+entry 0x4ff28ed0
+W (1695) spi_flash: Detected boya flash chip but using generic driver. For optimal functionality, enable `SPI_FLASH_SUPPORT_BOYA_CHIP` in menuconfig
+ESP_ERROR_CHECK failed: esp_err_t 0x102 (ESP_ERR_INVALID_ARG) at 0x4803002a
+file: "./main/app_main.c" line 351
+func: app_main
+expression: bsp_touch_init()
+ESP-ROM:esp32p4-eco2-20240710
+Build:Jul 10 2024
+rst:0xc (SW_CPU_RESET),boot:0x30f (SPI_FAST_FLASH_BOOT)
+Core0 Saved PC:0x4ff00cec
+Core1 Saved PC:0x4ff06e3c
+SPI mode:DIO, clock div:1
+load:0x4ff33ce0,len:0x510
+load:0x4ff28ed0,len:0xc34
+load:0x4ff2bbd0,len:0x3388
+entry 0x4ff28ed0
+W (1695) spi_flash: Detected boya flash chip but using generic driver. For optimal functionality, enable `SPI_FLASH_SUPPORT_BOYA_CHIP` in menuconfig
+ESP_ERROR_CHECK failed: esp_err_t 0x102 (ESP_ERR_INVALID_ARG) at 0x4803002a
+file: "./main/app_main.c" line 351
+func: app_main
+expression: bsp_touch_init()
+ESP-ROM:esp32p4-eco2-20240710
+Build:Jul 10 2024
+rst:0xc (SW_CPU_RESET),boot:0x30f (SPI_FAST_FLASH_BOOT)
+Core0 Saved PC:0x4ff00cec
+Core1 Saved PC:0x4ff06e3c
+SPI mode:DIO, clock div:1
+load:0x4ff33ce0,len:0x510
+load:0x4ff28ed0,len:0xc34
+load:0x4ff2bbd0,len:0x3388
+entry 0x4ff28ed0
+W (1695) spi_flash: Detected boya flash chip but using generic driver. For optimal functionality, enable `SPI_FLASH_SUPPORT_BOYA_CHIP` in menuconfig
+ESP_ERROR_CHECK failed: esp_err_t 0x102 (ESP_ERR_INVALID_ARG) at 0x4803002a
+file: "./main/app_main.c" line 351
+func: app_main
+expression: bsp_touch_init()
+ESP-ROM:esp32p4-eco2-20240710
+Build:Jul 10 2024
+rst:0xc (SW_CPU_RESET),boot:0x30f (SPI_FAST_FLASH_BOOT)
+Core0 Saved PC:0x4ff00cec
+Core1 Saved PC:0x4ff06e3c
+SPI mode:DIO, clock div:1
+load:0x4ff33ce0,len:0x510
+load:0x4ff28ed0,len:0xc34
+load:0x4ff2bbd0,len:0x3388
+entry 0x4ff28ed0
+W (1693) spi_flash: Detected boya flash chip but using generic driver. For optimal functionality, enable `SPI_FLASH_SUPPORT_BOYA_CHIP` in menuconfig
+ESP_ERROR_CHECK failed: esp_err_t 0x102 (ESP_ERR_INVALID_ARG) at 0x4803002a
+file: "./main/app_main.c" line 351
+func: app_main
+expression: bsp_touch_init()
+ESP-ROM:esp32p4-eco2-20240710
+Build:Jul 10 2024
+rst:0xc (SW_CPU_RESET),boot:0x30f (SPI_FAST_FLASH_BOOT)
+Core0 Saved PC:0x4ff00cec
+Core1 Saved PC:0x4ff06e3c
+SPI mode:DIO, clock div:1
+load:0x4ff33ce0,len:0x510
+load:0x4ff28ed0,len:0xc34
+load:0x4ff2bbd0,len:0x3388
+entry 0x4ff28ed0
+W (1695) spi_flash: Detected boya flash chip but using generic driver. For optimal functionality, enable `SPI_FLASH_SUPPORT_BOYA_CHIP` in menuconfig
+ESP_ERROR_CHECK failed: esp_err_t 0x102 (ESP_ERR_INVALID_ARG) at 0x4803002a
+file: "./main/app_main.c" line 351
+func: app_main
+expression: bsp_touch_init()
+ESP-ROM:esp32p4-eco2-20240710
+Build:Jul 10 2024
+rst:0xc (SW_CPU_RESET),boot:0x30f (SPI_FAST_FLASH_BOOT)
+Core0 Saved PC:0x4ff00cec
+Core1 Saved PC:0x4ff06e3c
+SPI mode:DIO, clock div:1
+load:0x4ff33ce0,len:0x510
+load:0x4ff28ed0,len:0xc34
+load:0x4ff2bbd0,len:0x3388
+entry 0x4ff28ed0
+W (1695) spi_flash: Detected boya flash chip but using generic driver. For optimal functionality, enable `SPI_FLASH_SUPPORT_BOYA_CHIP` in menuconfig
+ESP_ERROR_CHECK failed: esp_err_t 0x102 (ESP_ERR_INVALID_ARG) at 0x4803002a
+file: "./main/app_main.c" line 351
+func: app_main
+expression: bsp_touch_init()
+ESP-ROM:esp32p4-eco2-20240710
+Build:Jul 10 2024
+rst:0xc (SW_CPU_RESET),boot:0x30f (SPI_FAST_FLASH_BOOT)
+Core0 Saved PC:0x4ff00cec
+Core1 Saved PC:0x4ff06e3c
+SPI mode:DIO, clock div:1
+load:0x4ff33ce0,len:0x510
+load:0x4ff28ed0,len:0xc34
+load:0x4ff2bbd0,len:0x3388
+entry 0x4ff28ed0

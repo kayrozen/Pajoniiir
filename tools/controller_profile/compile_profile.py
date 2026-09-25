@@ -45,6 +45,7 @@ RAW_CC14_MSB = 4
 RAW_CC14_LSB = 5
 RAW_CC7_ABS = 6
 RAW_NOTE_STATE_PAIR = 7
+RAW_NOTE_SELECT = 8      # jc1060 parser only (v232)
 
 RAW_TYPE_NAMES = {
     RAW_NOTE_BUTTON: "note_button",
@@ -55,6 +56,7 @@ RAW_TYPE_NAMES = {
     RAW_CC14_LSB: "cc14_lsb",
     RAW_CC7_ABS: "cc7_abs",
     RAW_NOTE_STATE_PAIR: "note_state_pair",
+    RAW_NOTE_SELECT: "note_select",
 }
 
 FLAG_REPLAY = 0x0001
@@ -312,6 +314,13 @@ def compile_inputs(inputs):
                                      num(member["data1"]),
                                      RAW_NOTE_STATE_PAIR, t, i,
                                      pair_slot=slot, flags=flags, lut=lut))
+        elif kind == "note_select":
+            # One position of a multi-position selector: emits "value" on
+            # press, nothing on release (DDJ-400 Beat FX CH1/CH2/MASTER).
+            t, i = resolve_event(item["event"])
+            entries.append(Entry(num(item["status"]), num(item["data1"]),
+                                 RAW_NOTE_SELECT, t, i,
+                                 base_value=int(item["value"])))
         else:
             raise ValueError("unknown input type: " + kind)
 

@@ -18,6 +18,15 @@
 #include <unistd.h>
 #endif
 
+/* v233: every profile rejection is logged with its reason. WARN, because
+ * CONFIG_LOG_DEFAULT_LEVEL=2 compiles INFO out. */
+#ifdef CONTROLLER_PROFILE_MANAGER_PC_TEST
+#define CPM_LOGW(...) ((void)0)
+#else
+#include "esp_log.h"
+#define CPM_LOGW(...) ESP_LOGW("ctrl_profile", __VA_ARGS__)
+#endif
+
 /* ── Pure helpers (host-testable) ──────────────────────────────────────────── */
 
 uint32_t controller_profile_crc32(const uint8_t *data, size_t len)
@@ -58,20 +67,33 @@ esp_err_t controller_profile_meta_parse(const uint8_t *data, size_t len,
     meta->size = 0;
 
     if (len < CPM_HEADER_SIZE || len > CPM_MAX_PROFILE_SIZE) {
+        CPM_LOGW("profile rejected: file size %u outside %u..%u",
+                 (unsigned)len, (unsigned)CPM_HEADER_SIZE,
+                 (unsigned)CPM_MAX_PROFILE_SIZE);
         return ESP_ERR_INVALID_ARG;
     }
     if (memcmp(data, CPM_MAGIC, 4) != 0) {
+        CPM_LOGW("profile rejected: bad magic %02X %02X %02X %02X",
+                 data[0], data[1], data[2], data[3]);
         return ESP_ERR_INVALID_ARG;
     }
     if (rd_u16(data + 4) != CPM_VERSION || rd_u16(data + 6) != CPM_HEADER_SIZE) {
+        CPM_LOGW("profile rejected: version %u header %u (want %u/%u)",
+                 (unsigned)rd_u16(data + 4), (unsigned)rd_u16(data + 6),
+                 (unsigned)CPM_VERSION, (unsigned)CPM_HEADER_SIZE);
         return ESP_ERR_INVALID_ARG;
     }
 
     uint32_t profile_size = rd_u32(data + 8);
     if (profile_size != len) {
+        CPM_LOGW("profile rejected: read %u bytes, header size %u",
+                 (unsigned)len, (unsigned)profile_size);
         return ESP_ERR_INVALID_ARG;
     }
-    if (controller_profile_crc32(data + 16, len - 16) != rd_u32(data + 12)) {
+    uint32_t crc = controller_profile_crc32(data + 16, len - 16);
+    if (crc != rd_u32(data + 12)) {
+        CPM_LOGW("profile rejected: CRC computed 0x%08X, header 0x%08X",
+                 (unsigned)crc, (unsigned)rd_u32(data + 12));
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -80,6 +102,10 @@ esp_err_t controller_profile_meta_parse(const uint8_t *data, size_t len,
     uint8_t pair_slot_count = data[28];
     if (input_count > CPM_MAX_INPUTS || output_count > CPM_MAX_OUTPUTS ||
         pair_slot_count > CPM_MAX_PAIR_SLOTS) {
+        CPM_LOGW("profile rejected: inputs %u/%u outputs %u/%u pair slots %u/%u",
+                 (unsigned)input_count, (unsigned)CPM_MAX_INPUTS,
+                 (unsigned)output_count, (unsigned)CPM_MAX_OUTPUTS,
+                 (unsigned)pair_slot_count, (unsigned)CPM_MAX_PAIR_SLOTS);
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -90,6 +116,11 @@ esp_err_t controller_profile_meta_parse(const uint8_t *data, size_t len,
                            (size_t)output_count * CPM_OUTPUT_ENTRY_SIZE +
                            rd_u16(data + 30);
     if (expected_size != len) {
+        CPM_LOGW("profile rejected: %u bytes, entries+sysex need %u "
+                 "(inputs %u outputs %u sysex %u)",
+                 (unsigned)len, (unsigned)expected_size,
+                 (unsigned)input_count, (unsigned)output_count,
+                 (unsigned)rd_u16(data + 30));
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -99,17 +130,27 @@ esp_err_t controller_profile_meta_parse(const uint8_t *data, size_t len,
         uint8_t raw_type = entry[2];
         uint8_t pair_slot = entry[3];
         if (raw_type > CPM_MAX_RAW_TYPE) {
+            CPM_LOGW("profile rejected: input %u (%02X %02X) raw type %u > %u "
+                     "(firmware older than the profile compiler?)",
+                     (unsigned)i, entry[0], entry[1], (unsigned)raw_type,
+                     (unsigned)CPM_MAX_RAW_TYPE);
             return ESP_ERR_INVALID_ARG;
         }
         bool needs_pair_slot = raw_type == 4 || raw_type == 5 || raw_type == 7;
         if (needs_pair_slot &&
             (pair_slot == CPM_PAIR_SLOT_NONE || pair_slot >= pair_slot_count)) {
+            CPM_LOGW("profile rejected: input %u pair slot %u of %u",
+                     (unsigned)i, (unsigned)pair_slot,
+                     (unsigned)pair_slot_count);
             return ESP_ERR_INVALID_ARG;
         }
     }
     for (uint16_t i = 0; i < output_count;
          i++, entry += CPM_OUTPUT_ENTRY_SIZE) {
         if (entry[2] > CPM_MAX_OUTPUT_KIND) {
+            CPM_LOGW("profile rejected: output %u kind %u > %u",
+                     (unsigned)i, (unsigned)entry[2],
+                     (unsigned)CPM_MAX_OUTPUT_KIND);
             return ESP_ERR_INVALID_ARG;
         }
     }
@@ -352,15 +393,23 @@ static bool load_profile_meta(const char *dir_path, const char *name,
 
     FILE *f = fopen(path, "rb");
     if (!f) {
+        CPM_LOGW("profile dir '%s': cannot open %s (errno %d %s)", name, path,
+                 errno, strerror(errno));
         return false; /* not a profile directory */
     }
 
     uint8_t *buf = (uint8_t *)malloc(CPM_MAX_PROFILE_SIZE + 1);
     if (!buf) {
         fclose(f);
+        CPM_LOGW("profile '%s': no memory for %u-byte read buffer", name,
+                 (unsigned)(CPM_MAX_PROFILE_SIZE + 1));
         return false;
     }
     size_t len = fread(buf, 1, CPM_MAX_PROFILE_SIZE + 1, f);
+    if (ferror(f)) {
+        CPM_LOGW("profile '%s': read error after %u bytes (errno %d %s)",
+                 name, (unsigned)len, errno, strerror(errno));
+    }
     fclose(f);
 
     memset(meta, 0, sizeof(*meta));
@@ -371,6 +420,14 @@ static bool load_profile_meta(const char *dir_path, const char *name,
     /* A too-large file fails validation inside meta_parse (len bound). */
     (void)controller_profile_meta_parse(buf, len, meta);
     free(buf);
+    if (meta->valid) {
+        CPM_LOGW("profile '%s': %u bytes VID=0x%04X PID=0x%04X inputs=%u "
+                 "outputs=%u OK", name, (unsigned)len, meta->vid, meta->pid,
+                 (unsigned)meta->input_count, (unsigned)meta->output_count);
+    } else {
+        CPM_LOGW("profile '%s': %s (%u bytes read) INVALID, ignored", name,
+                 path, (unsigned)len);
+    }
     return true; /* recorded (possibly with valid=false so UI can report it) */
 }
 
@@ -388,6 +445,8 @@ esp_err_t controller_profile_scan_dir(const char *root,
 
     DIR *dir = opendir(root);
     if (!dir) {
+        CPM_LOGW("cannot open profile root %s (errno %d %s)", root, errno,
+                 strerror(errno));
         return ESP_ERR_NOT_FOUND;
     }
 
@@ -397,9 +456,13 @@ esp_err_t controller_profile_scan_dir(const char *root,
             continue;
         }
         if (!controller_profile_id_valid(entry->d_name)) {
+            CPM_LOGW("profile dir '%s' skipped: name must be [A-Za-z0-9_-], "
+                     "< %u chars", entry->d_name, (unsigned)CPM_ID_MAX);
             continue;
         }
         if (controller_profile_storage_recover(root, entry->d_name) != ESP_OK) {
+            CPM_LOGW("profile dir '%s' skipped: upload/backup recovery failed",
+                     entry->d_name);
             continue;
         }
         controller_profile_meta_t meta;
@@ -602,7 +665,9 @@ static bool cpm_read_profile(const controller_profile_meta_t *m,
     }
     sd_io_gate_end();
     if (got != m->size) {
-        ESP_LOGW(TAG, "cannot read complete profile %s", m->path);
+        ESP_LOGW(TAG, "cannot read complete profile %s: %u of %u bytes "
+                 "(errno %d %s)", m->path, (unsigned)got, (unsigned)m->size,
+                 errno, strerror(errno));
         free(buf);
         return false;
     }
@@ -610,6 +675,9 @@ static bool cpm_read_profile(const controller_profile_meta_t *m,
     controller_profile_meta_t parsed = {0};
     if (controller_profile_meta_parse(buf, m->size, &parsed) != ESP_OK ||
         parsed.vid != m->vid || parsed.pid != m->pid) {
+        ESP_LOGW(TAG, "profile %s changed on SD since scan (VID/PID "
+                 "0x%04X:0x%04X, scanned 0x%04X:0x%04X)", m->path,
+                 parsed.vid, parsed.pid, m->vid, m->pid);
         free(buf);
         return false;
     }
@@ -718,8 +786,13 @@ esp_err_t controller_profile_manager_scan_storage(void)
         ESP_LOGW(TAG, "no %s directory (SD missing or no profiles)",
                  CONFIG_CONTROLLER_PROFILE_SD_PATH);
     } else if (rc == ESP_OK) {
-        ESP_LOGI(TAG, "%u controller profile(s) in %s",
-                 (unsigned)scanned->count, CONFIG_CONTROLLER_PROFILE_SD_PATH);
+        unsigned valid = 0u;
+        for (uint8_t i = 0; i < scanned->count; i++) {
+            valid += scanned->profiles[i].valid ? 1u : 0u;
+        }
+        ESP_LOGW(TAG, "%u controller profile(s) in %s, %u valid",
+                 (unsigned)scanned->count, CONFIG_CONTROLLER_PROFILE_SD_PATH,
+                 valid);
     }
     free(scanned);
     return rc;
@@ -815,6 +888,12 @@ int controller_profile_manager_on_descriptor_report(uint16_t vid, uint16_t pid,
     }
     const int idx = controller_profile_registry_on_descriptor(&s_registry, vid, pid);
     s_registry.connected_epoch = connection_epoch;
+    const unsigned reg_count = s_registry.count;
+    unsigned reg_invalid = 0u;
+    for (uint8_t i = 0; i < s_registry.count; i++) {
+        const controller_profile_meta_t *m = &s_registry.profiles[i];
+        reg_invalid += !m->valid ? 1u : 0u;
+    }
     char product_copy[CPM_PRODUCT_MAX + 1];
     snprintf(product_copy, sizeof(product_copy), "%s", s_registry.connected_product);
     if (already_active && idx >= 0) {
@@ -832,8 +911,10 @@ int controller_profile_manager_on_descriptor_report(uint16_t vid, uint16_t pid,
     }
     if (idx < 0) {
         controller_profile_runtime_clear();
-        ESP_LOGW(TAG, "controller VID=0x%04X PID=0x%04X uses built-in map",
-                 vid, pid);
+        ESP_LOGW(TAG, "controller VID=0x%04X PID=0x%04X uses built-in map "
+                 "(no valid SD profile matches; registry %u profile(s), %u "
+                 "invalid - see 'profile rejected' at boot)",
+                 vid, pid, reg_count, reg_invalid);
         return -1;
     }
     if (already_active) {

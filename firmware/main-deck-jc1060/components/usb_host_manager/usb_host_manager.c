@@ -27,12 +27,19 @@ static const char *TAG = "usb_host_mgr";
 #define RECOVERY_POWER_ON_TIMEOUT_MS 1000u
 #define RECOVERY_RETRY_BASE_MS     250u
 #define RECOVERY_RETRY_MAX_MS      30000u
+#define RESTART_RELEASE_TIMEOUT_MS 5000u
+#define RESTART_POLL_MS            10u
+#define RESTART_ALL_FREE_TIMEOUT_MS 2000u
+#define RESTART_UNINSTALL_TIMEOUT_MS 1000u
+#define RESTART_INSTALL_ATTEMPTS   3u
+#define RESTART_INSTALL_RETRY_MS   500u
 
 typedef enum {
     MANAGER_STOPPED = 0,
     MANAGER_STARTING,
     MANAGER_READY,
     MANAGER_FAILED,
+    MANAGER_RESTARTING,
 } manager_state_t;
 
 static usb_host_manager_config_t s_config;
@@ -63,6 +70,17 @@ static usb_host_topology_t s_topology;
 static usb_host_recovery_arbiter_t s_recovery_arbiter;
 static portMUX_TYPE s_topology_mux = portMUX_INITIALIZER_UNLOCKED;
 static manager_state_t s_state = MANAGER_STOPPED;
+/* v238: Host Library calls in flight outside the daemon. A restart waits for
+ * zero before usb_host_uninstall(); see host_call_enter(). */
+static uint32_t s_host_calls;
+static const char *s_restart_why = "";
+static uint32_t s_host_generation;
+static uint32_t s_host_restarts;
+static uint32_t s_host_restart_failures;
+static const char *s_participant_names[USB_HOST_MANAGER_RESTART_PARTICIPANTS_MAX];
+static uint32_t s_participant_mask;
+static uint32_t s_participant_released;
+static portMUX_TYPE s_participant_mux = portMUX_INITIALIZER_UNLOCKED;
 
 typedef struct {
     uint8_t port;
@@ -82,7 +100,25 @@ static inline manager_state_t state_get(void)
 
 static inline void state_set(manager_state_t state)
 {
-    __atomic_store_n(&s_state, state, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_state, state, __ATOMIC_SEQ_CST);
+}
+
+/* Pairs with the SEQ_CST RESTARTING store in request_host_restart(): once the
+ * daemon has seen s_host_calls == 0 after that store, no caller can still be
+ * inside, or enter, a Host Library call. */
+static bool host_call_enter(void)
+{
+    (void)__atomic_add_fetch(&s_host_calls, 1u, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&s_state, __ATOMIC_SEQ_CST) == MANAGER_READY) {
+        return true;
+    }
+    (void)__atomic_sub_fetch(&s_host_calls, 1u, __ATOMIC_SEQ_CST);
+    return false;
+}
+
+static inline void host_call_exit(void)
+{
+    (void)__atomic_sub_fetch(&s_host_calls, 1u, __ATOMIC_SEQ_CST);
 }
 
 static void topology_event_callback(
@@ -160,20 +196,36 @@ static void topology_client_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
+    bool deregister_logged = false;
     for (;;) {
         const esp_err_t event_rc = usb_host_client_handle_events(
             s_topology_client, pdMS_TO_TICKS(100));
         if (event_rc != ESP_OK && event_rc != ESP_ERR_TIMEOUT) {
             ESP_LOGW(TAG, "topology events: %s", esp_err_to_name(event_rc));
         }
+        if (state_get() != MANAGER_RESTARTING) {
+            continue;
+        }
+        /* v238: the reinstall re-creates this task with a new client. */
+        const esp_err_t dereg_rc =
+            usb_host_client_deregister(s_topology_client);
+        if (dereg_rc != ESP_OK) {
+            if (!deregister_logged) {
+                ESP_LOGW(TAG, "host restart: topology deregister: %s",
+                         esp_err_to_name(dereg_rc));
+                deregister_logged = true;
+            }
+            continue;
+        }
+        s_topology_client = NULL;
+        __atomic_store_n(&s_topology_task, NULL, __ATOMIC_RELEASE);
+        vTaskDelete(NULL);
+        return;
     }
 }
 
 static esp_err_t recovery_power_off_if_idle(uint8_t port)
 {
-    if (!usb_host_manager_is_ready()) {
-        return ESP_ERR_INVALID_STATE;
-    }
     if (port >= 32u) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -181,9 +233,13 @@ static esp_err_t recovery_power_off_if_idle(uint8_t port)
     if ((s_config.peripheral_map & bit) == 0u) {
         return ESP_ERR_NOT_FOUND;
     }
+    if (!host_call_enter()) {
+        return ESP_ERR_INVALID_STATE;
+    }
 
     const esp_err_t rc =
         usb_host_lib_power_off_root_port_if_idle_by_index(port);
+    host_call_exit();
     if (rc == ESP_OK) {
         (void)__atomic_fetch_and(&s_root_power_requested_mask, ~bit,
                                 __ATOMIC_ACQ_REL);
@@ -199,7 +255,9 @@ static recovery_cycle_result_t recovery_power_cycle(
              (unsigned)reason);
     esp_err_t rc = recovery_power_off_if_idle(port);
     if (rc == ESP_ERR_NOT_FINISHED) {
-        ESP_LOGI(TAG,
+        /* v234: WARN - the "recovering" line above is WARN too, and an
+         * INFO here left a refused recovery looking like a silent success. */
+        ESP_LOGW(TAG,
                  "USB%u recovery suppressed: attach/enumeration is active",
                  (unsigned)port);
         return RECOVERY_CYCLE_SUPPRESSED_ACTIVE;
@@ -271,7 +329,9 @@ static void recovery_task(void *arg)
         uint8_t port = USB_HOST_RECOVERY_PORT_NONE;
         usb_host_recovery_reason_t reason = USB_HOST_RECOVERY_REASON_NONE;
         const uint32_t now = (uint32_t)xTaskGetTickCount();
-        if (usb_host_recovery_arbiter_acquire(&s_recovery_arbiter, now,
+        /* v238: hold queued recoveries while a host restart runs. */
+        if (usb_host_manager_is_ready() &&
+            usb_host_recovery_arbiter_acquire(&s_recovery_arbiter, now,
                                               &port, &reason)) {
             const recovery_cycle_result_t result =
                 recovery_power_cycle(port, reason);
@@ -309,9 +369,10 @@ static void recovery_task(void *arg)
     }
 }
 
-static void usb_host_daemon_task(void *arg)
+/* Boot and the v238 restart both install from the daemon task: the Host
+ * Library allocates the DWC interrupts on the calling core. */
+static esp_err_t install_host_library(void)
 {
-    TaskHandle_t starter = (TaskHandle_t)arg;
     const usb_host_config_t host_config = {
         .skip_phy_setup = false,
         .root_port_unpowered = s_config.root_port_unpowered,
@@ -351,18 +412,218 @@ static void usb_host_daemon_task(void *arg)
     }
 #endif
 
-    s_install_result = usb_host_install(&host_config);
-    if (s_install_result == ESP_OK) {
-        const BaseType_t topology_created = xTaskCreate(
-            topology_client_task, "usb_topology", 4096u,
-            (void *)xTaskGetCurrentTaskHandle(),
-            s_config.daemon_priority + 2u, &s_topology_task);
-        if (topology_created != pdPASS ||
-            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5000)) == 0u) {
-            s_install_result = topology_created == pdPASS
-                                   ? ESP_ERR_TIMEOUT
-                                   : ESP_ERR_NO_MEM;
+    return usb_host_install(&host_config);
+}
+
+/* The state must not be RESTARTING here: the task would leave at once. */
+static esp_err_t start_topology_client(void)
+{
+    TaskHandle_t topology_task = NULL;
+    const BaseType_t topology_created = xTaskCreate(
+        topology_client_task, "usb_topology", 4096u,
+        (void *)xTaskGetCurrentTaskHandle(),
+        s_config.daemon_priority + 2u, &topology_task);
+    if (topology_created != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+    __atomic_store_n(&s_topology_task, topology_task, __ATOMIC_RELEASE);
+    if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5000)) == 0u) {
+        return ESP_ERR_TIMEOUT;
+    }
+    /* topology_client_task() stored its usb_host_client_register() result. */
+    return s_install_result;
+}
+
+static void count_lib_events(uint32_t event_flags)
+{
+    if ((event_flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) != 0u) {
+        (void)__atomic_add_fetch(&s_no_clients_events, 1u, __ATOMIC_RELAXED);
+    }
+    if ((event_flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) != 0u) {
+        (void)__atomic_add_fetch(&s_all_free_events, 1u, __ATOMIC_RELAXED);
+    }
+}
+
+/* Runs the Host Library for up to timeout_ms; returns the OR of the event
+ * flags seen. Clients closing their devices need it to make progress. */
+static uint32_t pump_lib_events(uint32_t timeout_ms)
+{
+    uint32_t event_flags = 0u;
+    (void)usb_host_lib_handle_events(pdMS_TO_TICKS(timeout_ms), &event_flags);
+    count_lib_events(event_flags);
+    return event_flags;
+}
+
+static void log_unreleased_participants(uint32_t missing)
+{
+    for (uint32_t i = 0; i < USB_HOST_MANAGER_RESTART_PARTICIPANTS_MAX; ++i) {
+        if ((missing & (1u << i)) != 0u) {
+            ESP_LOGW(TAG, "host restart: %s still holds its client",
+                     s_participant_names[i] ? s_participant_names[i] : "?");
         }
+    }
+}
+
+static void host_restart_finish(bool reinstalled, esp_err_t rc)
+{
+    __atomic_store_n(&s_participant_released, 0u, __ATOMIC_RELEASE);
+    if (rc == ESP_OK) {
+        (void)__atomic_add_fetch(&s_host_restarts, 1u, __ATOMIC_RELAXED);
+        state_set(MANAGER_READY);
+    } else {
+        (void)__atomic_add_fetch(&s_host_restart_failures, 1u,
+                                 __ATOMIC_RELAXED);
+        /* Old stack kept: still usable. Reinstall failure: nothing left. */
+        state_set(reinstalled ? MANAGER_FAILED : MANAGER_READY);
+    }
+    /* Last: participants waiting on the generation read the state above. */
+    (void)__atomic_add_fetch(&s_host_generation, 1u, __ATOMIC_SEQ_CST);
+}
+
+/* v238: uninstall + reinstall exactly like boot. Called on the daemon task
+ * with the state already RESTARTING, so no new Host Library call starts. */
+static void host_restart(void)
+{
+    const uint32_t required =
+        __atomic_load_n(&s_participant_mask, __ATOMIC_ACQUIRE);
+    ESP_LOGW(TAG, "host restart (%s): waiting for clients 0x%02X",
+             s_restart_why, (unsigned)required);
+
+    const TickType_t release_deadline =
+        xTaskGetTickCount() + pdMS_TO_TICKS(RESTART_RELEASE_TIMEOUT_MS);
+    uint32_t released = 0u;
+    bool quiet = false;
+    for (;;) {
+        released = __atomic_load_n(&s_participant_released, __ATOMIC_ACQUIRE);
+        quiet = (released & required) == required &&
+                __atomic_load_n(&s_topology_task, __ATOMIC_ACQUIRE) == NULL &&
+                __atomic_load_n(&s_host_calls, __ATOMIC_SEQ_CST) == 0u;
+        if (quiet ||
+            (int32_t)(release_deadline - xTaskGetTickCount()) <= 0) {
+            break;
+        }
+        (void)pump_lib_events(RESTART_POLL_MS);
+    }
+
+    usb_host_lib_info_t info = {0};
+    (void)usb_host_lib_info(&info);
+    ESP_LOGW(TAG,
+             "host restart: released=0x%02X/0x%02X topology=%s calls=%u "
+             "clients=%d devices=%d",
+             (unsigned)released, (unsigned)required,
+             __atomic_load_n(&s_topology_task, __ATOMIC_ACQUIRE) ? "held"
+                                                                 : "released",
+             (unsigned)__atomic_load_n(&s_host_calls, __ATOMIC_SEQ_CST),
+             info.num_clients, info.num_devices);
+    if (!quiet) {
+        log_unreleased_participants(required & ~released);
+    }
+
+    /* A registered client makes usb_host_uninstall() return
+     * ESP_ERR_INVALID_STATE, and its handle would dangle after it; the
+     * restart cannot be forced past it. Keep the old stack instead. */
+    if (info.num_clients != 0 ||
+        __atomic_load_n(&s_host_calls, __ATOMIC_SEQ_CST) != 0u) {
+        ESP_LOGE(TAG, "host restart aborted: %d client(s) still registered, "
+                      "old stack kept",
+                 info.num_clients);
+        if (__atomic_load_n(&s_topology_task, __ATOMIC_ACQUIRE) == NULL) {
+            /* It already left: bring it back on the old stack. */
+            state_set(MANAGER_STARTING);
+            (void)start_topology_client();
+        }
+        host_restart_finish(false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+
+    esp_err_t rc = usb_host_device_free_all();
+    if (rc == ESP_ERR_NOT_FINISHED) {
+        const TickType_t deadline =
+            xTaskGetTickCount() + pdMS_TO_TICKS(RESTART_ALL_FREE_TIMEOUT_MS);
+        rc = ESP_ERR_TIMEOUT;
+        do {
+            if ((pump_lib_events(RESTART_POLL_MS) &
+                 USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) != 0u) {
+                rc = ESP_OK;
+                break;
+            }
+        } while ((int32_t)(deadline - xTaskGetTickCount()) > 0);
+    }
+    if (rc != ESP_OK) {
+        ESP_LOGW(TAG, "host restart: free_all: %s (devices=%d)",
+                 esp_err_to_name(rc), info.num_devices);
+    }
+
+    /* Uninstall needs no pending process/event flags: drain, then retry. */
+    const TickType_t uninstall_deadline =
+        xTaskGetTickCount() + pdMS_TO_TICKS(RESTART_UNINSTALL_TIMEOUT_MS);
+    for (;;) {
+        (void)pump_lib_events(0u);
+        rc = usb_host_uninstall();
+        if (rc != ESP_ERR_INVALID_STATE ||
+            (int32_t)(uninstall_deadline - xTaskGetTickCount()) <= 0) {
+            break;
+        }
+        (void)pump_lib_events(RESTART_POLL_MS);
+    }
+    if (rc != ESP_OK) {
+        (void)usb_host_lib_info(&info);
+        ESP_LOGE(TAG, "host restart: usb_host_uninstall: %s "
+                      "(clients=%d devices=%d), old stack kept",
+                 esp_err_to_name(rc), info.num_clients, info.num_devices);
+        state_set(MANAGER_STARTING);
+        (void)start_topology_client();
+        host_restart_finish(false, rc);
+        return;
+    }
+
+    portENTER_CRITICAL(&s_topology_mux);
+    usb_host_topology_init(&s_topology);
+    portEXIT_CRITICAL(&s_topology_mux);
+    __atomic_store_n(&s_root_power_requested_mask,
+                     s_config.root_port_unpowered ? 0u
+                                                  : s_config.peripheral_map,
+                     __ATOMIC_RELEASE);
+
+    /* Leave RESTARTING first: the new topology task would otherwise
+     * deregister at once. STARTING still refuses outside Host Library calls. */
+    state_set(MANAGER_STARTING);
+    for (uint32_t attempt = 1u; attempt <= RESTART_INSTALL_ATTEMPTS;
+         ++attempt) {
+        rc = install_host_library();
+        if (rc == ESP_OK) {
+            break;
+        }
+        ESP_LOGE(TAG, "host restart: install attempt %u/%u: %s",
+                 (unsigned)attempt, (unsigned)RESTART_INSTALL_ATTEMPTS,
+                 esp_err_to_name(rc));
+        vTaskDelay(pdMS_TO_TICKS(RESTART_INSTALL_RETRY_MS));
+    }
+    if (rc == ESP_OK) {
+        rc = start_topology_client();
+        if (rc != ESP_OK) {
+            /* Clients can still register; only the root map is missing. */
+            ESP_LOGE(TAG, "host restart: topology client: %s",
+                     esp_err_to_name(rc));
+            rc = ESP_OK;
+        }
+    }
+    s_install_result = rc;
+    if (rc == ESP_OK) {
+        ESP_LOGW(TAG, "host restart done: USB Host Library reinstalled "
+                      "(peripheral_map=0x%02X, roots unpowered=%u)",
+                 s_config.peripheral_map,
+                 s_config.root_port_unpowered ? 1u : 0u);
+    }
+    host_restart_finish(true, rc);
+}
+
+static void usb_host_daemon_task(void *arg)
+{
+    TaskHandle_t starter = (TaskHandle_t)arg;
+    s_install_result = install_host_library();
+    if (s_install_result == ESP_OK) {
+        s_install_result = start_topology_client();
     }
     if (s_install_result == ESP_OK) {
         state_set(MANAGER_READY);
@@ -396,13 +657,15 @@ static void usb_host_daemon_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
-        if ((event_flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) != 0u) {
-            (void)__atomic_add_fetch(&s_no_clients_events, 1u,
-                                     __ATOMIC_RELAXED);
-        }
-        if ((event_flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) != 0u) {
-            (void)__atomic_add_fetch(&s_all_free_events, 1u,
-                                     __ATOMIC_RELAXED);
+        count_lib_events(event_flags);
+        if (state_get() == MANAGER_RESTARTING) {
+            host_restart();
+            if (state_get() == MANAGER_FAILED) {
+                ESP_LOGE(TAG, "host restart left no USB Host Library");
+                s_daemon_task = NULL;
+                vTaskDelete(NULL);
+                return;
+            }
         }
     }
 }
@@ -572,10 +835,11 @@ bool usb_host_manager_is_ready(void)
 
 esp_err_t usb_host_manager_set_all_root_power(bool enable)
 {
-    if (!usb_host_manager_is_ready()) {
+    if (!host_call_enter()) {
         return ESP_ERR_INVALID_STATE;
     }
     const esp_err_t rc = usb_host_lib_set_root_port_power(enable);
+    host_call_exit();
     if (rc == ESP_OK || rc == ESP_ERR_INVALID_STATE) {
         __atomic_store_n(&s_root_power_requested_mask,
                          enable ? s_config.peripheral_map : 0u,
@@ -587,9 +851,6 @@ esp_err_t usb_host_manager_set_all_root_power(bool enable)
 esp_err_t usb_host_manager_set_root_power_by_index(uint8_t root_port_index,
                                                    bool enable)
 {
-    if (!usb_host_manager_is_ready()) {
-        return ESP_ERR_INVALID_STATE;
-    }
     if (root_port_index >= 32u) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -598,9 +859,13 @@ esp_err_t usb_host_manager_set_root_power_by_index(uint8_t root_port_index,
     if ((s_config.peripheral_map & bit) == 0u) {
         return ESP_ERR_NOT_FOUND;
     }
+    if (!host_call_enter()) {
+        return ESP_ERR_INVALID_STATE;
+    }
 
     const esp_err_t rc = usb_host_lib_set_root_port_power_by_index(
         root_port_index, enable);
+    host_call_exit();
     if (rc == ESP_OK) {
         if (enable) {
             (void)__atomic_fetch_or(&s_root_power_requested_mask, bit,
@@ -618,11 +883,88 @@ esp_err_t usb_host_manager_get_library_info(usb_host_lib_info_t *info_out)
     if (!info_out) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!usb_host_manager_is_ready()) {
+    if (!host_call_enter()) {
         memset(info_out, 0, sizeof(*info_out));
         return ESP_ERR_INVALID_STATE;
     }
-    return usb_host_lib_info(info_out);
+    const esp_err_t rc = usb_host_lib_info(info_out);
+    host_call_exit();
+    return rc;
+}
+
+esp_err_t usb_host_manager_restart_participant_register(const char *name,
+                                                        uint32_t *id_out)
+{
+    if (!name || !id_out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t rc = ESP_ERR_NO_MEM;
+    portENTER_CRITICAL(&s_participant_mux);
+    for (uint32_t i = 0; i < USB_HOST_MANAGER_RESTART_PARTICIPANTS_MAX; ++i) {
+        const uint32_t bit = 1u << i;
+        if ((s_participant_mask & bit) == 0u) {
+            s_participant_names[i] = name;
+            __atomic_fetch_or(&s_participant_mask, bit, __ATOMIC_RELEASE);
+            *id_out = bit;
+            rc = ESP_OK;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_participant_mux);
+    return rc;
+}
+
+esp_err_t usb_host_manager_request_host_restart(const char *why)
+{
+    /* Counted as a Host Library call so the daemon cannot uninstall before
+     * usb_host_lib_unblock() below has returned. */
+    if (!host_call_enter()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    manager_state_t expected = MANAGER_READY;
+    const bool won = __atomic_compare_exchange_n(
+        &s_state, &expected, MANAGER_RESTARTING, false, __ATOMIC_SEQ_CST,
+        __ATOMIC_SEQ_CST);
+    if (won) {
+        s_restart_why = why ? why : "?";
+        __atomic_store_n(&s_participant_released, 0u, __ATOMIC_RELEASE);
+        (void)usb_host_lib_unblock();
+    }
+    host_call_exit();
+    return won ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+bool usb_host_manager_host_restart_pending(void)
+{
+    return state_get() == MANAGER_RESTARTING;
+}
+
+uint32_t usb_host_manager_host_generation(void)
+{
+    return __atomic_load_n(&s_host_generation, __ATOMIC_SEQ_CST);
+}
+
+void usb_host_manager_host_restart_release(uint32_t id, uint32_t generation)
+{
+    /* A release from an earlier restart must not count for the next one. */
+    if (usb_host_manager_host_generation() != generation ||
+        !usb_host_manager_host_restart_pending()) {
+        return;
+    }
+    (void)__atomic_fetch_or(&s_participant_released, id, __ATOMIC_ACQ_REL);
+}
+
+esp_err_t usb_host_manager_wait_host_restart(uint32_t generation,
+                                             TickType_t timeout)
+{
+    const TickType_t start = xTaskGetTickCount();
+    while (usb_host_manager_host_generation() == generation) {
+        if (xTaskGetTickCount() - start >= timeout) {
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    return usb_host_manager_is_ready() ? ESP_OK : ESP_ERR_INVALID_STATE;
 }
 
 void usb_host_manager_get_diagnostics(usb_host_manager_diagnostics_t *diag_out)
@@ -669,6 +1011,11 @@ void usb_host_manager_get_diagnostics(usb_host_manager_diagnostics_t *diag_out)
                             __ATOMIC_ACQUIRE),
         .recovery_failures =
             __atomic_load_n(&s_recovery_failures, __ATOMIC_ACQUIRE),
+        .host_restarts =
+            __atomic_load_n(&s_host_restarts, __ATOMIC_ACQUIRE),
+        .host_restart_failures =
+            __atomic_load_n(&s_host_restart_failures, __ATOMIC_ACQUIRE),
+        .host_generation = usb_host_manager_host_generation(),
         .peripheral_map = s_config.peripheral_map,
         .fs_phy_override_requested = s_config.override_fs_phy_index,
         .fs_phy_index = s_config.fs_phy_index,

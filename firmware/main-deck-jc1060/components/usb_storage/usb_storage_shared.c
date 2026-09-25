@@ -6,6 +6,8 @@
  * The storage implementation below remains byte-for-byte the mature product
  * owner. These three narrow adapters move Host Library ownership to the shared
  * dual-controller manager and restrict storage recovery to USB0.
+ * v238: the USB_STORAGE_HOST_RESTART_* hooks join usb_host_manager host
+ * restarts (drive + MSC driver released, reinstalled afterwards).
  */
 #include "usb_host_manager.h"
 
@@ -104,6 +106,42 @@ static esp_err_t shared_storage_set_root_power(bool enable)
         SHARED_STORAGE_ROOT_INDEX, enable);
 }
 
+/* v238: usb_host_manager host restart participant (usb_storage.c hooks). */
+static uint32_t s_shared_restart_participant;
+
+static void shared_storage_restart_join(void)
+{
+    const esp_err_t rc = usb_host_manager_restart_participant_register(
+        "usb_storage", &s_shared_restart_participant);
+    if (rc != ESP_OK) {
+        ESP_LOGW("usb_storage", "host restart participant: %s",
+                 esp_err_to_name(rc));
+    }
+}
+
+static bool shared_storage_restart_pending(void)
+{
+    return s_shared_restart_participant != 0u &&
+           usb_host_manager_host_restart_pending();
+}
+
+static void shared_storage_restart_release(uint32_t generation)
+{
+    usb_host_manager_host_restart_release(s_shared_restart_participant,
+                                          generation);
+}
+
+static esp_err_t shared_storage_restart_wait(uint32_t generation)
+{
+    esp_err_t rc;
+    while ((rc = usb_host_manager_wait_host_restart(
+                generation, pdMS_TO_TICKS(30000))) == ESP_ERR_TIMEOUT) {
+        ESP_LOGW("usb_storage", "host restart: still waiting for the USB "
+                                "host stack");
+    }
+    return rc;
+}
+
 #define usb_host_install shared_storage_host_install
 #define usb_host_lib_handle_events shared_storage_handle_events
 #define usb_host_lib_set_root_port_power shared_storage_set_root_power
@@ -111,4 +149,12 @@ static esp_err_t shared_storage_set_root_power(bool enable)
     shared_storage_device_route_allowed(address)
 #define USB_STORAGE_REQUEST_ROOT_RECOVERY(why) \
     shared_storage_request_root_recovery(why)
+#define USB_STORAGE_HOST_RESTART_JOIN() shared_storage_restart_join()
+#define USB_STORAGE_HOST_RESTART_PENDING() shared_storage_restart_pending()
+#define USB_STORAGE_HOST_RESTART_GENERATION() \
+    usb_host_manager_host_generation()
+#define USB_STORAGE_HOST_RESTART_RELEASE(generation) \
+    shared_storage_restart_release(generation)
+#define USB_STORAGE_HOST_RESTART_WAIT(generation) \
+    shared_storage_restart_wait(generation)
 #include "usb_storage.c"

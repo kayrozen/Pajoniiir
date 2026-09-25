@@ -62,6 +62,30 @@ it is declared in `profile.json` as `"init_sysex"` and sent by the generic
 profile path (`controller_led_runtime_send_profile_init()`) on profile
 activation, before the first LED snapshot.
 
+### Channel FILTER and Beat FX CH SELECT (v232)
+
+- **Channel FILTER** (`B6 17/37`, `B6 18/38`, identical to the FLX4): the P4
+  runs the channel filter DSP only while Smart CFX is on, a FLX4 feature.
+  The DDJ-400 has no Smart CFX button, so the knobs had no effect. On
+  JC1060, since v232, a profile without a `system.smart_cfx` input makes the
+  filter always live (`audio_engine_set_channel_filter_needs_smart_cfx`, set
+  from the profile runtime change callback). Centre is still a bypass.
+- **Beat FX CH SELECT**: the DDJ-400 switch sends `94 10` (CH1), `94 11` (CH2)
+  and `94 14` (MASTER), all on status `94` (Mixxx `Pioneer-DDJ-400.midi.xml`,
+  quirx `beatFxChannel`). The FLX4 `state_pair` (`94 10` + `95 11`) only
+  caught CH1. `profile.json` now uses three `note_select` inputs (value on
+  press only, a JC1060-only raw type, so this profile no longer loads on the
+  S3 parser). MASTER maps to target 2 (CH1&CH2): the P4 has no master-bus
+  Beat FX, so the effect runs per deck, pre-fader. Filter and Flanger sound
+  the same as on master. Echo/Delay tails follow the channel faders instead
+  of the master.
+- **Firmware requirement (v233)**: raw type 8 (`note_select`) needs JC1060
+  firmware v233 or later. v232 checked the parser but not the SD profile
+  manager (`CPM_MAX_RAW_TYPE` stayed 7), so it rejected this 6176-byte profile
+  without a log and fell back to the built-in map. Since v233 every rejection
+  is logged as `ctrl_profile: profile rejected: ...`. The pre-v232 file
+  (6160 bytes, no raw type 8) still loads.
+
 ## Hardware Identification
 
 - **Vendor ID**: `0x2B73` (Pioneer DJ)
