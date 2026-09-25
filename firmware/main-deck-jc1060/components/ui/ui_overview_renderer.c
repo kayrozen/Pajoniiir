@@ -538,24 +538,26 @@ void ui_overview_renderer_draw_main_with_options(uint8_t *pixels,
     draw_center_playhead(pixels, stride_px, width_px, height_px);
 }
 
-void ui_overview_renderer_draw_main_rgb565_column_span(uint16_t *pixels,
-                                                       int stride_px,
-                                                       int height_px,
-                                                       int dest_x_px,
-                                                       int logical_x_px,
-                                                       int column_count,
-                                                       int logical_width_px,
-                                                       const ui_waveform_source_t *source,
-                                                       uint32_t duration_ms,
-                                                       const anlz_metadata_t *meta,
-                                                       uint32_t center_ms,
-                                                       uint32_t window_ms,
-                                                       const uint16_t *palette,
-                                                       size_t palette_count,
-                                                       bool regular_beat_cap_bottom,
-                                                       bool loop_active,
-                                                       uint32_t loop_start_ms,
-                                                       uint32_t loop_end_ms)
+void ui_overview_renderer_draw_main_rgb565_column_span_cues(uint16_t *pixels,
+                                                            int stride_px,
+                                                            int height_px,
+                                                            int dest_x_px,
+                                                            int logical_x_px,
+                                                            int column_count,
+                                                            int logical_width_px,
+                                                            const ui_waveform_source_t *source,
+                                                            uint32_t duration_ms,
+                                                            const anlz_metadata_t *meta,
+                                                            uint32_t center_ms,
+                                                            uint32_t window_ms,
+                                                            const uint16_t *palette,
+                                                            size_t palette_count,
+                                                            bool regular_beat_cap_bottom,
+                                                            bool loop_active,
+                                                            uint32_t loop_start_ms,
+                                                            uint32_t loop_end_ms,
+                                                            const anlz_cue_t *cues,
+                                                            uint8_t cue_count)
 {
     if (!pixels || stride_px <= 0 || height_px <= 0 ||
         logical_width_px <= 0 || column_count <= 0 ||
@@ -683,15 +685,15 @@ void ui_overview_renderer_draw_main_rgb565_column_span(uint16_t *pixels,
 
     /* Hot-cue markers: a full-height line in the cue-slot colour plus a short
      * solid head at the top so the cue reads even over a busy waveform. */
-    if (meta && meta->cue_count > 0 && window_ms > 0) {
+    if (cues && cue_count > 0 && window_ms > 0) {
         int head_h = height_px / 6;
         if (head_h < 3) head_h = 3;
-        for (uint8_t c = 0; c < meta->cue_count && c < WAVE_CUE_MAX; c++) {
-            uint8_t slot = meta->cues[c].index;
+        for (uint8_t c = 0; c < cue_count && c < WAVE_CUE_MAX; c++) {
+            uint8_t slot = cues[c].index;
             if (slot >= WAVE_CUE_MAX) {
                 continue;
             }
-            int cue_x = (int)(((int64_t)meta->cues[c].start_ms - window_start_ms) *
+            int cue_x = (int)(((int64_t)cues[c].start_ms - window_start_ms) *
                               (int64_t)logical_width_px / (int64_t)window_ms);
             if (cue_x < logical_x_px || cue_x >= logical_x_px + column_count) {
                 continue;
@@ -713,6 +715,47 @@ void ui_overview_renderer_draw_main_rgb565_column_span(uint16_t *pixels,
             }
         }
     }
+}
+
+void ui_overview_renderer_draw_main_rgb565_column_span(uint16_t *pixels,
+                                                       int stride_px,
+                                                       int height_px,
+                                                       int dest_x_px,
+                                                       int logical_x_px,
+                                                       int column_count,
+                                                       int logical_width_px,
+                                                       const ui_waveform_source_t *source,
+                                                       uint32_t duration_ms,
+                                                       const anlz_metadata_t *meta,
+                                                       uint32_t center_ms,
+                                                       uint32_t window_ms,
+                                                       const uint16_t *palette,
+                                                       size_t palette_count,
+                                                       bool regular_beat_cap_bottom,
+                                                       bool loop_active,
+                                                       uint32_t loop_start_ms,
+                                                       uint32_t loop_end_ms)
+{
+    ui_overview_renderer_draw_main_rgb565_column_span_cues(pixels,
+                                                           stride_px,
+                                                           height_px,
+                                                           dest_x_px,
+                                                           logical_x_px,
+                                                           column_count,
+                                                           logical_width_px,
+                                                           source,
+                                                           duration_ms,
+                                                           meta,
+                                                           center_ms,
+                                                           window_ms,
+                                                           palette,
+                                                           palette_count,
+                                                           regular_beat_cap_bottom,
+                                                           loop_active,
+                                                           loop_start_ms,
+                                                           loop_end_ms,
+                                                           meta ? meta->cues : NULL,
+                                                           meta ? meta->cue_count : 0);
 }
 
 void ui_overview_renderer_draw_main_rgb565_columns(uint16_t *pixels,

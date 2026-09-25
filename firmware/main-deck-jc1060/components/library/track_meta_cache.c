@@ -16,8 +16,10 @@ static const char *TAG = "track_meta_cache";
 static const char *CACHE_ROOT = "/sd/trackcache";
 
 #define TRACK_META_CACHE_MAGIC   0x31434D54u /* "TMC1" */
-/* v3 (fw 241): memory cue added; v2 entries lack it and are re-parsed. */
-#define TRACK_META_CACHE_VERSION 3u
+/* v3 (fw 241): memory cue added; v2 entries lack it and are re-parsed.
+ * v4 (fw 243): hot cues read from the real PCOB layout; v3 entries were saved
+ * with an always-empty cue list and are re-parsed. */
+#define TRACK_META_CACHE_VERSION 4u
 #define TRACK_META_CACHE_FLAGS_LOW  0x01u
 #define TRACK_META_CACHE_FLAGS_VBR  0x02u
 #define TRACK_META_CACHE_FLAGS_HIGH 0x04u

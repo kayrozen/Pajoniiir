@@ -233,9 +233,13 @@ uint32_t end_ms;      // bytes 8–11: loop end (only if type=2)
 >
 > The JC1060 firmware reads the memory cue with this layout
 > (`anlz_metadata_t.memory_cue_ms`, earliest memory point or loop start,
-> across every PCOB). `parse_pcob()`, which fills `cues[]` for the hot-cue
-> display, still uses the old layout and only the first PCOB. On a real file
-> byte 1 is `'C'`, so it yields no hot cues. That fix is still open.
+> across every PCOB). `parse_pcob()` still uses the old layout and only the
+> first PCOB. On a real file byte 1 is `'C'`, so it yields no hot cues.
+>
+> Fixed in fw 243: the same walk reads the type-1 list into `cues[]` (slot =
+> hot_cue − 1, loop end from `0x24`) and replaces the `parse_pcob()` result.
+> This was checked against real exports: P022/0000B12C gives A = 12249 ms and
+> P01B/00020FAD gives B = 182 ms.
 
 ### PQTZ — Beat Grid Entry (8 bytes, big-endian)
 

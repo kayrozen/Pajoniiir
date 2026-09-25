@@ -87,6 +87,7 @@ bool ui_settings_is_active_tab(int active_tab, int settings_tab_index)
 #include "esp_timer.h"
 #include "esp_system.h"
 #include "firmware_health.h"
+#include "controller_profile_manager.h"
 #endif
 
 static const char *TAG = "ui_settings";
@@ -111,6 +112,14 @@ static uint8_t s_master_trim_preset = 0;
 static ui_settings_wifi_toggle_cb_t s_wifi_toggle_cb = NULL;
 static ui_settings_recording_toggle_cb_t s_recording_toggle_cb = NULL;
 static lv_obj_t *s_label_main_out = NULL;
+/* v245: controller-dependent labels ("CUE: <NAME>", "MIXER: <NAME>"). */
+static lv_obj_t *s_label_cue_controller = NULL;
+static lv_obj_t *s_label_mixer_controller = NULL;
+static uint32_t s_controller_name_generation = 0;
+static bool s_controller_name_valid = false;
+#ifndef WIN32
+static void ui_settings_update_controller_name_labels(void);
+#endif
 
 static void main_out_event_cb(lv_event_t *event)
 {
@@ -609,8 +618,8 @@ lv_obj_t *ui_settings_create(lv_obj_t *parent)
         lv_obj_align(s_label_ui_blackout, LV_ALIGN_CENTER, 0, 0);
         ui_blackout_apply_label(ui_blackout_init);
     }
-    ui_settings_value_label(output_section,
-                            "CUE: FLX4 USB",
+    s_label_cue_controller = ui_settings_value_label(output_section,
+                            "CUE: USB",
                             COL_ACCENT,
                             &lv_font_montserrat_12,
                             16,
@@ -730,8 +739,22 @@ lv_obj_t *ui_settings_create(lv_obj_t *parent)
                                                   96, 41);
 
     lv_obj_t *mixer_section = ui_settings_section(screen, 30, 356, 740, 64, "MIXER STATUS");
-    ui_settings_static_tile(mixer_section, 18, 34, 110, 22,
-                            "MIXER: FLX4", COL_TEXT_MUTED, COL_PANEL_DK, COL_BORDER);
+    lv_obj_t *mixer_tile = ui_settings_static_tile(mixer_section, 18, 34, 110, 22,
+                                                   "MIXER: USB", COL_TEXT_MUTED,
+                                                   COL_PANEL_DK, COL_BORDER);
+    s_label_mixer_controller = lv_obj_get_child(mixer_tile, 0);
+    if (s_label_mixer_controller) {
+        /* Long profile names must stay inside the 110 px tile. */
+        lv_label_set_long_mode(s_label_mixer_controller, LV_LABEL_LONG_MODE_DOTS);
+        lv_obj_set_width(s_label_mixer_controller, 104);
+        lv_obj_set_style_text_align(s_label_mixer_controller, LV_TEXT_ALIGN_CENTER,
+                                    LV_PART_MAIN);
+        lv_obj_align(s_label_mixer_controller, LV_ALIGN_CENTER, 0, 0);
+    }
+    s_controller_name_valid = false;
+#ifndef WIN32
+    ui_settings_update_controller_name_labels();
+#endif
     ui_settings_static_tile(mixer_section, 140, 34, 104, 22,
                             "CH FADERS", COL_ACCENT, COL_PANEL_DK, COL_BORDER);
     ui_settings_static_tile(mixer_section, 256, 34, 112, 22,
@@ -814,6 +837,35 @@ static void ui_settings_format_storage_size(uint64_t bytes, char *out, size_t ou
 }
 
 #ifndef WIN32
+/* v245: re-read the active profile name only when the profile manager's
+ * generation moved (atomic load per frame; try-lock copy on change). */
+static void ui_settings_update_controller_name_labels(void)
+{
+    if (!s_label_cue_controller && !s_label_mixer_controller) {
+        return;
+    }
+    uint32_t generation = controller_profile_manager_active_generation();
+    if (s_controller_name_valid && generation == s_controller_name_generation) {
+        return;
+    }
+    char name[CPM_ID_MAX];
+    if (!controller_profile_manager_get_active_short_name(name, sizeof(name))) {
+        return;   /* manager busy: retry next frame */
+    }
+    const char *shown = name[0] != '\0' ? name : "USB";
+    char text[CPM_ID_MAX + 8];
+    if (s_label_cue_controller) {
+        snprintf(text, sizeof(text), "CUE: %s", shown);
+        lv_label_set_text(s_label_cue_controller, text);
+    }
+    if (s_label_mixer_controller) {
+        snprintf(text, sizeof(text), "MIXER: %s", shown);
+        lv_label_set_text(s_label_mixer_controller, text);
+    }
+    s_controller_name_generation = generation;
+    s_controller_name_valid = true;
+}
+
 static void ui_settings_update_controller_status_label(const deck_state_t *state)
 {
     if (!s_widgets.controller_status || !state) {
@@ -888,6 +940,7 @@ void ui_settings_update(const ui_frame_context_t *ctx)
     }
 #ifndef WIN32
     ui_settings_update_controller_status_label(&ctx->deck_state[CTRL_DECK_1]);
+    ui_settings_update_controller_name_labels();
     ui_settings_update_sd_status_label(false);
 #if CONFIG_AUDIO_RECORDER_ENABLED
     ui_settings_update_recording_label();

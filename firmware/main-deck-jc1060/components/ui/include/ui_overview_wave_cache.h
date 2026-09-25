@@ -57,6 +57,11 @@ typedef struct {
     bool loop_active;
     uint32_t loop_start_ms;
     uint32_t loop_end_ms;
+    /* v244: merged hot cue list (local pads + ANLZ). When cues_set is false
+     * the renderer falls back to meta->cues. Cleared by reset. */
+    bool cues_set;
+    uint8_t cue_count;
+    anlz_cue_t cues[ANLZ_MAX_CUES];
     struct {
         uint32_t update_count[UI_OVERVIEW_WAVE_CACHE_KIND_COUNT];
         uint32_t total_columns_rendered;
@@ -112,6 +117,12 @@ void ui_overview_wave_cache_set_loop(ui_overview_wave_cache_t *cache,
                                      bool active,
                                      uint32_t start_ms,
                                      uint32_t end_ms);
+
+/* v244: set the hot cue markers drawn on the main waveform (copied). A change
+ * to the list invalidates the cache so the strip is fully re-rendered. */
+void ui_overview_wave_cache_set_cues(ui_overview_wave_cache_t *cache,
+                                     const anlz_cue_t *cues,
+                                     uint8_t cue_count);
 
 bool ui_overview_wave_cache_update(ui_overview_wave_cache_t *cache,
                                    const ui_waveform_source_t *source,

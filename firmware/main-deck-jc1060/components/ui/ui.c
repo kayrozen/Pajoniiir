@@ -730,6 +730,24 @@ static void ui_update_overview_cue_markers(uint8_t deck)
     anlz_snapshot_release(snapshot);
 }
 
+/* v244: deck_core bumps the hot cue revision whenever a deck's published
+ * pad cues change (pad set/clear, load, Rekordbox seed). Refresh the Hot Cues
+ * tab and both Overview cue marker sets on the next frame instead of waiting
+ * for the 1 Hz slow update. Runs in the LVGL task; no hot_cue_store access. */
+static void ui_refresh_hot_cues_if_changed(void)
+{
+    static uint32_t s_seen_revision;
+    uint32_t revision = deck_core_hot_cues_revision();
+    if (revision == s_seen_revision) {
+        return;
+    }
+    s_seen_revision = revision;
+    ui_performance_tabs_update_hot_cues();
+    for (uint8_t deck = 0; deck < DECK_CORE_DECK_COUNT; deck++) {
+        ui_update_overview_cue_markers(deck);
+    }
+}
+
 // ─── Global Interface Functions ──────────────────────────────────────────────
 
 #ifdef WIN32
@@ -1140,6 +1158,7 @@ void ui_update(void) {
      * re-publish the pre-update handle for one extra tick. */
     ui_release_frame_context(&ctx);
     ui_build_frame_context(&ctx);
+    ui_refresh_hot_cues_if_changed();
 
 #ifdef WIN32
     deck_state_t state = ctx.deck_state[CTRL_DECK_1];

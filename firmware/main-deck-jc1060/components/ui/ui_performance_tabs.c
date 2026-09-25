@@ -42,6 +42,7 @@ uint32_t ui_performance_tabs_calculate_jump_target(uint32_t position_ms,
 #ifndef UI_PERFORMANCE_TABS_HOST_TEST
 
 #include "esp_log.h"
+#include "ui_hot_cue_view.h"
 #include "ui_theme.h"
 
 #define UI_PERFORMANCE_TAB_COUNT_HOT_CUES 8
@@ -313,7 +314,13 @@ void ui_performance_tabs_update_hot_cues(void)
     anlz_snapshot_t *snapshot =
         ui_performance_tabs_acquire_active_anlz();
     const anlz_metadata_t *meta = anlz_snapshot_metadata(snapshot);
-    bool has_anlz = meta != NULL;
+    /* v244: local pad cues (hot_cue_store, via the deck_core snapshot) win
+     * over the ANLZ cues slot by slot; an unset slot falls back to ANLZ. */
+    deck_core_hot_cues_t store;
+    bool has_store = deck_core_get_hot_cues(deck, &store);
+    anlz_cue_t cues[ANLZ_MAX_CUES];
+    uint8_t cue_count = ui_hot_cue_view_merge(has_store ? &store : NULL, meta, cues);
+    bool has_source = meta != NULL || has_store;
 
     for (int i = 0; i < UI_PERFORMANCE_TAB_COUNT_HOT_CUES; i++) {
         bool found = false;
@@ -321,15 +328,13 @@ void ui_performance_tabs_update_hot_cues(void)
         uint32_t end_pos = 0;
         uint8_t type = UI_CONTROLS_HOT_CUE_SINGLE;
 
-        if (has_anlz) {
-            for (int j = 0; j < meta->cue_count; j++) {
-                if (meta->cues[j].index == i) {
-                    pos = meta->cues[j].start_ms;
-                    end_pos = meta->cues[j].end_ms;
-                    type = (uint8_t)meta->cues[j].type;
-                    found = true;
-                    break;
-                }
+        for (int j = 0; j < cue_count; j++) {
+            if (cues[j].index == i) {
+                pos = cues[j].start_ms;
+                end_pos = cues[j].end_ms;
+                type = (uint8_t)cues[j].type;
+                found = true;
+                break;
             }
         }
 
@@ -354,7 +359,7 @@ void ui_performance_tabs_update_hot_cues(void)
                 lv_label_set_text_fmt(lbl_pad, "%s %c", is_loop ? "LOOP" : "CUE", 'A' + i);
             }
             ui_performance_tabs_style_hot_cue_pad(i, is_loop, false);
-        } else if (has_anlz) {
+        } else if (has_source) {
             ui_controls_set_hot_cue(ui_performance_tabs_controls(),
                                     (uint8_t)i,
                                     0,

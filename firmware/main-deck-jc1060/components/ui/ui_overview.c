@@ -7,6 +7,7 @@
 #include "ui_beat_fx_format.h"
 #include "ui_beat_indicator.h"
 #include "ui_diagnostics.h"
+#include "ui_hot_cue_view.h"
 #include "ui_lvgl_backend.h"
 #include "ui_mixer_view.h"
 #include "ui_overview_motion.h"
@@ -442,6 +443,11 @@ static bool s_overview_cue_point_visible[DECK_CORE_DECK_COUNT];
 static bool s_overview_cue_point_seen[DECK_CORE_DECK_COUNT];
 static uint32_t s_overview_cue_fingerprint[DECK_CORE_DECK_COUNT];
 static bool s_overview_cue_fingerprint_valid[DECK_CORE_DECK_COUNT];
+/* v244: merged hot cues (local pads over ANLZ) last computed by
+ * ui_overview_update_cue_markers, fed to the main strip cache every frame. */
+static anlz_cue_t s_overview_cues[DECK_CORE_DECK_COUNT][ANLZ_MAX_CUES];
+static uint8_t s_overview_cue_count[DECK_CORE_DECK_COUNT];
+static bool s_overview_cues_valid[DECK_CORE_DECK_COUNT];
 static uint32_t s_overview_deck_duration_ms[DECK_CORE_DECK_COUNT];
 static uint16_t s_overview_deck_bpm[DECK_CORE_DECK_COUNT];
 static anlz_snapshot_t *s_overview_deck_snapshot[DECK_CORE_DECK_COUNT];
@@ -1796,6 +1802,11 @@ static void ui_render_overview_main_waveform(ui_overview_deck_panel_t *panel,
          * to the playhead) so the cache tints it; a change flips it invalid. */
         ui_overview_wave_cache_set_loop(&s_overview_wave_cache[idx], loop_active,
                                         loop_start_ms, loop_end_ms);
+        if (s_overview_cues_valid[idx]) {
+            ui_overview_wave_cache_set_cues(&s_overview_wave_cache[idx],
+                                            s_overview_cues[idx],
+                                            s_overview_cue_count[idx]);
+        }
         int64_t render_start_us = ui_diagnostics_enabled() ? esp_timer_get_time() : 0;
         bool cache_updated = ui_overview_wave_cache_update(&s_overview_wave_cache[idx],
                                                            source,
@@ -1898,6 +1909,7 @@ void ui_overview_load_waveform_data(uint8_t deck,
     };
     ui_overview_deck_panel_t *panel = &s_overview_decks[idx];
     s_overview_cue_fingerprint_valid[idx] = false;
+    s_overview_cues_valid[idx] = false;
     panel->last_mini_fill_x = -1;
     panel->last_mini_played_w = -1;
     if (panel->mini_played) {
@@ -1931,16 +1943,18 @@ void ui_overview_load_waveform_data(uint8_t deck,
 
 /* FNV-1a over the cue layout + track duration. Lets the 1 Hz slow-update skip
  * the expensive strip re-render + reblit unless the cues actually changed. */
-static uint32_t ui_overview_cue_fingerprint(const anlz_metadata_t *meta, uint32_t duration_ms)
+static uint32_t ui_overview_cue_fingerprint(const anlz_cue_t *cues,
+                                            uint8_t cue_count,
+                                            uint32_t duration_ms)
 {
     uint32_t fp = 2166136261u;
     fp = (fp ^ duration_ms) * 16777619u;
-    if (meta) {
-        fp = (fp ^ (uint32_t)meta->cue_count) * 16777619u;
-        for (uint8_t j = 0; j < meta->cue_count && j < ANLZ_MAX_CUES; j++) {
-            fp = (fp ^ (uint32_t)meta->cues[j].index) * 16777619u;
-            fp = (fp ^ meta->cues[j].start_ms) * 16777619u;
-        }
+    fp = (fp ^ (uint32_t)cue_count) * 16777619u;
+    for (uint8_t j = 0; j < cue_count && j < ANLZ_MAX_CUES; j++) {
+        fp = (fp ^ (uint32_t)cues[j].index) * 16777619u;
+        fp = (fp ^ (uint32_t)cues[j].type) * 16777619u;
+        fp = (fp ^ cues[j].start_ms) * 16777619u;
+        fp = (fp ^ cues[j].end_ms) * 16777619u;
     }
     return fp;
 }
@@ -1954,7 +1968,16 @@ void ui_overview_update_cue_markers(uint8_t deck, const anlz_metadata_t *meta, u
      * and unconditionally reset the wave cache (forcing a full strip rebuild on
      * both decks ~once per second), which is the main source of the periodic
      * waveform hitch. */
-    uint32_t fingerprint = ui_overview_cue_fingerprint(meta, duration_ms);
+    /* v244: local pad cues (deck_core snapshot of hot_cue_store) win over
+     * the ANLZ cues slot by slot, so a freshly set pad shows up too. */
+    deck_core_hot_cues_t store;
+    bool has_store = deck_core_get_hot_cues(deck_idx, &store);
+    anlz_cue_t *cues = s_overview_cues[deck_idx];
+    uint8_t cue_count = ui_hot_cue_view_merge(has_store ? &store : NULL, meta, cues);
+    s_overview_cue_count[deck_idx] = cue_count;
+    s_overview_cues_valid[deck_idx] = true;
+
+    uint32_t fingerprint = ui_overview_cue_fingerprint(cues, cue_count, duration_ms);
     if (s_overview_cue_fingerprint_valid[deck_idx] &&
         s_overview_cue_fingerprint[deck_idx] == fingerprint) {
         return;
@@ -1974,7 +1997,7 @@ void ui_overview_update_cue_markers(uint8_t deck, const anlz_metadata_t *meta, u
     };
 
     /* The main (zoom) waveform cue markers are now baked into the scrolling
-     * strip (drawn from meta->cues by the renderer), so hide the legacy LVGL
+     * strip (drawn from the merged cue list by the renderer), so hide the legacy LVGL
      * marker/head objects that used to flicker over the PPA overlay. */
     for (int i = 0; i < 8; i++) {
         if (s_overview_cue_markers[deck_idx][i]) {
@@ -1993,10 +2016,10 @@ void ui_overview_update_cue_markers(uint8_t deck, const anlz_metadata_t *meta, u
         }
         bool found = false;
         uint32_t pos = 0;
-        if (meta && duration_ms > 0) {
-            for (int j = 0; j < meta->cue_count; j++) {
-                if (meta->cues[j].index == i) {
-                    pos = meta->cues[j].start_ms;
+        if (duration_ms > 0) {
+            for (int j = 0; j < cue_count; j++) {
+                if (cues[j].index == i) {
+                    pos = cues[j].start_ms;
                     found = true;
                     break;
                 }

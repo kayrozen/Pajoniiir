@@ -183,6 +183,34 @@ bool controller_profile_id_valid(const char *id)
     return true;
 }
 
+bool controller_profile_short_name(const char *id, char *out, size_t out_size)
+{
+    if (!out || out_size == 0u) {
+        return false;
+    }
+    out[0] = '\0';
+    if (!id || id[0] == '\0') {
+        return false;
+    }
+    const char *start = id;
+    const char *sep = strchr(id, '_');
+    if (sep && sep[1] != '\0') {
+        start = sep + 1;
+    }
+    size_t n = 0u;
+    for (const char *c = start; *c != '\0' && n + 1u < out_size; c++) {
+        char ch = *c;
+        if (ch == '_') {
+            ch = '-';
+        } else if (ch >= 'a' && ch <= 'z') {
+            ch = (char)(ch - 'a' + 'A');
+        }
+        out[n++] = ch;
+    }
+    out[n] = '\0';
+    return n > 0u;
+}
+
 static bool build_storage_path(char *out, size_t out_size, const char *root,
                                const char *id, const char *filename)
 {
@@ -631,6 +659,10 @@ static uint16_t s_log_caps = 0xFFFFu;
 static int s_log_idx = -2;
 static bool s_runtime_initialized;
 static volatile bool s_storage_busy;
+/* v245: ID of the active local profile as last published ("" = none), read
+ * under a try-lock, and its change generation, polled lock-free by the UI. */
+static char s_published_active_id[CPM_ID_MAX];
+static uint32_t s_active_generation;
 
 static bool cpm_lock(void)
 {
@@ -641,6 +673,22 @@ static bool cpm_lock(void)
 static void cpm_unlock(void)
 {
     xSemaphoreGive(s_manager_mutex);
+}
+
+/* Call with the manager mutex held after any registry change. */
+static void cpm_publish_active_locked(void)
+{
+    const char *id = "";
+    const int idx = s_registry.active_index;
+    if (idx >= 0 && idx < (int)s_registry.count &&
+        s_registry.transfer_state == CPM_TRANSFER_ACTIVE) {
+        id = s_registry.profiles[idx].id;
+    }
+    if (strncmp(s_published_active_id, id, sizeof(s_published_active_id)) == 0) {
+        return;
+    }
+    snprintf(s_published_active_id, sizeof(s_published_active_id), "%s", id);
+    (void)__atomic_add_fetch(&s_active_generation, 1u, __ATOMIC_RELEASE);
 }
 
 static bool cpm_read_profile(const controller_profile_meta_t *m,
@@ -700,6 +748,7 @@ static int cpm_activate_bound_profile(void)
     controller_profile_meta_t meta = s_registry.profiles[idx];
     const uint32_t epoch = s_registry.connected_epoch;
     controller_profile_registry_mark_transfer_started(&s_registry, idx);
+    cpm_publish_active_locked();
     cpm_unlock();
 
     uint8_t *blob = NULL;
@@ -720,6 +769,7 @@ static int cpm_activate_bound_profile(void)
     } else if (still_bound) {
         controller_profile_registry_mark_transfer_failed(&s_registry, idx);
     }
+    cpm_publish_active_locked();
     cpm_unlock();
     free(blob);
 
@@ -777,6 +827,7 @@ esp_err_t controller_profile_manager_scan_storage(void)
 
     if (rc == ESP_OK && cpm_lock()) {
         controller_profile_registry_apply_rescan(&s_registry, scanned);
+        cpm_publish_active_locked();
         *scanned = s_registry;
         cpm_unlock();
     }
@@ -830,6 +881,7 @@ esp_err_t controller_profile_manager_install_profile(
     if (rc == ESP_OK && cpm_lock()) {
         controller_profile_registry_apply_rescan(&s_registry, scanned);
         reactivate = s_registry.controller_present;
+        cpm_publish_active_locked();
         if (out_meta) *out_meta = installed;
         cpm_unlock();
     }
@@ -858,6 +910,27 @@ esp_err_t controller_profile_manager_get_registry_snapshot(
     *out_registry = s_registry;
     cpm_unlock();
     return ESP_OK;
+}
+
+uint32_t controller_profile_manager_active_generation(void)
+{
+    return __atomic_load_n(&s_active_generation, __ATOMIC_ACQUIRE);
+}
+
+bool controller_profile_manager_get_active_short_name(char *out, size_t out_size)
+{
+    if (!out || out_size == 0u) {
+        return false;
+    }
+    char id[CPM_ID_MAX];
+    if (!s_manager_mutex || xSemaphoreTake(s_manager_mutex, 0) != pdTRUE) {
+        return false;
+    }
+    memcpy(id, s_published_active_id, sizeof(id));
+    cpm_unlock();
+    id[sizeof(id) - 1u] = '\0';
+    (void)controller_profile_short_name(id, out, out_size);
+    return true;
 }
 
 int controller_profile_manager_on_descriptor(uint16_t vid, uint16_t pid)
@@ -899,6 +972,7 @@ int controller_profile_manager_on_descriptor_report(uint16_t vid, uint16_t pid,
     if (already_active && idx >= 0) {
         controller_profile_registry_mark_transfer_active(&s_registry, idx);
     }
+    cpm_publish_active_locked();
     cpm_unlock();
 
     if (vid != s_log_vid || pid != s_log_pid || caps != s_log_caps || idx != s_log_idx) {
@@ -933,6 +1007,7 @@ bool controller_profile_manager_on_disconnect(void)
     char product[CPM_PRODUCT_MAX + 1];
     snprintf(product, sizeof(product), "%s", s_registry.connected_product);
     bool changed = controller_profile_registry_on_disconnect(&s_registry);
+    cpm_publish_active_locked();
     s_log_vid = 0xFFFFu;
     s_log_pid = 0xFFFFu;
     s_log_caps = 0xFFFFu;

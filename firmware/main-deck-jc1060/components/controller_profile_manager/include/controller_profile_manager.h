@@ -115,6 +115,17 @@ int controller_profile_manager_on_descriptor_report(uint16_t vid, uint16_t pid,
  * edge. Returns true only when a present controller was actually cleared. */
 bool controller_profile_manager_on_disconnect(void);
 
+/* v245: generation of the active profile name. Bumped (atomic) whenever the
+ * active local profile changes (activation, built-in fallback, disconnect,
+ * rescan). Cheap enough to poll every UI frame. */
+uint32_t controller_profile_manager_active_generation(void);
+
+/* v245: short display name of the active local profile (see
+ * controller_profile_short_name), or "" when the built-in map / no controller
+ * is active. Non-blocking try-lock: returns false when the manager is busy so
+ * a caller on the LVGL task can simply retry next frame. */
+bool controller_profile_manager_get_active_short_name(char *out, size_t out_size);
+
 /* ── Pure helpers (host-testable, no ESP logging) ──────────────────────────── */
 
 /* CRC-32 (IEEE 802.3, zlib-compatible). */
@@ -129,6 +140,12 @@ esp_err_t controller_profile_meta_parse(const uint8_t *data, size_t len,
 /* Profile IDs are also directory names. Only ASCII letters, digits, '_' and
  * '-' are accepted so an HTTP-provided ID can never escape `root`. */
 bool controller_profile_id_valid(const char *id);
+
+/* v245: short display name derived from a profile ID: the leading vendor token
+ * is dropped when more tokens follow, the rest is upper-cased with '_' -> '-'
+ * ("pioneer_ddj_400" -> "DDJ-400", "pioneer_ddj_flx4" -> "DDJ-FLX4").
+ * Truncated to out_size - 1. Returns false (out = "") for an empty/NULL ID. */
+bool controller_profile_short_name(const char *id, char *out, size_t out_size);
 
 /* Recover a profile directory after an interrupted same-directory swap.
  * A valid target is authoritative; otherwise a backup is restored. Any

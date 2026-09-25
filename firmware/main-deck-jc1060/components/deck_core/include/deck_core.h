@@ -161,6 +161,30 @@ esp_err_t deck_core_clear_loaded_tracks(uint32_t media_generation);
 bool deck_core_get_loaded_track(uint8_t deck,
                                 deck_loaded_track_summary_t *out);
 
+/* Hot cues of the loaded track as held by the deck actor (hot_cue_store,
+ * including cues seeded from Rekordbox), published through the deck snapshot
+ * seqlock so the UI never reads NVS. `known` is false until the actor has read
+ * the store for the track now loaded on `deck`. */
+#define DECK_CORE_HOT_CUE_SLOT_COUNT 8u
+
+typedef struct {
+    uint32_t pos_ms;
+    uint32_t end_ms;    /* loop end; 0 for a single cue */
+    bool     loop;
+} deck_core_hot_cue_slot_t;
+
+typedef struct {
+    bool     known;
+    uint8_t  valid_mask;
+    deck_core_hot_cue_slot_t slots[DECK_CORE_HOT_CUE_SLOT_COUNT];
+} deck_core_hot_cues_t;
+
+bool deck_core_get_hot_cues(uint8_t deck, deck_core_hot_cues_t *out);
+
+/* Bumped on every change of the published hot-cue view (any deck), so the UI
+ * can refresh cue displays without polling the slots every frame. */
+uint32_t deck_core_hot_cues_revision(void);
+
 /*
  * Drain controller-originated UI commands. ui_update() is the sole firmware
  * caller so all LVGL/library work executes in the LVGL task context.

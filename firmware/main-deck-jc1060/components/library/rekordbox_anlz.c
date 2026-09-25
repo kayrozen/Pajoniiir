@@ -431,12 +431,13 @@ static esp_err_t parse_pcob(FILE *fp, anlz_metadata_t *out)
     return ESP_OK;
 }
 
-/* ── Memory cue (PCOB type 0, real PCPT layout) ─────────────────────────── *
+/* ── Memory cue and hot cues (PCOB lists, real PCPT layout) ──────────────── *
  *
  * Rekordbox writes two PCOB sections: list type 0 holds memory points, type 1
  * hot cues. parse_pcob() above only sees the first PCOB and assumes an older
- * record layout, so the memory cue is read here by its own walk over every
- * section (Deep Symmetry ANLZ spec):
+ * record layout that never matches a real export (cue_count stays 0), so both
+ * lists are read here by their own walk over every section (Deep Symmetry ANLZ
+ * spec):
  *
  * PCOB header (len_header >= 0x18):
  *   0x0c  u32  list type (0 = memory points, 1 = hot cues)
@@ -445,11 +446,14 @@ static esp_err_t parse_pcob(FILE *fp, anlz_metadata_t *out)
  *
  * PCPT entry (len_entry, normally 0x38):
  *   0x00  'PCPT'   0x04 len_header   0x08 len_entry
- *   0x0c  u32  hot_cue (0 = memory point)
+ *   0x0c  u32  hot_cue (0 = memory point, 1..8 = hot cue A..H)
  *   0x1c  u8   type (1 = point, 2 = loop)
  *   0x20  u32  time_ms (loop start for loops)
+ *   0x24  u32  loop_time_ms (loop end; 0xffffffff for points)
  *
- * The earliest memory point or loop start wins, like CDJ auto-cue. A PCPT
+ * The earliest memory point or loop start wins, like CDJ auto-cue. A real
+ * hot-cue list replaces whatever parse_pcob() guessed; slot index is
+ * hot_cue - 1 and the first entry for a slot wins. A PCPT
  * entry that does not fit its section ends the list without rejecting the
  * file; the section chain itself was already validated by the tag walks.
  */
@@ -457,8 +461,28 @@ static esp_err_t parse_pcob(FILE *fp, anlz_metadata_t *out)
 #define ANLZ_PCOB_HEADER_MIN     0x18u
 #define ANLZ_PCPT_ENTRY_MIN      0x28u
 #define ANLZ_PCOB_LIST_MEMORY    0u
+#define ANLZ_PCOB_LIST_HOT_CUES  1u
 
-static void read_memory_cue_list(FILE *fp, uint32_t pos, uint32_t header_size,
+static void add_hot_cue(anlz_metadata_t *out, uint32_t hot_cue, uint8_t type,
+                        uint32_t time_ms, uint32_t loop_time_ms)
+{
+    if (hot_cue == 0u || hot_cue > ANLZ_MAX_CUES || time_ms == UINT32_MAX ||
+        out->cue_count >= ANLZ_MAX_CUES) {
+        return;
+    }
+    const uint8_t index = (uint8_t)(hot_cue - 1u);
+    for (uint8_t i = 0; i < out->cue_count; ++i) {
+        if (out->cues[i].index == index) return;
+    }
+    const bool loop = type == 2u && loop_time_ms != UINT32_MAX && loop_time_ms > time_ms;
+    anlz_cue_t *cue = &out->cues[out->cue_count++];
+    cue->type     = loop ? ANLZ_CUE_LOOP : ANLZ_CUE_SINGLE;
+    cue->index    = index;
+    cue->start_ms = time_ms;
+    cue->end_ms   = loop ? loop_time_ms : 0u;
+}
+
+static void read_pcob_list(FILE *fp, uint32_t pos, uint32_t header_size,
                                  uint32_t segment_size, anlz_metadata_t *out)
 {
     uint8_t hdr[ANLZ_PCOB_HEADER_MIN];
@@ -469,7 +493,12 @@ static void read_memory_cue_list(FILE *fp, uint32_t pos, uint32_t header_size,
     const uint32_t list_type = ((uint32_t)hdr[0x0c] << 24) | ((uint32_t)hdr[0x0d] << 16) |
                                ((uint32_t)hdr[0x0e] <<  8) |  (uint32_t)hdr[0x0f];
     const uint16_t count = (uint16_t)((hdr[0x12] << 8) | hdr[0x13]);
-    if (list_type != ANLZ_PCOB_LIST_MEMORY) return;
+    if (list_type == ANLZ_PCOB_LIST_HOT_CUES) {
+        out->cue_count = 0;
+        memset(out->cues, 0, sizeof(out->cues));
+    } else if (list_type != ANLZ_PCOB_LIST_MEMORY) {
+        return;
+    }
 
     const uint32_t end = pos + segment_size;
     uint32_t entry = pos + header_size;
@@ -487,10 +516,14 @@ static void read_memory_cue_list(FILE *fp, uint32_t pos, uint32_t header_size,
                                  ((uint32_t)buf[14] <<  8) |  (uint32_t)buf[15];
         const uint32_t time_ms = ((uint32_t)buf[32] << 24) | ((uint32_t)buf[33] << 16) |
                                  ((uint32_t)buf[34] <<  8) |  (uint32_t)buf[35];
+        const uint32_t loop_ms = ((uint32_t)buf[36] << 24) | ((uint32_t)buf[37] << 16) |
+                                 ((uint32_t)buf[38] <<  8) |  (uint32_t)buf[39];
         if (tag != ANLZ_TAG_PCPT || len < ANLZ_PCPT_ENTRY_MIN || len > end - entry) {
             return;
         }
-        if (hot_cue == 0u && time_ms != UINT32_MAX &&
+        if (list_type == ANLZ_PCOB_LIST_HOT_CUES) {
+            add_hot_cue(out, hot_cue, buf[0x1c], time_ms, loop_ms);
+        } else if (hot_cue == 0u && time_ms != UINT32_MAX &&
             (!out->has_memory_cue || time_ms < out->memory_cue_ms)) {
             out->memory_cue_ms = time_ms;
             out->has_memory_cue = true;
@@ -499,7 +532,7 @@ static void read_memory_cue_list(FILE *fp, uint32_t pos, uint32_t header_size,
     }
 }
 
-static esp_err_t parse_memory_cue(FILE *fp, anlz_metadata_t *out)
+static esp_err_t parse_pcob_lists(FILE *fp, anlz_metadata_t *out)
 {
     out->has_memory_cue = false;
     out->memory_cue_ms = 0u;
@@ -524,7 +557,7 @@ static esp_err_t parse_memory_cue(FILE *fp, anlz_metadata_t *out)
             return ESP_ERR_INVALID_SIZE;
         }
         if (tag == ANLZ_TAG_PCOB && header_size >= ANLZ_PCOB_HEADER_MIN) {
-            read_memory_cue_list(fp, pos, header_size, segment_size, out);
+            read_pcob_list(fp, pos, header_size, segment_size, out);
             if (s_anlz_short_read) return ESP_ERR_INVALID_SIZE;
         }
         pos += advance;
@@ -654,7 +687,7 @@ esp_err_t anlz_parse_dat(const char *dat_path, anlz_metadata_t *out)
     }
     if (result == ESP_OK) {
         s_anlz_short_read = false;
-        result = parse_memory_cue(fp, &next);
+        result = parse_pcob_lists(fp, &next);
     }
     fclose(fp);
 

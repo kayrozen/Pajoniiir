@@ -169,17 +169,27 @@ typedef struct {
 
 static deck_shifted_loop_roll_t s_shifted_loop_roll[DECK_CORE_DECK_COUNT];
 
-static void publish_state_snapshot(void)
+static void snapshot_write_begin(void)
 {
     while (__atomic_exchange_n(&s_snapshot_writer, true, __ATOMIC_ACQ_REL)) {
         taskYIELD();
     }
     (void)__atomic_add_fetch(&s_snapshot_seq, 1u, __ATOMIC_RELEASE); /* odd */
+}
+
+static void snapshot_write_end(void)
+{
+    (void)__atomic_add_fetch(&s_snapshot_seq, 1u, __ATOMIC_RELEASE); /* even */
+    __atomic_store_n(&s_snapshot_writer, false, __ATOMIC_RELEASE);
+}
+
+static void publish_state_snapshot(void)
+{
+    snapshot_write_begin();
     memcpy(s_published_decks, s_decks, sizeof(s_published_decks));
     memcpy(s_published_loop_shadow, s_loop_shadow, sizeof(s_published_loop_shadow));
     s_published_beat_fx = s_beat_fx;
-    (void)__atomic_add_fetch(&s_snapshot_seq, 1u, __ATOMIC_RELEASE); /* even */
-    __atomic_store_n(&s_snapshot_writer, false, __ATOMIC_RELEASE);
+    snapshot_write_end();
 }
 
 static void copy_state_snapshot(uint8_t deck,
@@ -235,31 +245,85 @@ static deck_censor_shadow_t s_censor_shadow[DECK_CORE_DECK_COUNT];
 /* Hot-cue exists-mask cache: publish_flx4_led_snapshot() needs the mask on
  * every publish, and reading it from NVS each time puts flash reads on the
  * input-handling path. All cue writes go through this file, so the cache is
- * refreshed on save and only misses once per loaded track. */
+ * refreshed on save and only misses once per loaded track.
+ *
+ * The cache also holds the slot positions, published for the UI through the
+ * same seqlock as the deck snapshot (the UI never reads hot_cue_store/NVS):
+ * every cache write republishes the view and bumps s_hot_cue_revision. */
 static uint32_t s_hot_cue_mask_cache_key[DECK_CORE_DECK_COUNT];
 static uint8_t  s_hot_cue_mask_cache_value[DECK_CORE_DECK_COUNT];
+static deck_core_hot_cue_slot_t s_hot_cue_cache_slots[DECK_CORE_DECK_COUNT][DECK_CORE_HOT_CUE_SLOT_COUNT];
+
+typedef struct {
+    uint32_t track_key;
+    uint8_t  valid_mask;
+    deck_core_hot_cue_slot_t slots[DECK_CORE_HOT_CUE_SLOT_COUNT];
+} deck_hot_cue_view_t;
+
+typedef char deck_core_hot_cue_slot_count_matches_store
+    [(DECK_CORE_HOT_CUE_SLOT_COUNT == HOT_CUE_STORE_SLOT_COUNT) ? 1 : -1];
+
+static deck_hot_cue_view_t s_published_hot_cues[DECK_CORE_DECK_COUNT];
+static uint32_t s_hot_cue_revision;
+
+static void snapshot_write_begin(void);
+static void snapshot_write_end(void);
+
+/* Caller holds the snapshot writer. */
+static void publish_hot_cue_view_locked(void)
+{
+    for (uint8_t d = 0; d < DECK_CORE_DECK_COUNT; d++) {
+        s_published_hot_cues[d].track_key = s_hot_cue_mask_cache_key[d];
+        s_published_hot_cues[d].valid_mask = s_hot_cue_mask_cache_value[d];
+        memcpy(s_published_hot_cues[d].slots, s_hot_cue_cache_slots[d],
+               sizeof(s_published_hot_cues[d].slots));
+    }
+    (void)__atomic_add_fetch(&s_hot_cue_revision, 1u, __ATOMIC_RELEASE);
+}
 
 static void hot_cue_mask_cache_invalidate(uint8_t deck)
 {
     if (deck >= DECK_CORE_DECK_COUNT) {
         return;
     }
+    snapshot_write_begin();
     s_hot_cue_mask_cache_key[deck] = 0;
     s_hot_cue_mask_cache_value[deck] = 0;
+    memset(s_hot_cue_cache_slots[deck], 0, sizeof(s_hot_cue_cache_slots[deck]));
+    publish_hot_cue_view_locked();
+    snapshot_write_end();
 }
 
-static void hot_cue_mask_cache_store(uint8_t deck, uint32_t track_key, uint8_t mask)
+static void hot_cue_mask_cache_store(uint8_t deck, uint32_t track_key,
+                                     const hot_cue_store_blob_t *blob)
 {
+    const uint8_t mask = (uint8_t)(blob->valid_mask & 0xFFu);
+    deck_core_hot_cue_slot_t slots[DECK_CORE_HOT_CUE_SLOT_COUNT] = {0};
+    for (uint8_t i = 0; i < DECK_CORE_HOT_CUE_SLOT_COUNT; i++) {
+        if ((mask & (1u << i)) == 0u) continue;
+        const bool loop = blob->slots[i].type == HOT_CUE_STORE_TYPE_LOOP;
+        slots[i] = (deck_core_hot_cue_slot_t) {
+            .pos_ms = blob->slots[i].pos_ms,
+            .end_ms = loop ? blob->slots[i].end_ms : 0u,
+            .loop = loop,
+        };
+    }
+
+    snapshot_write_begin();
     if (deck < DECK_CORE_DECK_COUNT) {
         s_hot_cue_mask_cache_key[deck] = track_key;
         s_hot_cue_mask_cache_value[deck] = mask;
+        memcpy(s_hot_cue_cache_slots[deck], slots, sizeof(slots));
     }
     /* Keep the other deck coherent when both decks hold the same track. */
     for (uint8_t d = 0; d < DECK_CORE_DECK_COUNT; d++) {
         if (d != deck && s_hot_cue_mask_cache_key[d] == track_key) {
             s_hot_cue_mask_cache_value[d] = mask;
+            memcpy(s_hot_cue_cache_slots[d], slots, sizeof(slots));
         }
     }
+    publish_hot_cue_view_locked();
+    snapshot_write_end();
 }
 
 #define DECK_CORE_DEFERRED_MIXER_LOG_STEP 2048u
@@ -701,7 +765,7 @@ static uint8_t hot_cue_exists_mask_for_deck(uint8_t deck)
     if (hot_cue_store_load(track_key, &blob) == ESP_OK) {
         mask = (uint8_t)(blob.valid_mask & 0xFFu);
     }
-    hot_cue_mask_cache_store(deck, track_key, mask);
+    hot_cue_mask_cache_store(deck, track_key, &blob);
     return mask;
 }
 
@@ -742,7 +806,7 @@ static void handle_hot_cue_pad_action(uint8_t deck, uint8_t pad, bool shifted, d
         memset(&blob.slots[pad], 0, sizeof(blob.slots[pad]));
         rc = hot_cue_store_save(track_key, &blob);
         if (rc == ESP_OK) {
-            hot_cue_mask_cache_store(deck, track_key, (uint8_t)(blob.valid_mask & 0xFFu));
+            hot_cue_mask_cache_store(deck, track_key, &blob);
             ESP_LOGI(TAG, "deck %u hot cue %u cleared",
                      (unsigned)deck + 1,
                      (unsigned)pad + 1);
@@ -783,7 +847,7 @@ static void handle_hot_cue_pad_action(uint8_t deck, uint8_t pad, bool shifted, d
     };
     rc = hot_cue_store_save(track_key, &blob);
     if (rc == ESP_OK) {
-        hot_cue_mask_cache_store(deck, track_key, (uint8_t)(blob.valid_mask & 0xFFu));
+        hot_cue_mask_cache_store(deck, track_key, &blob);
         ESP_LOGI(TAG, "deck %u hot cue %u set -> %lu ms",
                  (unsigned)deck + 1,
                  (unsigned)pad + 1,
@@ -1945,6 +2009,63 @@ static void on_cue_release(uint8_t deck)
     sync_legacy_compat_leds(deck);
 }
 
+/* Rekordbox hot cues as a hot_cue_store blob: slot = ANLZ index (A..H), a
+ * Rekordbox loop keeps its end as a LOOP slot, cues past the track end are
+ * dropped. */
+static void hot_cue_seed_from_anlz(const anlz_metadata_t *meta, uint32_t duration_ms,
+                                   hot_cue_store_blob_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    for (uint8_t i = 0; i < meta->cue_count && i < ANLZ_MAX_CUES; i++) {
+        const anlz_cue_t *cue = &meta->cues[i];
+        const uint32_t bit = 1u << cue->index;
+        if (cue->index >= HOT_CUE_STORE_SLOT_COUNT || (out->valid_mask & bit) != 0u ||
+            (duration_ms != 0u && cue->start_ms >= duration_ms)) {
+            continue;
+        }
+        const bool loop = cue->type == ANLZ_CUE_LOOP && cue->end_ms > cue->start_ms;
+        out->slots[cue->index] = (hot_cue_store_slot_t) {
+            .pos_ms = cue->start_ms,
+            .end_ms = loop ? cue->end_ms : 0u,
+            .type = loop ? HOT_CUE_STORE_TYPE_LOOP : HOT_CUE_STORE_TYPE_SINGLE,
+        };
+        out->valid_mask |= bit;
+    }
+}
+
+/* Seed the store from Rekordbox only while the track has no local hot cue:
+ * any cue set on the pads keeps priority and nothing is overwritten. A store
+ * read error other than "not found" also leaves the store alone. */
+static void seed_hot_cues_from_anlz(uint8_t deck, uint32_t track_key,
+                                    const hot_cue_store_blob_t *seed)
+{
+    if (track_key == 0u || seed->valid_mask == 0u) {
+        return;
+    }
+    hot_cue_store_blob_t stored = {0};
+    esp_err_t rc = hot_cue_store_load(track_key, &stored);
+    if (rc == ESP_OK && (stored.valid_mask & 0xFFu) != 0u) {
+        ESP_LOGI(TAG, "deck %u hot cues: local mask 0x%02x kept, Rekordbox ignored",
+                 (unsigned)deck + 1, (unsigned)(stored.valid_mask & 0xFFu));
+        hot_cue_mask_cache_store(deck, track_key, &stored);
+        return;
+    }
+    if (rc != ESP_OK && rc != ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(TAG, "deck %u hot cue seed skipped: load failed: %s",
+                 (unsigned)deck + 1, esp_err_to_name(rc));
+        return;
+    }
+    rc = hot_cue_store_save(track_key, seed);
+    if (rc != ESP_OK) {
+        ESP_LOGW(TAG, "deck %u hot cue seed save failed: %s",
+                 (unsigned)deck + 1, esp_err_to_name(rc));
+        return;
+    }
+    hot_cue_mask_cache_store(deck, track_key, seed);
+    ESP_LOGI(TAG, "deck %u hot cues seeded from Rekordbox: mask 0x%02x",
+             (unsigned)deck + 1, (unsigned)(seed->valid_mask & 0xFFu));
+}
+
 /* Actor side of a track load: the cue point starts at the Rekordbox memory cue
  * (track start without one) and a paused deck parks on it, so the first CUE
  * press previews instead of overwriting it. `generation` is the low 16 bits of
@@ -1965,10 +2086,20 @@ static void apply_loaded_memory_cue(uint8_t deck, uint16_t generation)
         (loaded.duration_ms == 0u || meta->memory_cue_ms < loaded.duration_ms)) {
         cue_ms = meta->memory_cue_ms;
     }
+    hot_cue_store_blob_t hot_cue_seed = {0};
+    if (current && loaded.has_anlz && meta) {
+        hot_cue_seed_from_anlz(meta, loaded.duration_ms, &hot_cue_seed);
+    }
     anlz_snapshot_release(snapshot);
     if (!current) {
         return;
     }
+
+    seed_hot_cues_from_anlz(idx, loaded.track_key, &hot_cue_seed);
+    /* The pad bank was published when the load was submitted, before this
+     * track was in the store; bring it to this track's cues (mask diff, so an
+     * unchanged bank sends nothing). */
+    publish_loaded_track_hot_cue_leds(idx);
 
     deck_state_t *state = &s_decks[idx];
     const bool uses_audio = deck_uses_audio_engine(idx);
@@ -3382,6 +3513,45 @@ bool deck_core_get_loaded_track(uint8_t deck,
     return deck_loaded_track_store_get(&s_loaded_tracks, deck, out);
 }
 
+bool deck_core_get_hot_cues(uint8_t deck, deck_core_hot_cues_t *out)
+{
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (deck >= DECK_CORE_DECK_COUNT) return false;
+
+    deck_hot_cue_view_t view;
+    for (;;) {
+        const uint32_t before = __atomic_load_n(&s_snapshot_seq, __ATOMIC_ACQUIRE);
+        if (before & 1u) {
+            continue;   /* writer mid-update; re-read the sequence */
+        }
+        view = s_published_hot_cues[deck];
+        const uint32_t after = __atomic_load_n(&s_snapshot_seq, __ATOMIC_ACQUIRE);
+        if (after == before) {
+            break;
+        }
+    }
+
+    /* The view is only this deck's cues while it names the loaded track: right
+     * after a load it still describes the previous one (or nothing) until the
+     * actor has read the store. */
+    deck_loaded_track_summary_t loaded = {0};
+    if (view.track_key == 0u ||
+        !deck_loaded_track_store_get(&s_loaded_tracks, deck, &loaded) ||
+        !loaded.valid || loaded.track_key != view.track_key) {
+        return false;
+    }
+    out->known = true;
+    out->valid_mask = view.valid_mask;
+    memcpy(out->slots, view.slots, sizeof(out->slots));
+    return true;
+}
+
+uint32_t deck_core_hot_cues_revision(void)
+{
+    return __atomic_load_n(&s_hot_cue_revision, __ATOMIC_ACQUIRE);
+}
+
 #if defined(DECK_CORE_PC_TEST)
 void deck_core_test_reset(void)
 {
@@ -3414,6 +3584,8 @@ void deck_core_test_reset(void)
     memset(s_beat_jump_shift_helper_led_state, 0, sizeof(s_beat_jump_shift_helper_led_state));
     memset(s_hot_cue_mask_cache_key, 0, sizeof(s_hot_cue_mask_cache_key));
     memset(s_hot_cue_mask_cache_value, 0, sizeof(s_hot_cue_mask_cache_value));
+    memset(s_hot_cue_cache_slots, 0, sizeof(s_hot_cue_cache_slots));
+    memset(s_published_hot_cues, 0, sizeof(s_published_hot_cues));
 #if defined(DECK_CORE_PC_TEST)
     memset(s_deferred_mixer_last, 0, sizeof(s_deferred_mixer_last));
     memset(s_deferred_mixer_seen, 0, sizeof(s_deferred_mixer_seen));

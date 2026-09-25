@@ -90,6 +90,29 @@ void ui_overview_renderer_draw_main_rgb565_column_span(uint16_t *pixels,
                                                        uint32_t loop_start_ms,
                                                        uint32_t loop_end_ms);
 
+/* v244: same as ..._column_span but the hot-cue markers come from `cues`
+ * (merged local + ANLZ list) instead of meta->cues. */
+void ui_overview_renderer_draw_main_rgb565_column_span_cues(uint16_t *pixels,
+                                                            int stride_px,
+                                                            int height_px,
+                                                            int dest_x_px,
+                                                            int logical_x_px,
+                                                            int column_count,
+                                                            int logical_width_px,
+                                                            const ui_waveform_source_t *source,
+                                                            uint32_t duration_ms,
+                                                            const anlz_metadata_t *meta,
+                                                            uint32_t center_ms,
+                                                            uint32_t window_ms,
+                                                            const uint16_t *palette,
+                                                            size_t palette_count,
+                                                            bool regular_beat_cap_bottom,
+                                                            bool loop_active,
+                                                            uint32_t loop_start_ms,
+                                                            uint32_t loop_end_ms,
+                                                            const anlz_cue_t *cues,
+                                                            uint8_t cue_count);
+
 bool ui_overview_renderer_draw_mini(uint8_t *pixels,
                                     int stride_px,
                                     int width_px,

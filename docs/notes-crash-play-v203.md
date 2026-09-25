@@ -1643,3 +1643,151 @@ visiblement de la position réelle.
   - test hôte des helpers d'incrustation (géométrie, rognage, wrap du ring
     buffer, restauration à l'identique, indépendance des decks) : OK ;
   - pas de build firmware ni de test matériel.
+
+## v243 — semage des hot cues Rekordbox au chargement (2026-09-25)
+
+- Validation matérielle de v242 : non renseignée ici. v241–v242 ont été
+  commités par l'opérateur (`b0ac977`).
+- Constat préalable : `anlz_metadata_t.cues[]` était toujours vide sur les
+  vrais exports. `parse_pcob()` suppose un ancien layout de PCPT (type et
+  index aux octets 0 et 1). Sur un vrai fichier, l'octet 1 vaut `'C'`, donc
+  chaque entrée est rejetée. Sur 52 ANLZ réels, 0 cue était lu, alors que
+  P022/0000B12C porte A=12249 ms et P01B/00020FAD B=182 ms. Conséquence : les
+  marqueurs hot cue de la waveform (qui lisent `meta->cues`) ne sont jamais
+  apparus sur du vrai matériel.
+- Parseur (`rekordbox_anlz.c`) :
+  - le parcours v241 des PCOB (`parse_pcob_lists`) lit aussi la liste de
+    type 1 (hot cues) avec le vrai layout PCPT :
+    - `hot_cue` à 0x0c, de 1 à 8, correspond au slot 0 à 7 (A à H) ;
+    - le type à 0x1c ;
+    - `time_ms` à 0x20 ;
+    - `loop_time_ms` à 0x24.
+  - Une liste réelle remplace ce que `parse_pcob()` avait deviné, ce qui garde
+    la fixture legacy de `tests/anlz` valide.
+  - Une boucle sans fin valide devient un point.
+  - Pour chaque slot, la première entrée gagne. Les slots hors 1 à 8 et les
+    temps à `0xffffffff` sont ignorés.
+- Cache méta : passe en v4. Les entrées v3 ont été écrites avec une liste de
+  cues vide et sont donc re-parsées.
+- `deck_core` (même chemin acteur que le memory cue v241,
+  `apply_loaded_memory_cue`) :
+  - `hot_cue_seed_from_anlz()` construit un blob `hot_cue_store` à partir des
+    `cues[]` : slot = index ANLZ, la boucle devient
+    `HOT_CUE_STORE_TYPE_LOOP` avec `end_ms`, et les cues au-delà de la durée
+    sont ignorés.
+  - `seed_hot_cues_from_anlz()` ne sauve en NVS que si le store n'a aucun cue
+    pour ce `track_key` (`ESP_ERR_NOT_FOUND` ou `valid_mask == 0`). Un cue
+    local posé aux pads reste prioritaire, et rien n'est écrasé. Une autre
+    erreur de lecture laisse aussi le store intact.
+  - La clé est `loaded.track_key`, la même que
+    `loaded_track_key_for_deck()` utilise pour les pads. Le cache
+    `s_hot_cue_mask_cache` est mis à jour par `hot_cue_mask_cache_store()`.
+  - Les LEDs des pads sont ensuite republiées par
+    `publish_loaded_track_hot_cue_leds()` (diff de masque, rien n'est envoyé
+    si la banque est déjà juste).
+  - Pas d'écriture NVS si la piste n'a pas de hot cue Rekordbox.
+- Limites connues :
+  - rappel d'un slot LOOP = saut au début de la boucle (le rappel existant
+    ignore `end_ms`) ;
+  - après avoir effacé tous ses cues locaux, la piste est re-semée au
+    prochain chargement ;
+  - les marqueurs de la waveform et l'onglet Hot Cues affichent toujours
+    `meta->cues` (Rekordbox), pas le store. Les cues posés localement n'y
+    apparaissent donc pas, comme avant.
+- Vérification :
+  - hôte : `tests/anlz` 39/39 contre la source jc1060 ;
+  - test synthétique du vrai layout (point, boucle, doublon, slot hors plage,
+    boucle sans fin, remplacement du legacy) : OK ;
+  - les 52 ANLZ réels sont parsés sans erreur, et les 2 pistes à hot cues
+    donnent A=12249 et B=182 ;
+  - aller-retour du cache v4 avec des cues : OK ;
+  - `deck_core_dual` : 3 tests v243 OK. Avec le semage retiré, ils échouent
+    (8 assertions), ce qui confirme qu'ils le détectent. Les 16 échecs
+    préexistants restent identiques ;
+  - `-fsyntax-only` en mode firmware de `deck_core.c` : diagnostics
+    identiques à HEAD ;
+  - pas de build firmware ni de test matériel.
+
+## v244 — cues locaux (pads) visibles dans l'UI (2026-09-25)
+
+- Bug remonté sur v243 : un hot cue posé au pad ne s'affichait ni dans
+  l'onglet Hot Cues ni sur la waveform. `ui_performance_tabs_update_hot_cues()`
+  et `ui_overview_update_cue_markers()` (ainsi que le renderer de la strip
+  principale) ne lisaient que `meta->cues` (ANLZ), jamais `hot_cue_store`.
+- `deck_core` : le cache `s_hot_cue_mask_cache` garde maintenant aussi les
+  positions des slots (`s_hot_cue_cache_slots`). Chaque mise à jour du cache
+  (pad set/clear, chargement, semage v243, invalidation) publie une vue
+  par deck sous le seqlock existant du snapshot (`snapshot_write_begin/end`,
+  extraits de `publish_state_snapshot`) et incrémente un compteur de
+  révision.
+  - `deck_core_get_hot_cues(deck, &out)` : copie sans verrou côté lecteur.
+    Retourne `known` seulement si la vue porte le `track_key` actuellement
+    chargé sur ce deck. L'UI ne lit donc jamais `hot_cue_store`/NVS dans la
+    tâche LVGL.
+  - `deck_core_hot_cues_revision()` : lecture atomique.
+  - Aucun changement dans le chemin audio : pas d'allocation, pas de
+    changement de pacing ni de priorités.
+- UI : `ui_hot_cue_view_merge()` (nouveau `ui_hot_cue_view.c`) fusionne
+  slot par slot : cue du store s'il existe, sinon cue ANLZ du même slot,
+  sinon vide.
+  - Onglet Hot Cues : utilise la liste fusionnée. EMPTY dès qu'une des deux
+    sources est connue ; les positions factices ne restent que sans aucune
+    source.
+  - Overview : les lignes mini et l'empreinte FNV utilisent la liste
+    fusionnée (type et fin de boucle inclus). La strip principale la reçoit
+    via `ui_overview_wave_cache_set_cues()` (copie, comparaison champ par
+    champ, invalidation seulement si la liste change) et
+    `ui_overview_renderer_draw_main_rgb565_column_span_cues()`. L'ancienne
+    fonction reste un wrapper sur `meta->cues`, et le cache retombe sur
+    `meta->cues` tant que la liste fusionnée n'est pas calculée après un
+    chargement.
+  - `ui_update()` compare la révision à chaque frame. Si elle a changé, il
+    rafraîchit l'onglet Hot Cues et les marqueurs des deux decks, sans
+    attendre le tick de 1 Hz.
+- Limite connue : avec la règle de repli, un slot vidé au pad (ou un slot
+  Rekordbox non semé parce que la piste avait déjà des cues locaux) montre
+  encore le cue ANLZ alors que le pad est éteint.
+- Vérification :
+  - `deck_core_dual` : 2 tests v244 OK. Ils couvrent le pad set/clear, la
+    révision, le deck sans piste, le deck invalide, le semage visible et la
+    même piste sur les deux decks. La mutation « vue non publiée » donne
+    12 échecs. Les 16 échecs préexistants restent identiques ;
+  - test hôte de `ui_hot_cue_view_merge` : OK ;
+  - `-fsyntax-only` en mode firmware de `deck_core.c`, `ui.c`,
+    `ui_overview.c` et `ui_performance_tabs.c` : diagnostics identiques à
+    HEAD. `ui_hot_cue_view.c`, `ui_overview_renderer.c` et
+    `ui_overview_wave_cache.c` : aucun diagnostic ;
+  - pas de build firmware ni de test matériel.
+
+## v245 — Settings : nom du contrôleur actif au lieu de « FLX4 » (2026-09-25)
+
+- Bug : dans Settings, la valeur « CUE: FLX4 USB » et la tuile « MIXER: FLX4 »
+  étaient codées en dur, même avec une DDJ-400 active.
+- `controller_profile_manager` :
+  - `controller_profile_short_name()` (helper pur) : dérive le nom court de
+    l'id du profil (nom du répertoire SD). Le préfixe vendeur est retiré,
+    le reste passe en majuscules et `_` devient `-` :
+    `pioneer_ddj_400` → `DDJ-400`, `pioneer_ddj_flx4` → `DDJ-FLX4`.
+  - `cpm_publish_active_locked()` : appelé sous le mutex après chaque
+    changement du registre (début, succès ou échec d'activation, descripteur,
+    rescan, installation, déconnexion). Il recopie l'id du profil actif
+    (`CPM_TRANSFER_ACTIVE`, sinon "") et incrémente une génération atomique
+    seulement si l'id change.
+  - `controller_profile_manager_active_generation()` : lecture atomique.
+  - `controller_profile_manager_get_active_short_name()` : copie l'id avec
+    un try-lock non bloquant. Elle retourne false si le manager est occupé.
+- `ui_settings.c` : « CUE: <NOM> » et « MIXER: <NOM> », ou « CUE: USB » et
+  « MIXER: USB » si aucun profil local n'est actif (y compris avec le mapping
+  intégré). Mise à jour à la création et dans `ui_settings_update()` quand la
+  génération change. Chaque frame ne fait qu'une lecture atomique ; si le
+  try-lock échoue, on réessaie à la frame suivante. `lv_label_set_text()`
+  invalide le label. Le label de la tuile MIXER passe en mode DOTS sur
+  104 px pour qu'un nom long reste dans la tuile de 110 px.
+- `ui/CMakeLists.txt` : `controller_profile_manager` est ajouté aux REQUIRES
+  (pas de cycle).
+- Vérification :
+  - suite hôte `controller_profile_manager` contre la source jc1060 : OK ;
+  - test hôte de `controller_profile_short_name` : OK ;
+  - `-fsyntax-only` en mode firmware de `ui_settings.c` (avec des stubs BSP)
+    et de `controller_profile_manager.c` : diagnostics identiques à HEAD ;
+  - pas de build firmware ni de test matériel.

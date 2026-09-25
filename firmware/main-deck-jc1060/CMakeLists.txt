@@ -12,7 +12,7 @@ set(EXTRA_COMPONENT_DIRS
     "${CMAKE_CURRENT_LIST_DIR}/../common/control_state_reconciler")
 
 # Bump on every OTA-worthy change (same-version images are skipped by OTA).
-set(PROJECT_VER "242")
+set(PROJECT_VER "245")
 
 project(pajoniiir_deck)
 
