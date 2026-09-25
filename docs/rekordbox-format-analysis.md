@@ -219,6 +219,24 @@ uint32_t end_ms;      // bytes 8–11: loop end (only if type=2)
 // bytes 12–55: name, color info (not used)
 ```
 
+> **Correction (fw 241, JC1060).** The layout above does not match real files
+> and was never validated (the PCOBs observed so far were empty). Per the Deep
+> Symmetry ANLZ spec, a DAT carries two PCOB sections, and every PCPT entry is
+> a tagged mini-section:
+>
+> - PCOB header (`len_header` 0x18): `0x0c` u32 list type (0 = memory points,
+>   1 = hot cues), `0x12` u16 entry count; entries start at `len_header`.
+> - PCPT entry (`len_entry` 0x38): `0x00` `'PCPT'`, `0x04` len_header 0x1c,
+>   `0x08` len_entry, `0x0c` u32 hot_cue (0 = memory, 1 = A…), `0x10` u32
+>   status, `0x1c` u8 type (1 = point, 2 = loop), `0x20` u32 time_ms,
+>   `0x24` u32 loop_time_ms.
+>
+> The JC1060 firmware reads the memory cue with this layout
+> (`anlz_metadata_t.memory_cue_ms`, earliest memory point or loop start,
+> across every PCOB). `parse_pcob()`, which fills `cues[]` for the hot-cue
+> display, still uses the old layout and only the first PCOB. On a real file
+> byte 1 is `'C'`, so it yields no hot cues. That fix is still open.
+
 ### PQTZ — Beat Grid Entry (8 bytes, big-endian)
 
 ```c

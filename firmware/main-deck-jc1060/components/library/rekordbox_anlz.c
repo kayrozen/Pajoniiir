@@ -431,6 +431,107 @@ static esp_err_t parse_pcob(FILE *fp, anlz_metadata_t *out)
     return ESP_OK;
 }
 
+/* ── Memory cue (PCOB type 0, real PCPT layout) ─────────────────────────── *
+ *
+ * Rekordbox writes two PCOB sections: list type 0 holds memory points, type 1
+ * hot cues. parse_pcob() above only sees the first PCOB and assumes an older
+ * record layout, so the memory cue is read here by its own walk over every
+ * section (Deep Symmetry ANLZ spec):
+ *
+ * PCOB header (len_header >= 0x18):
+ *   0x0c  u32  list type (0 = memory points, 1 = hot cues)
+ *   0x12  u16  entry count
+ *   entries start at len_header
+ *
+ * PCPT entry (len_entry, normally 0x38):
+ *   0x00  'PCPT'   0x04 len_header   0x08 len_entry
+ *   0x0c  u32  hot_cue (0 = memory point)
+ *   0x1c  u8   type (1 = point, 2 = loop)
+ *   0x20  u32  time_ms (loop start for loops)
+ *
+ * The earliest memory point or loop start wins, like CDJ auto-cue. A PCPT
+ * entry that does not fit its section ends the list without rejecting the
+ * file; the section chain itself was already validated by the tag walks.
+ */
+#define ANLZ_TAG_PCPT            0x50435054u  /* 'PCPT' */
+#define ANLZ_PCOB_HEADER_MIN     0x18u
+#define ANLZ_PCPT_ENTRY_MIN      0x28u
+#define ANLZ_PCOB_LIST_MEMORY    0u
+
+static void read_memory_cue_list(FILE *fp, uint32_t pos, uint32_t header_size,
+                                 uint32_t segment_size, anlz_metadata_t *out)
+{
+    uint8_t hdr[ANLZ_PCOB_HEADER_MIN];
+    if (fseek(fp, (long)pos, SEEK_SET) != 0 ||
+        !anlz_read_exact(hdr, sizeof(hdr), fp)) {
+        return;
+    }
+    const uint32_t list_type = ((uint32_t)hdr[0x0c] << 24) | ((uint32_t)hdr[0x0d] << 16) |
+                               ((uint32_t)hdr[0x0e] <<  8) |  (uint32_t)hdr[0x0f];
+    const uint16_t count = (uint16_t)((hdr[0x12] << 8) | hdr[0x13]);
+    if (list_type != ANLZ_PCOB_LIST_MEMORY) return;
+
+    const uint32_t end = pos + segment_size;
+    uint32_t entry = pos + header_size;
+    for (uint16_t i = 0; i < count && end - entry >= ANLZ_PCPT_ENTRY_MIN; ++i) {
+        uint8_t buf[ANLZ_PCPT_ENTRY_MIN];
+        if (fseek(fp, (long)entry, SEEK_SET) != 0 ||
+            !anlz_read_exact(buf, sizeof(buf), fp)) {
+            return;
+        }
+        const uint32_t tag     = ((uint32_t)buf[0]  << 24) | ((uint32_t)buf[1]  << 16) |
+                                 ((uint32_t)buf[2]  <<  8) |  (uint32_t)buf[3];
+        const uint32_t len     = ((uint32_t)buf[8]  << 24) | ((uint32_t)buf[9]  << 16) |
+                                 ((uint32_t)buf[10] <<  8) |  (uint32_t)buf[11];
+        const uint32_t hot_cue = ((uint32_t)buf[12] << 24) | ((uint32_t)buf[13] << 16) |
+                                 ((uint32_t)buf[14] <<  8) |  (uint32_t)buf[15];
+        const uint32_t time_ms = ((uint32_t)buf[32] << 24) | ((uint32_t)buf[33] << 16) |
+                                 ((uint32_t)buf[34] <<  8) |  (uint32_t)buf[35];
+        if (tag != ANLZ_TAG_PCPT || len < ANLZ_PCPT_ENTRY_MIN || len > end - entry) {
+            return;
+        }
+        if (hot_cue == 0u && time_ms != UINT32_MAX &&
+            (!out->has_memory_cue || time_ms < out->memory_cue_ms)) {
+            out->memory_cue_ms = time_ms;
+            out->has_memory_cue = true;
+        }
+        entry += len;
+    }
+}
+
+static esp_err_t parse_memory_cue(FILE *fp, anlz_metadata_t *out)
+{
+    out->has_memory_cue = false;
+    out->memory_cue_ms = 0u;
+
+    if (fseek(fp, 0, SEEK_END) != 0) return ESP_ERR_INVALID_SIZE;
+    const long fsz = ftell(fp);
+    if (fsz < 12 || (unsigned long)fsz > UINT32_MAX) return ESP_ERR_INVALID_SIZE;
+    const uint32_t file_len = (uint32_t)fsz;
+
+    uint32_t pos = 0u;
+    while (pos + 12u <= file_len) {
+        if (fseek(fp, (long)pos, SEEK_SET) != 0) return ESP_ERR_INVALID_SIZE;
+        const uint32_t tag          = read_be32(fp);
+        const uint32_t header_size  = read_be32(fp);
+        const uint32_t segment_size = read_be32(fp);
+        if (s_anlz_short_read) return ESP_ERR_INVALID_SIZE;
+
+        const uint32_t advance = (tag == ANLZ_TAG_PMAI) ? header_size : segment_size;
+        if (header_size < 12u ||
+            (tag != ANLZ_TAG_PMAI && segment_size < header_size) ||
+            advance < 12u || advance > file_len - pos) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        if (tag == ANLZ_TAG_PCOB && header_size >= ANLZ_PCOB_HEADER_MIN) {
+            read_memory_cue_list(fp, pos, header_size, segment_size, out);
+            if (s_anlz_short_read) return ESP_ERR_INVALID_SIZE;
+        }
+        pos += advance;
+    }
+    return ESP_OK;
+}
+
 /* ── PWV3 parser ─────────────────────────────────────────────────────────── *
  *
  * Byte layout after tag (same as PWAV but data can be up to 60 000 bytes):
@@ -551,6 +652,10 @@ esp_err_t anlz_parse_dat(const char *dat_path, anlz_metadata_t *out)
         if (result != ESP_OK) break;
         if (tags[i] == ANLZ_TAG_PPTH) has_path = found && next.audio_path[0] != '\0';
     }
+    if (result == ESP_OK) {
+        s_anlz_short_read = false;
+        result = parse_memory_cue(fp, &next);
+    }
     fclose(fp);
 
     /* Without PPTH there is no audio path, so the analysis cannot be tied to a
@@ -565,8 +670,9 @@ esp_err_t anlz_parse_dat(const char *dat_path, anlz_metadata_t *out)
     }
 
     *out = next;
-    ANLZ_LOGI(TAG, "DAT transaction published: bpm=%u beats=%u cues=%u",
-              out->bpm, out->beat_count, out->cue_count);
+    ANLZ_LOGI(TAG, "DAT transaction published: bpm=%u beats=%u cues=%u memory_cue=%s%lu",
+              out->bpm, out->beat_count, out->cue_count,
+              out->has_memory_cue ? "" : "none/", (unsigned long)out->memory_cue_ms);
     return ESP_OK;
 }
 

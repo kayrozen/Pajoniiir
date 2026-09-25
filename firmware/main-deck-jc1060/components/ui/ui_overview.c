@@ -427,6 +427,19 @@ static uint32_t ui_overview_main_window_ms(uint8_t deck, const anlz_metadata_t *
 
 static lv_obj_t *s_overview_cue_markers[DECK_CORE_DECK_COUNT][8];
 static lv_obj_t *s_overview_mini_cue_markers[DECK_CORE_DECK_COUNT][8];
+/* Deck cue point (deck_state_t.cue_point_ms) marker: a small solid yellow
+ * down-pointing triangle at the top edge, burned into the main strip at blit
+ * time (it moves with CUE presses, not with the ANLZ key) and drawn as an LVGL
+ * object on the LVGL-rendered mini overview. */
+#define OVERVIEW_CUE_POINT_COLOR   0xFFFF00
+#define OVERVIEW_CUE_POINT_TRI_W   9
+#define OVERVIEW_CUE_POINT_TRI_H   5
+#define OVERVIEW_MINI_CUE_POINT_W  7
+#define OVERVIEW_MINI_CUE_POINT_H  5
+static lv_obj_t *s_overview_mini_cue_point[DECK_CORE_DECK_COUNT];
+static uint32_t s_overview_cue_point_ms[DECK_CORE_DECK_COUNT];
+static bool s_overview_cue_point_visible[DECK_CORE_DECK_COUNT];
+static bool s_overview_cue_point_seen[DECK_CORE_DECK_COUNT];
 static uint32_t s_overview_cue_fingerprint[DECK_CORE_DECK_COUNT];
 static bool s_overview_cue_fingerprint_valid[DECK_CORE_DECK_COUNT];
 static uint32_t s_overview_deck_duration_ms[DECK_CORE_DECK_COUNT];
@@ -970,6 +983,21 @@ static void ui_create_overview_deck_panel(lv_obj_t *parent, uint8_t deck, int y)
         lv_obj_add_flag(mc, LV_OBJ_FLAG_HIDDEN);
         lv_obj_remove_flag(mc, LV_OBJ_FLAG_CLICKABLE);
         s_overview_mini_cue_markers[ui_overview_deck_index(deck)][i] = mc;
+    }
+
+    /* Mini cue-point triangle: above the hot-cue lines, below the playhead. */
+    {
+        lv_obj_t *cp = lv_obj_create(panel->mini_wave_border);
+        lv_obj_remove_style_all(cp);
+        lv_obj_set_style_bg_color(cp, lv_color_hex(OVERVIEW_CUE_POINT_COLOR), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(cp, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_size(cp, OVERVIEW_MINI_CUE_POINT_W, OVERVIEW_MINI_CUE_POINT_H);
+        lv_obj_set_pos(cp, 0, 0);
+        lv_obj_add_flag(cp, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(cp, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(cp, cue_head_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
+        s_overview_mini_cue_point[ui_overview_deck_index(deck)] = cp;
+        s_overview_cue_point_seen[ui_overview_deck_index(deck)] = false;
     }
 
     panel->mini_playhead = lv_obj_create(panel->mini_wave_border);
@@ -1578,6 +1606,66 @@ static void armed_loop_burn_restore(ui_overview_wave_cache_t *cache,
     }
 }
 
+/* ---------- cue point burn-in helpers ---------- */
+
+typedef struct {
+    uint16_t saved[OVERVIEW_CUE_POINT_TRI_W * OVERVIEW_CUE_POINT_TRI_H];
+    int      offset[OVERVIEW_CUE_POINT_TRI_W * OVERVIEW_CUE_POINT_TRI_H];
+    int      count;
+} cue_point_burn_ctx_t;
+
+/* Solid yellow triangle pointing down from the top edge, centred on the cue
+ * column. Drawn after the playhead so it stays readable when parked on cue. */
+static void cue_point_burn_save_and_fill(ui_overview_wave_cache_t *cache,
+                                         cue_point_burn_ctx_t *ctx,
+                                         uint8_t idx)
+{
+    ctx->count = 0;
+    if (!cache || !cache->pixels || cache->strip_width_px <= 0 ||
+        cache->view_width_px <= 0 || cache->height_px < OVERVIEW_CUE_POINT_TRI_H ||
+        cache->ms_per_px_q16 <= 0 || idx >= DECK_CORE_DECK_COUNT ||
+        !s_overview_cue_point_visible[idx]) {
+        return;
+    }
+
+    const int cue_logical = (int)((((int64_t)s_overview_cue_point_ms[idx] * Q16_ONE) -
+                                   cache->strip_start_ms_q16) /
+                                  cache->ms_per_px_q16);
+    const int half = OVERVIEW_CUE_POINT_TRI_W / 2;
+    const int view_end = cache->view_origin_px + cache->view_width_px;
+    if (cue_logical + half < cache->view_origin_px || cue_logical - half >= view_end) {
+        return;
+    }
+
+    const uint16_t color = UI_RGB565(0xFF, 0xFF, 0x00);
+    for (int y = 0; y < OVERVIEW_CUE_POINT_TRI_H; y++) {
+        const int row_half = half * (OVERVIEW_CUE_POINT_TRI_H - 1 - y) /
+                             (OVERVIEW_CUE_POINT_TRI_H - 1);
+        for (int dx = -row_half; dx <= row_half; dx++) {
+            const int logical_x = cue_logical + dx;
+            if (logical_x < cache->view_origin_px || logical_x >= view_end) {
+                continue;
+            }
+            int px = (cache->ring_head_px + logical_x) % cache->strip_width_px;
+            if (px < 0) px += cache->strip_width_px;
+            const int offset = y * cache->stride_px + px;
+            ctx->offset[ctx->count] = offset;
+            ctx->saved[ctx->count] = cache->pixels[offset];
+            cache->pixels[offset] = color;
+            ctx->count++;
+        }
+    }
+}
+
+static void cue_point_burn_restore(ui_overview_wave_cache_t *cache,
+                                   const cue_point_burn_ctx_t *ctx)
+{
+    if (!cache || !cache->pixels || !ctx) return;
+    for (int i = ctx->count - 1; i >= 0; i--) {
+        cache->pixels[ctx->offset[i]] = ctx->saved[i];
+    }
+}
+
 /* ---------- overlay blit ---------- */
 
 static bool ui_overview_blit_wave_overlay_rgb565(ui_overview_deck_panel_t *panel,
@@ -1608,6 +1696,9 @@ static bool ui_overview_blit_wave_overlay_rgb565(ui_overview_deck_panel_t *panel
     playhead_burn_ctx_t burn_ctx;
     playhead_burn_save_and_fill(&s_overview_wave_cache[idx], &burn_ctx,
                                 playhead_color);
+
+    cue_point_burn_ctx_t cue_point_ctx;
+    cue_point_burn_save_and_fill(&s_overview_wave_cache[idx], &cue_point_ctx, idx);
 
     ui_lvgl_backend_blit_perf_t total_perf = {0};
     for (uint8_t seg_i = 0; seg_i < cache_report->blit_count; seg_i++) {
@@ -1642,6 +1733,7 @@ static bool ui_overview_blit_wave_overlay_rgb565(ui_overview_deck_panel_t *panel
                      (unsigned)seg_i,
                      seg_logical.x, seg_logical.y, seg_logical.w, seg_logical.h,
                      (unsigned)seg->src_x_px);
+            cue_point_burn_restore(&s_overview_wave_cache[idx], &cue_point_ctx);
             playhead_burn_restore(&s_overview_wave_cache[idx], &burn_ctx);
             armed_loop_burn_restore(&s_overview_wave_cache[idx], &armed_burn_ctx);
             return false;
@@ -1649,6 +1741,7 @@ static bool ui_overview_blit_wave_overlay_rgb565(ui_overview_deck_panel_t *panel
     }
 
     /* Restore the strip so the cache stays clean for future scrolling. */
+    cue_point_burn_restore(&s_overview_wave_cache[idx], &cue_point_ctx);
     playhead_burn_restore(&s_overview_wave_cache[idx], &burn_ctx);
     armed_loop_burn_restore(&s_overview_wave_cache[idx], &armed_burn_ctx);
 
@@ -2341,6 +2434,44 @@ static void ui_overview_format_remaining_time(char *out,
     }
 }
 
+/* Track the deck cue point: reposition the mini triangle and, when it moved,
+ * reblit the main strip — a paused deck otherwise skips the blit and would keep
+ * showing the old triangle. */
+static void ui_update_overview_cue_point(uint8_t deck,
+                                         uint32_t cue_point_ms,
+                                         uint32_t duration_ms)
+{
+    uint8_t idx = ui_overview_deck_index(deck);
+    const bool visible = duration_ms > 0u && cue_point_ms <= duration_ms;
+    if (s_overview_cue_point_seen[idx] &&
+        s_overview_cue_point_visible[idx] == visible &&
+        (!visible || s_overview_cue_point_ms[idx] == cue_point_ms)) {
+        return;
+    }
+    s_overview_cue_point_seen[idx] = true;
+    s_overview_cue_point_visible[idx] = visible;
+    s_overview_cue_point_ms[idx] = visible ? cue_point_ms : 0u;
+
+    lv_obj_t *cp = s_overview_mini_cue_point[idx];
+    if (cp) {
+        if (visible) {
+            int mini_x = (int)(((int64_t)cue_point_ms * OVERVIEW_MINI_CV_W) /
+                               (int64_t)duration_ms);
+            if (mini_x > OVERVIEW_MINI_CV_W - 1) mini_x = OVERVIEW_MINI_CV_W - 1;
+            lv_obj_set_pos(cp, mini_x - OVERVIEW_MINI_CUE_POINT_W / 2, 0);
+            lv_obj_remove_flag(cp, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(cp, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+#ifndef WIN32
+    if (s_overview_wave_load_reblit_remaining[idx] == 0u) {
+        s_overview_wave_load_reblit_remaining[idx] = 1u;
+    }
+#endif
+}
+
 static void ui_update_overview_deck(uint8_t deck, const deck_state_t *state,
                                     uint16_t effective_speed_permille,
                                     bool scratch_position_authoritative)
@@ -2423,6 +2554,7 @@ static void ui_update_overview_deck(uint8_t deck, const deck_state_t *state,
     ui_obj_set_text_color_if_changed(panel->master_tempo_label,
                                       state->master_tempo ? COL_ON_ACCENT : COL_TEXT_MUTED);
 
+    ui_update_overview_cue_point(deck, state->cue_point_ms, duration_ms);
     ui_update_overview_waveform_progress(deck, panel, elapsed_ms, duration_ms,
                                          state->playing);
     ui_update_overview_beat_strip(deck, elapsed_ms);

@@ -1561,3 +1561,85 @@ visiblement de la position réelle.
   - `t_v239u` (avec `PSRAM` dans le log), `t_v239c`, `t_v235` et `t_v236`
     repassent ;
   - pas de build firmware ni de test matériel.
+
+## v241 — memory cue Rekordbox et CUE façon CDJ (2026-09-25)
+
+- ANLZ (`rekordbox_anlz.c`) :
+  - nouveau `parse_memory_cue()`, qui parcourt toutes les sections et lit
+    les PCOB de type 0 au vrai format PCPT (spec Deep Symmetry) ;
+  - il retient le plus petit `time_ms` (point mémoire ou début de boucle),
+    publié dans `anlz_metadata_t.has_memory_cue/memory_cue_ms` ;
+  - une entrée PCPT hors bornes termine la liste sans rejeter le DAT.
+- `parse_pcob()`, qui alimente `cues[]` pour les hot cues, n'a pas été
+  modifié. Il suppose un ancien format (type/index aux octets 0/1) et ne
+  lit que le premier PCOB : sur un vrai fichier il ne trouve aucun hot cue.
+  Correction à faire à part.
+- `track_meta_cache` :
+  - le format passe en v3, avec `memory_cue_ms` et le flag `0x08` dans
+    l'en-tête ;
+  - les entrées v2 sont rejetées puis re-parsées au prochain chargement,
+    une fois par piste.
+- `deck_core` :
+  - chargement : `deck_core_publish_loaded_track()` envoie à l'acteur
+    l'évènement interne `DECK_CORE_INTERNAL_LOAD_CUE_ID` (0xFD), qui porte
+    les 16 bits bas de la génération du store ;
+  - l'acteur fixe `cue_point_ms` au memory cue. Il vaut 0 sans ANLZ, sans
+    memory cue ou si le cue dépasse la durée ;
+  - si le deck est en pause, il s'y positionne (auto-cue CDJ), sinon le
+    premier CUE écraserait le memory cue ;
+  - une génération périmée est ignorée ;
+  - sur la file de l'acteur, envoi limité à 100 ms depuis la tâche LVGL.
+- `BTN_CUE` :
+  - en lecture : pause et retour au cue, comme avant ;
+  - en pause hors cue : la position audio réelle devient le cue, calée sur
+    le beat ANLZ le plus proche (`nearest_beat_ms`) s'il y a une grille. Le
+    deck est positionné sur ce cue et reste en pause ;
+  - en pause sur le cue : lecture tant que CUE est tenu. Au relâchement
+    (`on_button` traite maintenant `!pressed` pour CUE), pause et retour au
+    cue ;
+  - PLAY pendant cette pré-écoute verrouille la lecture (CDJ) ;
+  - EJECT et SHIFT+CUE remettent le cue à 0 et annulent la pré-écoute.
+  - Les pads hot cue ne changent pas.
+  - La LED CUE s'allume quand `position == cue_point_ms` (logique
+    existante). Après un seek, la position moteur vaut exactement la cible
+    (`output_base_ms`).
+- Vérification :
+  - hôte, dans le scratchpad : parseur mémoire, 6 cas ;
+  - suite `tests/anlz` compilée contre les sources jc1060 : 39/39 ;
+  - aller-retour du cache v3 ;
+  - `deck_core_dual` adapté à jc1060 avec 7 tests v241, tous OK. Les 16
+    échecs restants sont identiques sur HEAD (divergence p4/jc1060
+    préexistante) ;
+  - pas de build firmware ni de test matériel.
+
+## v242 — marqueur du cue point sur l'Overview (2026-09-25)
+
+- Validation matérielle de v241 : le memory cue se charge, le set-cue façon
+  CDJ et la pré-écoute fonctionnent.
+- Nouveau : un petit triangle jaune plein (`0xFFFF00`), pointe vers le bas,
+  marque `deck_state_t.cue_point_ms` pour chacun des deux decks. Seul
+  `ui_overview.c` change ; `deck_core` et `audio_engine` ne bougent pas.
+  - Waveform principale : triangle de 9 px de large sur 5 lignes, collé au
+    bord haut. Il est incrusté au moment du blit PPA
+    (`cue_point_burn_save_and_fill`/`_restore`), selon le même schéma
+    sauvegarde → remplissage → restauration que la tête de lecture et la
+    boucle armée. Il est dessiné après la tête de lecture, donc reste
+    visible quand le deck est arrêté sur le cue, et il est restauré en
+    premier, y compris sur le chemin d'échec PPA. Il est rogné à la fenêtre
+    visible. Aucune allocation : le contexte (45 pixels au plus) est sur la
+    pile.
+  - Mini waveform : objet LVGL de 7×5, dessiné par `cue_head_draw_cb`
+    (couleur jaune). Il est placé au-dessus des lignes hot cue et sous la
+    tête de lecture, à `cue * OVERVIEW_MINI_CV_W / durée`, et caché sans
+    piste ou si le cue dépasse la durée.
+  - Mise à jour : `ui_update_overview_cue_point()` n'agit que si la valeur
+    ou la visibilité change. Il positionne le mini triangle et force un
+    reblit de la bande principale (`s_overview_wave_load_reblit_remaining`,
+    au moins 1), sinon un deck en pause garderait l'ancien triangle.
+- Vérification :
+  - `gcc -fsyntax-only -Wall -Wextra` de `ui_overview.c` sur l'hôte, avec
+    les vrais headers LVGL et des stubs ESP-IDF minimaux : 0 erreur, mêmes
+    avertissements que HEAD ;
+  - test hôte des helpers d'incrustation (géométrie, rognage, wrap du ring
+    buffer, restauration à l'identique, indépendance des decks) : OK ;
+  - pas de build firmware ni de test matériel.

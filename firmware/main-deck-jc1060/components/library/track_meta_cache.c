@@ -16,10 +16,12 @@ static const char *TAG = "track_meta_cache";
 static const char *CACHE_ROOT = "/sd/trackcache";
 
 #define TRACK_META_CACHE_MAGIC   0x31434D54u /* "TMC1" */
-#define TRACK_META_CACHE_VERSION 2u
+/* v3 (fw 241): memory cue added; v2 entries lack it and are re-parsed. */
+#define TRACK_META_CACHE_VERSION 3u
 #define TRACK_META_CACHE_FLAGS_LOW  0x01u
 #define TRACK_META_CACHE_FLAGS_VBR  0x02u
 #define TRACK_META_CACHE_FLAGS_HIGH 0x04u
+#define TRACK_META_CACHE_FLAGS_MEMORY_CUE 0x08u
 
 #pragma pack(push, 1)
 typedef struct {
@@ -37,6 +39,7 @@ typedef struct {
     uint8_t flags;
     uint16_t reserved;
     uint32_t waveform_high_len;
+    uint32_t memory_cue_ms;
 } track_meta_cache_header_t;
 #pragma pack(pop)
 
@@ -220,6 +223,8 @@ static esp_err_t track_meta_cache_load_gated(uint32_t track_key,
     out_meta->cue_count = header.cue_count;
     out_meta->has_waveform_low = (header.flags & TRACK_META_CACHE_FLAGS_LOW) != 0;
     out_meta->has_vbr = (header.flags & TRACK_META_CACHE_FLAGS_VBR) != 0;
+    out_meta->has_memory_cue = (header.flags & TRACK_META_CACHE_FLAGS_MEMORY_CUE) != 0;
+    out_meta->memory_cue_ms = out_meta->has_memory_cue ? header.memory_cue_ms : 0u;
 
     ok = read_exact(fp, out_meta->waveform_low, sizeof(out_meta->waveform_low)) &&
          read_exact(fp, out_meta->vbr, sizeof(out_meta->vbr)) &&
@@ -331,8 +336,10 @@ static esp_err_t track_meta_cache_save_gated(uint32_t track_key,
         .cue_count = meta->cue_count,
         .flags = (meta->has_waveform_low ? TRACK_META_CACHE_FLAGS_LOW : 0u) |
                  (meta->has_vbr ? TRACK_META_CACHE_FLAGS_VBR : 0u) |
+                 (meta->has_memory_cue ? TRACK_META_CACHE_FLAGS_MEMORY_CUE : 0u) |
                  (meta->waveform_high && meta->waveform_high_len > 0 ? TRACK_META_CACHE_FLAGS_HIGH : 0u),
         .waveform_high_len = meta->waveform_high && meta->waveform_high_len > 0 ? meta->waveform_high_len : 0,
+        .memory_cue_ms = meta->has_memory_cue ? meta->memory_cue_ms : 0u,
     };
 
     library_load_trace_mark(LIBRARY_LOAD_PHASE_CACHE_SAVE_HEADER, track_key);

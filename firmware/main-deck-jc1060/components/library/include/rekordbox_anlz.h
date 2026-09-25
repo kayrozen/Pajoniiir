@@ -114,6 +114,11 @@ typedef struct anlz_metadata {
     anlz_cue_t cues[ANLZ_MAX_CUES];
     uint8_t    cue_count;
 
+    /* Memory cue (earliest entry of the type-0 PCOB, real PCPT layout).
+     * memory_cue_ms is 0 when has_memory_cue is false. */
+    uint32_t memory_cue_ms;
+    bool     has_memory_cue;
+
     /* VBR seek table (from PVBR) — 400 file-byte offsets */
     uint32_t vbr[ANLZ_VBR_TABLE_LEN];
     bool     has_vbr;
