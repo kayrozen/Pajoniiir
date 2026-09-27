@@ -23,6 +23,10 @@
 #include "audio_decoder.h"
 #include "audio_eof_policy.h"
 #include "audio_start_gate.h"
+#include "audio_cue_preroll.h"
+#include "audio_seek_skip.h"
+#include "audio_track_length.h"
+#include "audio_loop_resize.h"
 #include "audio_output_bookkeeping.h"
 #include "audio_format.h"
 #include "audio_diag.h"
@@ -235,6 +239,9 @@ typedef enum {
 typedef enum {
     AE_SEEK_REASON_USER = 0,
     AE_SEEK_REASON_LOOP,
+    /* v274: keeps the ring like LOOP, but skips to the exact target: the
+     * track goes on at the end of a grown or exited loop. */
+    AE_SEEK_REASON_LOOP_CONTINUE,
     AE_SEEK_REASON_SCRATCH_RELEASE,
     AE_SEEK_REASON_SCRATCH_ABORT,
 } ae_seek_reason_t;
@@ -314,7 +321,20 @@ typedef struct {
     /* PVBR seek table — 400 file-byte offsets (from ANLZ0000.DAT) */
     uint32_t pvbr[AUDIO_PVBR_LEN];
     bool     has_pvbr;
+    /* v273: where the entries are (audio_track_length.h); all zero, i.e. the
+     * v272 reading, until ae_resolve_track_length. Decode task only. */
+    audio_pvbr_geometry_t pvbr_geom;
+    /* Analysis span: the time base of the PVBR table and the waveforms. */
     uint32_t duration_ms;
+    /* v271: decoded file length, >= duration_ms when the file runs past the
+     * analysis (audio_track_length.h); 0 until resolved. Written by the
+     * decode task, read by the UI and deck tasks (atomic). */
+    uint32_t track_ms;
+    /* First decoded frame bitrate, for the constant-bitrate estimate. */
+    uint32_t first_kbps;
+    /* v272: the decoder ran past track_ms and extended it; EOF then sets the
+     * exact end. Decode task only. */
+    bool track_extended;
 
     /* Detected from first decoded frame */
     uint32_t sample_rate;
@@ -323,6 +343,16 @@ typedef struct {
     /* Decode cursor: frames decoded since the last seek. */
     uint32_t seek_base_ms;
     uint64_t frames_since_seek;
+    /* v263: decoded frames to drop before seek_base_ms. A PVBR seek lands on
+     * the table entry at or before the target (duration/400 apart, ~0.4 s on
+     * a 3 min track); without this the audio started up to that much before
+     * the position the deck and the waveform reported. Decode task only. */
+    uint32_t seek_skip_frames;
+    /* v273: a PVBR seek restarted the decoder mid-file and it has not output
+     * a frame yet. The frames it decodes to nothing (the bit reservoir, one
+     * to three) are track time: they come out of seek_skip_frames, or the
+     * clock would trail the audio by 24 ms each. Decode task only. */
+    bool seek_resync;
 
     /* Playback cursor: source frames consumed by the output resampler since the
      * last seek. This is what the UI/deck should expose as audible position. */
@@ -330,9 +360,9 @@ typedef struct {
     uint64_t output_frames_since_seek;
 
     /* Paused/CUE seek pre-roll: decode starts before the requested position,
-     * then moves canonical play_seq to this frame once history is published. */
-    uint32_t timeline_preroll_frames;
-    bool     timeline_preroll_pending;
+     * then moves canonical play_seq to the cue frame as soon as it is written.
+     * `pending` is read by the output and control tasks (atomic). */
+    audio_cue_preroll_t timeline_preroll;
 
     /* Pitch: 1.0 = ±0%, > 1.0 = faster, < 1.0 = slower  (range 0.9 – 1.1) */
     uint32_t pitch_factor_bits;
@@ -362,6 +392,14 @@ typedef struct {
     volatile uint32_t loop_start_ms;
     volatile uint32_t loop_end_ms;
     volatile bool     loop_active;
+    /* v274: the loop changed while active; the decode task cuts the ring at
+     * the point where the loop it was decoded against (resize_from_*) and
+     * the new one part (audio_loop_resize.h). Under AE_LOCK. */
+    bool     loop_resize_pending;
+    uint32_t loop_resize_from_start_ms;
+    uint32_t loop_resize_from_end_ms;
+    /* The last decoder seek was a loop wrap (decode task). */
+    bool     seek_was_loop_wrap;
 } audio_engine_state_t;
 
 static audio_engine_state_t  s_engines[AUDIO_ENGINE_DECK_COUNT];
@@ -625,13 +663,19 @@ static void complete_eof_drain_if_ready(uint8_t deck);
 #endif
 
 #if AE_FW
-static uint32_t deck_pcm_free(uint8_t deck, uint32_t sample_rate)
+/* Canonical mode: most decoded frames allowed ahead of the playhead. */
+static uint32_t deck_pcm_forward_cap(uint8_t deck, uint32_t sample_rate)
 {
-    if (!timeline_active(deck)) return audio_pcm_ring_free(&s_pcm_rings[deck]);
     uint32_t target = sample_rate > 0u
         ? (uint32_t)(((uint64_t)sample_rate * AE_TIMELINE_FORWARD_MS) / 1000u)
         : AUDIO_PCM_RING_FRAMES;
-    if (target > s_pcm_timelines[deck].capacity) target = s_pcm_timelines[deck].capacity;
+    return target > s_pcm_timelines[deck].capacity ? s_pcm_timelines[deck].capacity : target;
+}
+
+static uint32_t deck_pcm_free(uint8_t deck, uint32_t sample_rate)
+{
+    if (!timeline_active(deck)) return audio_pcm_ring_free(&s_pcm_rings[deck]);
+    uint32_t target = deck_pcm_forward_cap(deck, sample_rate);
     uint32_t future = audio_pcm_timeline_future_frames(&s_pcm_timelines[deck]);
     return future < target ? target - future : 0u;
 }
@@ -659,6 +703,45 @@ static uint32_t deck_pcm_drop_newest(uint8_t deck, uint32_t frames)
     return timeline_active(deck)
         ? audio_pcm_timeline_drop_newest(&s_pcm_timelines[deck], frames)
         : audio_pcm_ring_drop_newest(&s_pcm_rings[deck], frames);
+}
+
+/* Decode task only. Output is gated while pending, so moving play_seq here
+ * cannot race a consumer; key-lock re-seeds from it on the first render.
+ * force: the producer cannot write further (source EOF, or no room under the
+ * forward cap) - publish what is there rather than keep the output gated. */
+static void ae_cue_preroll_publish(uint8_t deck, audio_engine_state_t *eng, bool force)
+{
+    audio_pcm_timeline_t *t = &s_pcm_timelines[deck];
+    uint64_t playhead = 0u;
+    if (!timeline_active(deck)) {
+        /* No timeline, nothing to move: never leave the output gated. */
+        __atomic_store_n(&eng->timeline_preroll.pending, false, __ATOMIC_RELEASE);
+        return;
+    }
+    if (!audio_cue_preroll_publish_point(&eng->timeline_preroll,
+                                         audio_pcm_timeline_write_seq(t),
+                                         force, &playhead)) {
+        return;
+    }
+    if (!audio_pcm_timeline_set_playhead(t, playhead)) {
+        /* Unreachable with a fresh timeline; if it happens anyway, sound from
+         * the pre-roll start beats a deck that never plays. */
+        __atomic_store_n(&eng->timeline_preroll.pending, false, __ATOMIC_RELEASE);
+        ESP_LOGW(TAG, "cue pre-roll D%u: playhead %u rejected, released ungated",
+                 (unsigned)deck, (unsigned)playhead);
+        return;
+    }
+    if (playhead < eng->timeline_preroll.frames && eng->sample_rate > 0u) {
+        /* Forced short of the cue: expose the position that is really heard. */
+        uint32_t short_ms = (uint32_t)(((uint64_t)(eng->timeline_preroll.frames - playhead) *
+                                        1000u) / eng->sample_rate);
+        eng->output_base_ms = eng->output_base_ms > short_ms
+            ? eng->output_base_ms - short_ms : 0u;
+    }
+    __atomic_store_n(&eng->timeline_preroll.pending, false, __ATOMIC_RELEASE);
+    ESP_LOGI(TAG, "cue pre-roll D%u ready: history=%u frames target=%u ms%s",
+             (unsigned)deck, (unsigned)playhead, (unsigned)eng->output_base_ms,
+             playhead < eng->timeline_preroll.frames ? " (forced short)" : "");
 }
 #endif
 
@@ -1533,6 +1616,8 @@ static bool deck_output_active(uint8_t deck)
     if (!playing) return false;
     if (atomic_load_bool(&s_start_waiting[deck])) {
         if (atomic_load_bool(&s_start_seek_pending[deck])) return false;
+        /* Until the playhead sits on the cue, future frames are pre-roll. */
+        if (atomic_load_bool(&eng->timeline_preroll.pending)) return false;
         uint32_t future = deck_pcm_used(deck);
         uint32_t minimum = atomic_load_u32(&s_start_prebuffer_frames[deck]);
         if (!audio_start_gate_ready(future, minimum,
@@ -2189,6 +2274,21 @@ static int ae_flac_decode_one_frame(audio_engine_state_t *eng,
  * Internal helpers
  * ═════════════════════════════════════════════════════════════════════════ */
 
+#if AE_FW
+/* v273: a frame the restarted decoder output nothing for. Caller holds
+ * AE_LOCK. */
+static void ae_seek_resync_frame(audio_engine_state_t *eng, const mp3dec_frame_info_t *info)
+{
+    const uint32_t frame_samples = info->layer == 1 ? 384u
+        : (info->layer == 3 && info->hz < 32000) ? 576u : 1152u;
+    const uint32_t left = frame_samples -
+        audio_seek_skip_take(&eng->seek_skip_frames, frame_samples);
+    /* Past the skip (more frames than the landing lead): the clock moves on,
+     * the audio starts that much after the target. */
+    eng->frames_since_seek += left;
+}
+#endif
+
 /*
  * decode_one_frame — read + decode one MP3 frame from a deck engine.
  *
@@ -2199,6 +2299,7 @@ static int ae_flac_decode_one_frame(audio_engine_state_t *eng,
  * File position advances by exactly one frame (frame_bytes).
  * Caller must hold s_file_mutex if called from multiple threads.
  */
+
 static int decode_one_frame(
     audio_engine_state_t *eng,
 #if AE_FW
@@ -2256,7 +2357,8 @@ static int decode_one_frame(
     }
     ae_clear_read_faults(deck);
 
-    mp3dec_frame_info_t info;
+    /* hz stays 0 when minimp3 only skipped junk */
+    mp3dec_frame_info_t info = {0};
     int samples = mp3dec_decode_frame(&eng->dec, input, (int)got,
                                       s_scratch_pcm, &info);
     if (info.frame_bytes > 0) {
@@ -2265,11 +2367,16 @@ static int decode_one_frame(
         eng->file_pos += 1u;
         return 0;
     }
-    if (samples == 0) return 0;
+    if (samples == 0) {
+        if (eng->seek_resync && info.hz > 0) ae_seek_resync_frame(eng, &info);
+        return 0;
+    }
+    eng->seek_resync = false;
 
     if (eng->sample_rate == 0u && info.hz > 0) {
         eng->sample_rate = (uint32_t)info.hz;
         eng->channels = info.channels;
+        eng->first_kbps = (uint32_t)info.bitrate_kbps;
         ESP_LOGI(TAG, "MP3 cache D%u: %d Hz, %d ch, %d kbps",
                  (unsigned)deck + 1u, info.hz, info.channels,
                  info.bitrate_kbps);
@@ -2318,23 +2425,28 @@ static int decode_one_frame(
  * seek_pvbr — fast O(1) seek using the 400-entry PVBR table.
  * Caller holds s_file_mutex.
  */
-static void seek_pvbr(audio_engine_state_t *eng, uint32_t position_ms)
+static uint32_t ae_track_length_ms(const audio_engine_state_t *eng)
 {
-    if (eng->duration_ms > 0u && position_ms > eng->duration_ms) {
-        position_ms = eng->duration_ms;
-    }
-    uint32_t idx = (eng->duration_ms > 0u)
-                   ? (uint32_t)(((uint64_t)position_ms *
-                                 (uint64_t)AUDIO_PVBR_LEN) /
-                                (uint64_t)eng->duration_ms)
-                   : 0u;
-    if (idx >= AUDIO_PVBR_LEN) idx = AUDIO_PVBR_LEN - 1u;
-    uint32_t target_byte = eng->pvbr[idx];
+    uint32_t track_ms = atomic_load_u32(&eng->track_ms);
+    return track_ms > eng->duration_ms ? track_ms : eng->duration_ms;
+}
 
-    if (target_byte > eng->file_size) target_byte = (uint32_t)eng->file_size;
+static uint32_t seek_pvbr(audio_engine_state_t *eng, uint32_t position_ms)
+{
+    /* Decoding restarts at the entry, see audio_seek_skip.h; past the
+     * analysis span it restarts from the tail byte rate (v271). v273: the
+     * entry is read after the ID3v2 tag, at its exact frame time
+     * (audio_pvbr_geometry_t). Upstream main-deck-p4 reads it as a file
+     * offset at k * span / 400: California Dreaming (133 kB tag) played its
+     * 10.5 s cue from 3.7 s. */
+    uint32_t target_byte = 0u;
+    uint32_t entry_ms = audio_pvbr_locate(eng->pvbr, AUDIO_PVBR_LEN, eng->duration_ms,
+                                          ae_track_length_ms(eng), eng->file_size,
+                                          &eng->pvbr_geom, position_ms, &target_byte);
     eng->file_pos = target_byte;
-    ESP_LOGI(TAG, "PVBR seek %u ms → table[%u] = byte %u",
-             (unsigned)position_ms, (unsigned)idx, (unsigned)target_byte);
+    ESP_LOGI(TAG, "PVBR seek %u ms → byte %u (entry %u ms)",
+             (unsigned)position_ms, (unsigned)target_byte, (unsigned)entry_ms);
+    return entry_ms;
 }
 
 /*
@@ -2347,10 +2459,178 @@ static void seek_pvbr(audio_engine_state_t *eng, uint32_t position_ms)
  * A cache miss after the cursor move reloads the aligned page on demand.
  * Caller holds s_file_mutex.
  */
+static void seek_estimate(audio_engine_state_t *eng, uint32_t position_ms);
+
+static size_t ae_track_scan_read(void *ctx, size_t offset, void *dst, size_t bytes)
+{
+    return audio_fw_preload_read_at((audio_fw_preload_t *)ctx, offset, dst, bytes);
+}
+
+/*
+ * v271: the file may run past the Rekordbox analysis (audio_track_length.h).
+ * v273: the Xing count is the length (v272 rejected it on a tail scan read
+ * one ID3 tag early); the scan from the last PVBR entry, the table estimate or
+ * the first frames' bitrate only stand in without it. Also sets the PVBR
+ * geometry the seeks use. Decode task, once per load; it alone touches the
+ * page cache, so the reads need no lock.
+ */
+static void ae_resolve_track_length(audio_engine_state_t *eng, audio_fw_preload_t *fw,
+                                    uint8_t deck)
+{
+    if (eng->format != AUDIO_FORMAT_MP3 && eng->format != AUDIO_FORMAT_UNKNOWN) return;
+    uint8_t head[1024];
+    size_t got = audio_fw_preload_read_at(fw, 0u, head, eng->file_size < 10u ? eng->file_size : 10u);
+    size_t audio_start = audio_id3v2_size(head, got);
+    if (audio_start >= eng->file_size) audio_start = 0u;
+    size_t want = eng->file_size - audio_start;
+    got = audio_fw_preload_read_at(fw, audio_start, head, want < sizeof head ? want : sizeof head);
+
+    audio_mp3_first_frame_t ff = {0};
+    (void)audio_mp3_first_frame(head, got, &ff);
+    audio_track_length_inputs_t in = {
+        .span_ms = eng->duration_ms,
+        .xing_ms = audio_mp3_header_duration_ms(head, got),
+    };
+    audio_pvbr_geometry_t geom = {
+        .base = audio_start,
+        /* frame 0 is the Xing/Info frame itself */
+        .frames = ff.count ? ff.count + 1u
+                           : audio_pvbr_frames_from_span(eng->duration_ms, ff.hz, ff.frame_samples),
+        .frame_samples = ff.frame_samples,
+        .hz = ff.hz,
+    };
+    audio_mp3_scan_t scan = {0};
+    const char *scan_note = "no scan";
+    if (eng->has_pvbr) {
+        geom.base = audio_pvbr_base(ae_track_scan_read, fw, eng->pvbr, AUDIO_PVBR_LEN,
+                                    audio_start, eng->file_size);
+        in.pvbr_ms = audio_pvbr_extrapolate_end_ms(eng->pvbr, AUDIO_PVBR_LEN,
+                                                   eng->duration_ms, geom.base, eng->file_size);
+        const size_t tail = geom.base + eng->pvbr[AUDIO_PVBR_LEN - 1u];
+        if (tail >= eng->file_size) {
+            scan_note = "table ends at file";
+        } else if (eng->file_size - tail > AUDIO_TAIL_SCAN_MAX_BYTES) {
+            scan_note = "tail scan capped";
+        } else if (audio_mp3_scan(ae_track_scan_read, fw, tail, eng->file_size, 0u, &scan)) {
+            in.scan_ms = audio_pvbr_entry_time_ms(&geom, AUDIO_PVBR_LEN - 1u, AUDIO_PVBR_LEN,
+                                                  eng->duration_ms) + scan.ms;
+            scan_note = "tail scan";
+        } else {
+            scan_note = "tail scan failed";
+        }
+    } else if (audio_mp3_scan(ae_track_scan_read, fw, audio_start, eng->file_size, 1u, &scan) &&
+               /* The Xing/Info frame is silent and says nothing of the rate:
+                * average from the frame after it. */
+               audio_mp3_scan(ae_track_scan_read, fw, in.xing_ms ? scan.first + 1u : scan.first,
+                              eng->file_size, AUDIO_BITRATE_SCAN_FRAMES, &scan) &&
+               scan.frames > 1u && scan.last_end > scan.first) {
+        in.bitrate_ms = (uint32_t)(((uint64_t)(eng->file_size - scan.first) * scan.ms) /
+                                   (scan.last_end - scan.first));
+        in.bitrate_cbr = scan.cbr;
+        scan_note = scan.cbr ? "cbr frames" : "vbr frames";
+    }
+    if (in.bitrate_ms == 0u && !eng->has_pvbr) {
+        in.bitrate_ms = audio_bitrate_duration_ms(eng->file_size - audio_start, eng->first_kbps);
+    }
+    eng->pvbr_geom = geom;
+    const audio_track_length_decision_t d = audio_track_length_decide(&in);
+    atomic_store_u32(&eng->track_ms, d.track_ms);
+    ESP_LOGW(TAG, "D%u length: xing %u ms %s, %s %u ms (%u frames), pvbr %u ms, bitrate %u ms, "
+             "analysis %u ms -> file %u ms (%s) track %u ms",
+             (unsigned)deck, (unsigned)in.xing_ms, audio_xing_verdict_name(d.xing),
+             scan_note, (unsigned)in.scan_ms, (unsigned)scan.frames, (unsigned)in.pvbr_ms,
+             (unsigned)in.bitrate_ms, (unsigned)eng->duration_ms, (unsigned)d.file_ms,
+             audio_track_length_source_name(d.source), (unsigned)d.track_ms);
+    if (eng->has_pvbr) {
+        ESP_LOGW(TAG, "D%u PVBR: entries from byte %u (id3 %u), %u frames of %u @ %u Hz",
+                 (unsigned)deck, (unsigned)geom.base, (unsigned)audio_start,
+                 (unsigned)geom.frames, (unsigned)geom.frame_samples, (unsigned)geom.hz);
+    }
+}
+
+/* v272: the decoder is past the track length without EOF, so the length is
+ * an underestimate; grow it ahead of the decoder. Decode task, outside
+ * AE_LOCK. */
+static void ae_note_decoded_past(audio_engine_state_t *eng, uint8_t deck, uint32_t decoded_ms)
+{
+    const uint32_t track_ms = ae_track_length_ms(eng);
+    if (track_ms == 0u || decoded_ms <= track_ms) return;   /* 0: length unknown */
+    const uint32_t extended = audio_track_length_extend(track_ms, decoded_ms);
+    atomic_store_u32(&eng->track_ms, extended);
+    eng->track_extended = true;
+    ESP_LOGW(TAG, "D%u length: decoded %u ms past track (%s) -> track %u ms (was %u ms)",
+             (unsigned)deck, (unsigned)decoded_ms,
+             audio_track_length_source_name(AUDIO_TRACK_LENGTH_DECODE),
+             (unsigned)extended, (unsigned)track_ms);
+}
+
+/* v271: the decoded end is the file length; raise the track length when the
+ * estimate fell short, or pin it after a runtime extension. Decode task, at
+ * decoder EOF. */
+static void ae_note_decoded_end(audio_engine_state_t *eng, uint8_t deck)
+{
+    if (eng->sample_rate == 0u) return;
+    const uint32_t end_ms = eng->seek_base_ms +
+        (uint32_t)((eng->frames_since_seek * 1000ull) / eng->sample_rate);
+    const uint32_t track_ms = ae_track_length_ms(eng);
+    const uint32_t exact = audio_track_length_at_eof(eng->duration_ms, track_ms, end_ms,
+                                                     eng->track_extended);
+    eng->track_extended = false;
+    if (exact == track_ms) return;
+    atomic_store_u32(&eng->track_ms, exact);
+    ESP_LOGW(TAG, "D%u length: decoded end %u ms (%s) -> track %u ms (was %u ms)",
+             (unsigned)deck, (unsigned)end_ms,
+             audio_track_length_source_name(AUDIO_TRACK_LENGTH_EOF),
+             (unsigned)exact, (unsigned)track_ms);
+}
+
+/* v274: cuts the ring where the loop it was decoded against and the current
+ * one part, and arms the decoder reseek there. Decode task, AE_LOCK held;
+ * true when a reseek is armed. */
+static bool ae_apply_loop_resize(audio_engine_state_t *eng, uint8_t deck)
+{
+    if (eng->seek_requested) return false;      /* pending seek first */
+    eng->loop_resize_pending = false;
+    audio_loop_resize_in_t in = {
+        .old_start_ms = eng->loop_resize_from_start_ms,
+        .old_end_ms = eng->loop_resize_from_end_ms,
+        .new_start_ms = eng->loop_active ? eng->loop_start_ms : eng->loop_resize_from_start_ms,
+        .new_end_ms = eng->loop_active ? eng->loop_end_ms : UINT32_MAX,
+        .seek_base_ms = eng->seek_base_ms,
+        .frames_since_seek = eng->frames_since_seek,
+        .since_wrap = eng->seek_was_loop_wrap,
+        .sample_rate = eng->sample_rate,
+    };
+    /* The output pops without AE_LOCK. The cut is counted from the write
+     * end, which only this task moves, so a pop between the fill read and
+     * the drop leaves it in place; the section just keeps the window short,
+     * as for the loop trim. */
+    taskENTER_CRITICAL(&s_ring_flush_mux);
+    in.ring_frames = deck_pcm_used(deck);
+    const audio_loop_resize_plan_t plan = audio_loop_resize_plan(&in);
+    const uint32_t dropped = plan.cut ? deck_pcm_drop_newest(deck, plan.drop_frames) : 0u;
+    taskEXIT_CRITICAL(&s_ring_flush_mux);
+    if (!plan.cut) return false;
+    eng->seek_target_ms = plan.seek_ms;
+    eng->seek_reason = plan.exact ? AE_SEEK_REASON_LOOP_CONTINUE : AE_SEEK_REASON_LOOP;
+    eng->seek_requested = true;
+    atomic_store_bool(&eng->eof, false);
+    ESP_LOGI(TAG, "D%u loop resize %u-%u -> %u-%u ms: dropped %u/%u fr, decoder %s %u ms",
+             (unsigned)deck, (unsigned)in.old_start_ms, (unsigned)in.old_end_ms,
+             (unsigned)in.new_start_ms, (unsigned)in.new_end_ms, (unsigned)dropped,
+             (unsigned)plan.drop_frames, plan.exact ? "continues at" : "wraps to",
+             (unsigned)plan.seek_ms);
+    return true;
+}
+
 static void seek_estimate(audio_engine_state_t *eng, uint32_t position_ms)
 {
-    uint32_t target_byte = (eng->duration_ms > 0 && eng->file_size > 0)
-        ? (uint32_t)(((uint64_t)position_ms * (uint64_t)eng->file_size) / eng->duration_ms)
+    /* v273: the audio starts after the ID3v2 tag (pvbr_geom.base; upstream
+     * spreads the tag over the track too). */
+    const uint32_t track_ms = ae_track_length_ms(eng);
+    const size_t start = eng->pvbr_geom.base < eng->file_size ? eng->pvbr_geom.base : 0u;
+    uint32_t target_byte = (track_ms > 0 && eng->file_size > 0)
+        ? (uint32_t)(start + ((uint64_t)position_ms * (uint64_t)(eng->file_size - start)) / track_ms)
         : 0u;
     if (target_byte > eng->file_size) target_byte = eng->file_size;
 
@@ -2444,10 +2724,52 @@ static uint64_t s_audio_wdt_last_idle_us;
 /* ESP-IDF invokes this weak hook from the Task WDT ISR before panic handling.
  * Two retained stores distinguish a real TWDT timeout from the P4's generic
  * MWDT reset reason, even if panic output or the coredump cannot complete. */
+/* v265: the task running on each core when the TWDT fired. The starved IDLE
+ * task names the core, the task running on it is the hog; the panic output
+ * that lists it is usually lost before the reset. Magic written last. */
+#define AE_TWDT_TASK_NAME_LEN 16u
+typedef struct {
+    uint32_t magic;
+    uint32_t magic_inv;
+    char name[portNUM_PROCESSORS][AE_TWDT_TASK_NAME_LEN];
+} ae_twdt_tasks_t;
+static __NOINIT_ATTR volatile ae_twdt_tasks_t s_twdt_tasks;
+
 void IRAM_ATTR esp_task_wdt_isr_user_handler(void)
 {
     s_audio_wdt_journal.twdt_isr_seen_inv = ~AUDIO_WDT_TRACE_MAGIC;
     s_audio_wdt_journal.twdt_isr_seen = AUDIO_WDT_TRACE_MAGIC;
+    s_twdt_tasks.magic = 0u;
+    for (int core = 0; core < portNUM_PROCESSORS; core++) {
+        TaskHandle_t task = xTaskGetCurrentTaskHandleForCore(core);
+        const char *name = task ? pcTaskGetName(task) : NULL;
+        uint32_t i = 0u;
+        for (; name && name[i] && i < AE_TWDT_TASK_NAME_LEN - 1u; i++) {
+            s_twdt_tasks.name[core][i] = name[i];
+        }
+        s_twdt_tasks.name[core][i] = '\0';
+    }
+    s_twdt_tasks.magic_inv = ~AUDIO_WDT_TRACE_MAGIC;
+    s_twdt_tasks.magic = AUDIO_WDT_TRACE_MAGIC;
+}
+
+/* Copies the names saved by the last TWDT ISR ("?" when none) and clears them. */
+static void ae_twdt_tasks_take(char out[portNUM_PROCESSORS][AE_TWDT_TASK_NAME_LEN])
+{
+    const bool valid = s_twdt_tasks.magic == AUDIO_WDT_TRACE_MAGIC &&
+                       s_twdt_tasks.magic_inv == ~AUDIO_WDT_TRACE_MAGIC;
+    for (int core = 0; core < portNUM_PROCESSORS; core++) {
+        for (uint32_t i = 0u; i < AE_TWDT_TASK_NAME_LEN; i++) {
+            out[core][i] = valid ? s_twdt_tasks.name[core][i] : '\0';
+        }
+        out[core][AE_TWDT_TASK_NAME_LEN - 1u] = '\0';
+        if (!out[core][0]) {
+            out[core][0] = '?';
+            out[core][1] = '\0';
+        }
+    }
+    s_twdt_tasks.magic = 0u;
+    s_twdt_tasks.magic_inv = 0u;
 }
 
 static inline void ae_wdt_trace(audio_wdt_phase_t phase, uint32_t mix_group)
@@ -2480,6 +2802,8 @@ static void ae_wdt_trace_boot_init(void)
         ? s_audio_wdt_previous.boot_id + 1u
         : 1u;
     audio_wdt_trace_clear_watchdog_flags(&s_audio_wdt_journal);
+    char running[portNUM_PROCESSORS][AE_TWDT_TASK_NAME_LEN];
+    ae_twdt_tasks_take(running);
     s_audio_wdt_block = 0u;
     s_audio_wdt_active_decks = 0u;
     s_audio_wdt_busy_blocks = 0u;
@@ -2512,13 +2836,14 @@ static void ae_wdt_trace_boot_init(void)
         if (wdt_reset) {
             ESP_LOGW(TAG, "previous boot WDT trace: phase=%s block=%u "
                      "mix_group=%u decks=0x%x twdt_isr=%u busy=%u up=%ums "
-                     "since_idle=%ums reset=%d",
+                     "since_idle=%ums reset=%d cpu0=%s cpu1=%s",
                      audio_wdt_trace_phase_name((audio_wdt_phase_t)prev->phase),
                      (unsigned)prev->block, (unsigned)prev->mix_group,
                      (unsigned)prev->active_deck_mask,
                      (unsigned)prev->twdt_isr_seen,
                      (unsigned)prev->busy_blocks, (unsigned)up_ms,
-                     (unsigned)gap_ms, (int)reset);
+                     (unsigned)gap_ms, (int)reset, running[0],
+                     portNUM_PROCESSORS > 1 ? running[portNUM_PROCESSORS - 1] : "-");
         }
     }
 }
@@ -2817,6 +3142,10 @@ park:
 
 /* Decoder reads compressed data through the bounded cache. Cache misses are
  * serialized by media_io_gate; decoded PCM runway keeps the output task isolated. */
+/* v265: longest the decode task may run without sleeping. 1 tick per 20 ms
+ * costs the decoder at most 5% and keeps IDLE0 far from the 5 s TWDT. */
+#define AE_DECODE_MAX_BUSY_US 20000
+
 static void ae_decode_task(void *arg)
 {
     audio_fw_task_context_t *ctx = (audio_fw_task_context_t *)arg;
@@ -2918,6 +3247,7 @@ static void ae_decode_task(void *arg)
              (unsigned)eng->file_size,
              (unsigned)fw->loaded_bytes,
              fw->load_done ? 1u : 0u);
+    ae_resolve_track_length(eng, fw, ctx->deck);
     ESP_LOGI(TAG, "producer ready @ %u Hz, shared output mixer eligible", (unsigned)eng->sample_rate);
     eng->load_progress = 100;
     eng->loading       = false;   /* P5a: track is now playable */
@@ -2931,42 +3261,78 @@ static void ae_decode_task(void *arg)
     }
 
     /* Steady-state decode loop (reads from PSRAM memory — no USB). */
+    int64_t decode_slept_us = esp_timer_get_time();
     while (runtime->run) {
+        /* v265: every user seek flushes the ring and restarts the pre-roll
+         * fill, so a seek flood (fast paused jog rewind) kept this loop
+         * decoding without ever reaching a full ring or its delays. Past
+         * AE_DECODE_MAX_BUSY_US without a sleep, give IDLE0 one tick before
+         * the task watchdog does. The output task outranks this one anyway. */
+        const int64_t decode_now_us = esp_timer_get_time();
+        if (decode_now_us - decode_slept_us >= AE_DECODE_MAX_BUSY_US) {
+            vTaskDelay(1);
+            decode_slept_us = esp_timer_get_time();
+        }
         if (eng->seek_requested) {
             AE_LOCK();
             if (eng->seek_requested) {
                 uint32_t target_ms = eng->seek_target_ms;
                 ae_seek_reason_t seek_reason = (ae_seek_reason_t)eng->seek_reason;
-                bool loop_seek = seek_reason == AE_SEEK_REASON_LOOP;
+                bool loop_seek = seek_reason == AE_SEEK_REASON_LOOP ||
+                                 seek_reason == AE_SEEK_REASON_LOOP_CONTINUE;
+                /* A loop wrap lands on a table entry and keeps its clock
+                 * (below); every other seek skips to its exact target. */
+                bool exact_seek = seek_reason != AE_SEEK_REASON_LOOP;
                 bool cue_preroll = timeline_active(ctx->deck) &&
                     seek_reason == AE_SEEK_REASON_USER &&
-                    !atomic_load_bool(&eng->playing) &&
-                    eng->sample_rate > 0u && target_ms > 0u;
-                uint32_t decode_target_ms = target_ms;
-                if (cue_preroll) {
-                    uint32_t pre_ms = target_ms < AE_TIMELINE_FORWARD_MS
-                        ? target_ms : AE_TIMELINE_FORWARD_MS;
-                    decode_target_ms = target_ms - pre_ms;
-                    eng->timeline_preroll_frames =
-                        (uint32_t)(((uint64_t)pre_ms * eng->sample_rate) / 1000u);
-                    eng->timeline_preroll_pending =
-                        eng->timeline_preroll_frames > 0u;
-                } else {
-                    eng->timeline_preroll_frames = 0u;
-                    eng->timeline_preroll_pending = false;
-                }
+                    !atomic_load_bool(&eng->playing);
+                /* Armed before s_start_seek_pending drops below, so a PLAY
+                 * racing this seek never sees neither gate. */
+                /* The producer only decodes with a full batch of room under
+                 * the forward cap, so the cue frame must sit one batch below
+                 * it or a paused deck never reaches it (v251 PLAY stall). */
+                uint32_t cap = deck_pcm_forward_cap(ctx->deck, eng->sample_rate);
+                uint32_t max_pre = cap > (uint32_t)MINIMP3_MAX_SAMPLES_PER_FRAME
+                    ? cap - (uint32_t)MINIMP3_MAX_SAMPLES_PER_FRAME : 0u;
+                audio_cue_preroll_t preroll;
+                eng->seek_skip_frames = 0u;
+                eng->seek_resync = false;
+                uint32_t decode_target_ms = audio_cue_preroll_arm(
+                    &preroll, cue_preroll, target_ms, eng->sample_rate, max_pre);
+                eng->timeline_preroll.frames = preroll.frames;
+                atomic_store_bool(&eng->timeline_preroll.pending, preroll.pending);
                 if (eng->format == AUDIO_FORMAT_WAV) {
                     ae_wav_seek_to_ms(eng, decode_target_ms);
                 } else if (eng->format == AUDIO_FORMAT_FLAC) {
                     (void)ae_flac_seek_to_ms(eng, fw, ctx->deck,
                                              decode_target_ms);
                 } else if (eng->has_pvbr) {
-                    seek_pvbr(eng, decode_target_ms);
+                    uint32_t entry_ms = seek_pvbr(eng, decode_target_ms);
+                    /* Loop wraps keep the old behaviour: their runway
+                     * (AE_LOOP_TRIM_MIN_RUNWAY_FRAMES) is sized for one
+                     * reseek, not for decoding up to 0.4 s more. A loop
+                     * resize continuing the track keeps the ring up to the
+                     * old end ahead of the playhead, runway enough. */
+                    if (exact_seek) {
+                        eng->seek_skip_frames = audio_seek_skip_frames(
+                            decode_target_ms, entry_ms, eng->sample_rate);
+                        eng->seek_resync = true;
+                        /* v269 diagnostic: entry_ms is derived from the
+                         * analysis span; past it, from the tail byte rate. */
+                        ESP_LOGW(TAG, "D%u seek %u ms: PVBR entry %u ms skip %u fr span %u track %u ms",
+                                 (unsigned)ctx->deck, (unsigned)decode_target_ms,
+                                 (unsigned)entry_ms, (unsigned)eng->seek_skip_frames,
+                                 (unsigned)eng->duration_ms,
+                                 (unsigned)ae_track_length_ms(eng));
+                    }
                 } else {
                     seek_estimate(eng, decode_target_ms);
                 }
                 eng->seek_base_ms      = decode_target_ms;
                 eng->frames_since_seek = 0u;
+                eng->seek_was_loop_wrap = seek_reason == AE_SEEK_REASON_LOOP;
+                /* A flushed ring is decoded against the current loop. */
+                if (!loop_seek) eng->loop_resize_pending = false;
                 if (!loop_seek) {
                     eng->output_base_ms = target_ms;
                     eng->output_frames_since_seek = 0u;
@@ -3005,12 +3371,27 @@ static void ae_decode_task(void *arg)
             (atomic_load_bool(&s_scratch_capture_freeze[ctx->deck]) ||
              atomic_load_bool(&s_scratch_playing[ctx->deck]))) {
             vTaskDelay(pdMS_TO_TICKS(1));
+            decode_slept_us = esp_timer_get_time();
             continue;
+        }
+        /* v274: after the scratch freeze (the frozen future is immutable),
+         * before the full-ring wait (the ring is full most of the time). */
+        if (eng->loop_resize_pending) {
+            AE_LOCK();
+            const bool armed = ae_apply_loop_resize(eng, ctx->deck);
+            AE_UNLOCK();
+            if (armed) continue;          /* the reseek, before any decode */
         }
         if (atomic_load_bool(&eng->eof) ||
             deck_pcm_free(ctx->deck, eng->sample_rate) <
                 (uint32_t)MINIMP3_MAX_SAMPLES_PER_FRAME) {
+            /* Safety net: a pending pre-roll that can no longer grow would
+             * gate the output forever once PLAY arrives. */
+            if (atomic_load_bool(&eng->timeline_preroll.pending)) {
+                ae_cue_preroll_publish(ctx->deck, eng, true);
+            }
             vTaskDelay(pdMS_TO_TICKS(2));
+            decode_slept_us = esp_timer_get_time();
             continue;
         }
         uint32_t scratch_newest_ms = 0u;
@@ -3046,6 +3427,19 @@ static void ae_decode_task(void *arg)
          * the decoder's own end-of-input signal further down, and borrowing it
          * to mean "publish nothing" would divert a mid-file loop wrap into the
          * EOF wait, which only the pending seek could release. */
+        if (samples > 0 && eng->seek_skip_frames > 0u) {
+            uint32_t drop = audio_seek_skip_take(&eng->seek_skip_frames,
+                                                 (uint32_t)samples);
+            samples -= (int)drop;
+            if (samples > 0) {
+                memmove(decode_pcm, decode_pcm + drop * 2u,
+                        (size_t)samples * 2u * sizeof(decode_pcm[0]));
+            } else {
+                /* Whole batch before the target: not an end of input. */
+                AE_UNLOCK();
+                continue;
+            }
+        }
         int publish_frames = samples;
         if (samples > 0) {
             eng->frames_since_seek += (uint64_t)samples;
@@ -3123,14 +3517,24 @@ static void ae_decode_task(void *arg)
         }
         bool eof = atomic_load_bool(&eng->eof);
         size_t file_pos = eng->file_pos;
+        const uint32_t decoded_ms = eng->sample_rate > 0u
+            ? eng->seek_base_ms + (uint32_t)((eng->frames_since_seek * 1000ull) / eng->sample_rate)
+            : 0u;
         AE_UNLOCK();
 
+        if (samples > 0) ae_note_decoded_past(eng, ctx->deck, decoded_ms);
+
         if (eof && samples <= 0) {
+            if (atomic_load_bool(&eng->timeline_preroll.pending)) {
+                ae_cue_preroll_publish(ctx->deck, eng, true);
+            }
+            ae_note_decoded_end(eng, ctx->deck);
             /* Decoder EOF is not transport EOF. The output task remains active
              * until it drains all already-decoded future PCM. */
             while (atomic_load_bool(&eng->eof) && runtime->run) {
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
+            decode_slept_us = esp_timer_get_time();
             continue;
         }
         if (samples <= 0) continue;
@@ -3175,6 +3579,9 @@ static void ae_decode_task(void *arg)
                 break;
             }
             while (deck_pcm_free(ctx->deck, eng->sample_rate) == 0u && runtime->run) {
+                if (atomic_load_bool(&eng->timeline_preroll.pending)) {
+                    ae_cue_preroll_publish(ctx->deck, eng, true);   /* see above */
+                }
                 if (capture_scratch && timeline_active(ctx->deck) &&
                     (atomic_load_bool(&s_scratch_capture_freeze[ctx->deck]) ||
                      atomic_load_bool(&s_scratch_playing[ctx->deck]))) {
@@ -3182,21 +3589,13 @@ static void ae_decode_task(void *arg)
                     break;
                 }
                 vTaskDelay(pdMS_TO_TICKS(1));
+                decode_slept_us = esp_timer_get_time();
             }
             if (capture_interrupted) break;
             (void)deck_pcm_push(ctx->deck, decode_pcm[i * 2], decode_pcm[i * 2 + 1]);
-        }
-        if (timeline_active(ctx->deck) && eng->timeline_preroll_pending &&
-            audio_pcm_timeline_write_seq(&s_pcm_timelines[ctx->deck]) >=
-                eng->timeline_preroll_frames) {
-            if (audio_pcm_timeline_set_playhead(
-                    &s_pcm_timelines[ctx->deck], eng->timeline_preroll_frames)) {
-                eng->timeline_preroll_pending = false;
-                ESP_LOGI(TAG,
-                         "cue pre-roll D%u ready: history=%u frames target=%u ms",
-                         (unsigned)ctx->deck,
-                         (unsigned)eng->timeline_preroll_frames,
-                         (unsigned)eng->output_base_ms);
+            /* Per frame, not per batch: the cue frame rarely ends a batch. */
+            if (atomic_load_bool(&eng->timeline_preroll.pending)) {
+                ae_cue_preroll_publish(ctx->deck, eng, false);
             }
         }
         if (timeline_active(ctx->deck) && scratch_newest_valid && !capture_interrupted) {
@@ -4901,6 +5300,11 @@ static esp_err_t audio_engine_load_for_deck(uint8_t deck,
 #endif
 
     eng->duration_ms = duration_ms;
+    atomic_store_u32(&eng->track_ms, 0u);
+    eng->first_kbps = 0u;
+    eng->track_extended = false;
+    eng->pvbr_geom = (audio_pvbr_geometry_t){0};
+    eng->seek_resync = false;
     if (eng->format == AUDIO_FORMAT_MP3 || eng->format == AUDIO_FORMAT_UNKNOWN) {
         eng->sample_rate = 0u;   /* latched on first decoded frame */
         eng->channels    = 2;
@@ -4930,6 +5334,9 @@ static esp_err_t audio_engine_load_for_deck(uint8_t deck,
 
     eng->seek_base_ms      = 0u;
     eng->frames_since_seek = 0u;
+    eng->seek_skip_frames  = 0u;
+    eng->seek_was_loop_wrap = false;
+    eng->loop_resize_pending = false;
     eng->output_base_ms    = 0u;
     eng->output_frames_since_seek = 0u;
 #if AE_FW
@@ -5120,6 +5527,7 @@ static esp_err_t audio_engine_play_for_deck(uint8_t deck)
         atomic_load_u32(&s_start_prebuffer_frames[deck]);
     bool wait_for_prebuffer =
         atomic_load_bool(&s_start_seek_pending[deck]) ||
+        atomic_load_bool(&eng->timeline_preroll.pending) ||
         !audio_start_gate_ready(deck_pcm_used(deck),
                                 prebuffer_frames,
                                 atomic_load_bool(&eng->eof));
@@ -5367,7 +5775,14 @@ float audio_engine_raw_pitch_to_percent(int16_t raw_pitch)
     return ((8192.0f - (float)raw_pitch) / 8192.0f) * 10.0f;
 }
 
-static uint32_t audio_engine_position_ms_for_deck(uint8_t deck)
+/* v285: last positions the LVGL task read, returned while the decoder holds
+ * the engine mutex (seek, frame decode). The output task cannot commit frames
+ * then either, so the kept value is what a blocking read would have found. */
+static uint32_t s_ui_position_ms[AUDIO_ENGINE_DECK_COUNT];
+static audio_engine_deck_status_t s_ui_status[AUDIO_ENGINE_DECK_COUNT];
+static uint32_t s_ui_lock_misses;
+
+static uint32_t audio_engine_position_ms_for_deck_ex(uint8_t deck, bool wait)
 {
     audio_engine_state_t *eng = &s_engines[deck];
     /* While the scratch source is audible, its fractional head is the playback
@@ -5378,25 +5793,39 @@ static uint32_t audio_engine_position_ms_for_deck(uint8_t deck)
         ae_scratch_handoff_t phase =
             (ae_scratch_handoff_t)scratch_handoff_load(&s_scratch_handoff[deck]);
         audio_scratch_buffer_t *b = &s_scratch_buf[deck];
+        /* A paused release already committed its pause position (v266):
+         * the fading tail must not drag the reported position past it. */
+        bool paused_release = phase == AE_SCRATCH_HANDOFF_FADE_OUT &&
+                              atomic_load_bool(&s_scratch_return_paused[deck]);
         if ((phase == AE_SCRATCH_HANDOFF_NONE ||
-             phase == AE_SCRATCH_HANDOFF_FADE_OUT) &&
+             phase == AE_SCRATCH_HANDOFF_FADE_OUT) && !paused_release &&
             b->newest_valid && b->sample_rate > 0u) {
             float head_back = scratch_head_snapshot(deck);
-            return audio_scratch_track_position_ms(
+            uint32_t pos = audio_scratch_track_position_ms(
                 b->newest_pos_ms, head_back, b->sample_rate,
                 eng->loop_active, eng->loop_start_ms, eng->loop_end_ms);
+            if (!wait) s_ui_position_ms[deck] = pos;
+            return pos;
         }
     }
-    AE_LOCK();
-    if (!eng->loaded || eng->sample_rate == 0) {
-        uint32_t base = eng->output_base_ms;
-        AE_UNLOCK();
-        return base;
+    if (wait) {
+        AE_LOCK();
+    } else if (!AE_TRY_LOCK()) {
+        __atomic_fetch_add(&s_ui_lock_misses, 1u, __ATOMIC_RELAXED);
+        return s_ui_position_ms[deck];
     }
-    uint32_t from_frames = (uint32_t)(eng->output_frames_since_seek * 1000u / eng->sample_rate);
-    uint32_t pos = eng->output_base_ms + from_frames;
+    uint32_t pos = eng->output_base_ms;
+    if (eng->loaded && eng->sample_rate != 0) {
+        pos += (uint32_t)(eng->output_frames_since_seek * 1000u / eng->sample_rate);
+    }
     AE_UNLOCK();
+    if (!wait) s_ui_position_ms[deck] = pos;
     return pos;
+}
+
+static uint32_t audio_engine_position_ms_for_deck(uint8_t deck)
+{
+    return audio_engine_position_ms_for_deck_ex(deck, true);
 }
 
 static bool deck_is_valid(uint8_t deck);
@@ -5411,14 +5840,21 @@ static ae_state_t engine_lifecycle_state(const audio_engine_state_t *eng)
             !atomic_load_bool(&eng->paused)) ? AE_PLAYING : AE_READY;
 }
 
-esp_err_t audio_engine_deck_get_status(uint8_t deck, audio_engine_deck_status_t *out)
+static esp_err_t deck_get_status_ex(uint8_t deck, audio_engine_deck_status_t *out,
+                                    bool wait)
 {
     if (!deck_is_valid(deck) || !out) return ESP_ERR_INVALID_ARG;
 
     audio_engine_state_t *eng = &s_engines[deck];
     memset(out, 0, sizeof(*out));
 
-    AE_LOCK();
+    if (wait) {
+        AE_LOCK();
+    } else if (!AE_TRY_LOCK()) {
+        __atomic_fetch_add(&s_ui_lock_misses, 1u, __ATOMIC_RELAXED);
+        *out = s_ui_status[deck];
+        return ESP_OK;
+    }
     out->state = engine_lifecycle_state(eng);
     out->load_progress = eng->load_progress;
     out->last_error = eng->last_error;
@@ -5437,15 +5873,37 @@ esp_err_t audio_engine_deck_get_status(uint8_t deck, audio_engine_deck_status_t 
     /* Keep status consumers on the same audible scratch coordinate as the
      * direct position API. This call is lock-free for an active scratch window. */
     if (atomic_load_bool(&s_scratch_playing[deck])) {
-        out->position_ms = audio_engine_position_ms_for_deck(deck);
+        out->position_ms = audio_engine_position_ms_for_deck_ex(deck, wait);
     }
+    if (!wait) s_ui_status[deck] = *out;
 
     return ESP_OK;
+}
+
+esp_err_t audio_engine_deck_get_status(uint8_t deck, audio_engine_deck_status_t *out)
+{
+    return deck_get_status_ex(deck, out, true);
+}
+
+esp_err_t audio_engine_deck_get_status_nowait(uint8_t deck, audio_engine_deck_status_t *out)
+{
+    return deck_get_status_ex(deck, out, false);
 }
 
 #if AE_FW
 static bool deck_transport_supported(uint8_t deck);
 #endif
+
+/* v274: an active loop changes (resize, IN/OUT jog, exit). Keeps the loop the
+ * ring was decoded against across several changes before the decode task
+ * gets to them. AE_LOCK held. */
+static void ae_note_loop_change(audio_engine_state_t *eng, bool changed)
+{
+    if (!changed || eng->loop_resize_pending) return;
+    eng->loop_resize_from_start_ms = eng->loop_start_ms;
+    eng->loop_resize_from_end_ms = eng->loop_end_ms;
+    eng->loop_resize_pending = true;
+}
 
 esp_err_t audio_engine_deck_set_loop(uint8_t deck, uint32_t start_ms, uint32_t end_ms)
 {
@@ -5455,11 +5913,23 @@ esp_err_t audio_engine_deck_set_loop(uint8_t deck, uint32_t start_ms, uint32_t e
 #endif
     audio_engine_state_t *eng = &s_engines[deck];
     AE_LOCK();
+    const bool resize = eng->loop_active &&
+        (eng->loop_start_ms != start_ms || eng->loop_end_ms != end_ms);
+    ae_note_loop_change(eng, resize);
     eng->loop_start_ms = start_ms;
     eng->loop_end_ms   = end_ms;
     eng->loop_active   = true;
     AE_UNLOCK();
     ESP_LOGI(TAG, "Audio loop set: %lu ms to %lu ms", (unsigned long)start_ms, (unsigned long)end_ms);
+    /* v274: /2 with the playhead already past the new end: into the new
+     * loop at the same phase, as a CDJ does (a seek, not a ring cut). */
+    uint32_t jump_ms = 0u;
+    if (resize && audio_loop_resize_jump_ms(audio_engine_position_ms_for_deck(deck),
+                                            start_ms, end_ms, &jump_ms)) {
+        ESP_LOGI(TAG, "Audio loop shrunk behind the playhead: jump to %lu ms",
+                 (unsigned long)jump_ms);
+        return audio_engine_request_user_seek(deck, jump_ms);
+    }
     return ESP_OK;
 }
 
@@ -5470,6 +5940,7 @@ esp_err_t audio_engine_deck_clear_loop(uint8_t deck)
     if (!deck_transport_supported(deck)) return ESP_ERR_NOT_SUPPORTED;
 #endif
     AE_LOCK();
+    ae_note_loop_change(&s_engines[deck], s_engines[deck].loop_active);
     s_engines[deck].loop_active = false;
     AE_UNLOCK();
     ESP_LOGI(TAG, "Audio loop cleared");
@@ -5657,6 +6128,15 @@ esp_err_t audio_engine_deck_seek(uint8_t deck, uint32_t position_ms)
     return audio_engine_request_user_seek(deck, position_ms);
 }
 
+bool audio_engine_deck_seek_busy(uint8_t deck)
+{
+    if (!deck_is_valid(deck)) return false;
+    const audio_engine_state_t *eng = &s_engines[deck];
+    return eng->seek_requested || atomic_load_bool(&eng->timeline_preroll.pending) ||
+           atomic_load_bool(&s_scratch_abort_seek_requested[deck]) ||
+           atomic_load_bool(&s_scratch_abort_seek_waiting[deck]);
+}
+
 void audio_engine_deck_set_pitch(uint8_t deck, int16_t raw_pitch)
 {
     if (!deck_is_valid(deck)) return;
@@ -5760,11 +6240,11 @@ bool audio_engine_deck_scratch_begin(uint8_t deck)
      * a short control-path window to publish the centered pre-roll rather than
      * engaging a one-sided scratch window or requiring a second touch. */
     for (uint32_t waits = 0u; waits < 60u &&
-         eng->timeline_preroll_pending; waits++) {
+         atomic_load_bool(&eng->timeline_preroll.pending); waits++) {
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 #endif
-    if (eng->timeline_preroll_pending) {
+    if (atomic_load_bool(&eng->timeline_preroll.pending)) {
         ESP_LOGW(TAG, "scratch begin D%u rejected: cue pre-roll pending",
                  (unsigned)deck);
         return false;
@@ -5852,14 +6332,24 @@ void audio_engine_deck_scratch_move(uint8_t deck, int16_t delta)
     audio_scratch_jog(&s_scratch_engine[deck], delta);
 }
 
-void audio_engine_deck_scratch_end(uint8_t deck)
+int audio_engine_deck_scratch_edge(uint8_t deck)
 {
-    if (!deck_is_valid(deck)) return;
+    if (!deck_is_valid(deck) || !atomic_load_bool(&s_scratch_playing[deck]) ||
+        scratch_handoff_load(&s_scratch_handoff[deck]) != AE_SCRATCH_HANDOFF_NONE) {
+        return 0;
+    }
+    /* Written by the output task, the sole renderer. */
+    return __atomic_load_n(&s_scratch_engine[deck].edge_latch, __ATOMIC_RELAXED);
+}
+
+bool audio_engine_deck_scratch_end(uint8_t deck, uint32_t *position_ms)
+{
+    if (!deck_is_valid(deck)) return false;
 
     /* No-op if scratch never engaged (begin was declined for a stopped deck):
      * arming the handoff here would flip s_scratch_playing on with no capture. */
     if (!atomic_load_bool(&s_scratch_playing[deck])) {
-        return;
+        return false;
     }
 
     /* Convert the read-head position back to a track position and seek normal
@@ -5872,19 +6362,13 @@ void audio_engine_deck_scratch_end(uint8_t deck)
     float head_back = scratch_head_snapshot(deck);
     bool return_paused = atomic_load_bool(&s_scratch_started_paused[deck]);
 
-    if (return_paused) {
-        (void)audio_pcm_timeline_set_playhead(
-            &s_pcm_timelines[deck], s_scratch_origin_play_seq[deck]);
-        s_engines[deck].output_base_ms = s_scratch_origin_pos_ms[deck];
-        s_engines[deck].output_frames_since_seek = 0u;
-#if AE_FW
-        output_position_epoch_bump(deck);
-        audio_resampler_reset(&s_resamplers[deck]);
-#endif
-        atomic_store_bool(&s_scratch_return_paused[deck], true);
-    }
-
-    if (!return_paused && b->newest_valid && b->sample_rate > 0u) {
+    /* Both a playing and a paused scratch continue from where the platter was
+     * released (v266: a paused one used to snap back to its touch-down
+     * origin, standard CDJ behaviour is that the release is the new pause
+     * position). The head sits inside the frozen canonical window, so moving
+     * the playhead there is exact and needs no decoder seek. */
+    bool placed = false;
+    if (b->newest_valid && b->sample_rate > 0u) {
         uint32_t frames_back = head_back > 0.0f ? (uint32_t)head_back : 0u;
         if (audio_pcm_timeline_set_playhead_frames_back(&s_pcm_timelines[deck],
                                                         frames_back)) {
@@ -5895,11 +6379,31 @@ void audio_engine_deck_scratch_end(uint8_t deck)
                 s_engines[deck].loop_end_ms);
             s_engines[deck].output_base_ms = target;
             s_engines[deck].output_frames_since_seek = 0u;
-#if AE_FW
-            output_position_epoch_bump(deck);
-            audio_resampler_reset(&s_resamplers[deck]);
-#endif
+            placed = true;
         }
+    }
+    if (return_paused && !placed) {
+        /* Head outside the window: the origin is the only exact position. */
+        (void)audio_pcm_timeline_set_playhead(
+            &s_pcm_timelines[deck], s_scratch_origin_play_seq[deck]);
+        s_engines[deck].output_base_ms = s_scratch_origin_pos_ms[deck];
+        s_engines[deck].output_frames_since_seek = 0u;
+#if AE_FW
+        ESP_LOGW(TAG, "scratch end D%u: head outside window -> origin %u ms",
+                 (unsigned)deck, (unsigned)s_scratch_origin_pos_ms[deck]);
+#endif
+    }
+#if AE_FW
+    if (placed || return_paused) {
+        output_position_epoch_bump(deck);
+        audio_resampler_reset(&s_resamplers[deck]);
+    }
+#endif
+    if (return_paused) {
+        atomic_store_bool(&s_scratch_return_paused[deck], true);
+    }
+    if (position_ms) {
+        *position_ms = s_engines[deck].output_base_ms;
     }
 
     /* Publish only a command. The output owner seeds gain and enters FADE_OUT
@@ -5907,6 +6411,7 @@ void audio_engine_deck_scratch_end(uint8_t deck)
     scratch_handoff_publish_command(deck, AE_SCRATCH_COMMAND_RELEASE);
     /* s_scratch_playing stays true through the handoff; the output task clears it
      * once the fade-in reaches full gain (AE_SCRATCH_HANDOFF_RING). */
+    return true;
 }
 
 bool audio_engine_deck_censor_begin(uint8_t deck)
@@ -5941,6 +6446,24 @@ void audio_engine_deck_censor_end(uint8_t deck)
 #endif
 }
 
+uint32_t audio_engine_output_latency_us(void)
+{
+#if AE_FW
+    return controller_usb_host_audio_latency_us() +
+           (uint32_t)CONFIG_AUDIO_DISPLAY_LATENCY_MS * 1000u;
+#else
+    return 0u;
+#endif
+}
+
+uint32_t audio_engine_deck_track_length_ms(uint8_t deck)
+{
+    if (!deck_is_valid(deck)) return 0;
+    const audio_engine_state_t *eng = &s_engines[deck];
+    if (!eng->loaded) return 0;
+    return atomic_load_u32(&eng->track_ms);
+}
+
 uint32_t audio_engine_deck_position_ms(uint8_t deck)
 {
     if (!deck_is_valid(deck)) return 0;
@@ -5948,6 +6471,20 @@ uint32_t audio_engine_deck_position_ms(uint8_t deck)
     if (!deck_transport_supported(deck)) return 0;
 #endif
     return audio_engine_position_ms_for_deck(deck);
+}
+
+uint32_t audio_engine_deck_position_ms_nowait(uint8_t deck)
+{
+    if (!deck_is_valid(deck)) return 0;
+#if AE_FW
+    if (!deck_transport_supported(deck)) return 0;
+#endif
+    return audio_engine_position_ms_for_deck_ex(deck, false);
+}
+
+uint32_t audio_engine_nowait_lock_misses(void)
+{
+    return __atomic_load_n(&s_ui_lock_misses, __ATOMIC_RELAXED);
 }
 
 bool audio_engine_deck_is_playing(uint8_t deck)
@@ -6709,10 +7246,13 @@ void audio_engine_get_mixer_snapshot(audio_engine_mixer_snapshot_t *out_snapshot
         out_snapshot->deck_peak_display[deck] = atomic_load_u16(&s_deck_ui_peak[deck]);
         ae_scratch_handoff_t scratch_phase =
             (ae_scratch_handoff_t)scratch_handoff_load(&s_scratch_handoff[deck]);
+        /* v267: a held deck (platter hold, jog transport) is frozen too, its
+         * position only moves by seeks: no forward extrapolation. */
         bool scratch_position_authoritative =
-            atomic_load_bool(&s_scratch_playing[deck]) &&
-            (scratch_phase == AE_SCRATCH_HANDOFF_NONE ||
-             scratch_phase == AE_SCRATCH_HANDOFF_FADE_OUT);
+            (atomic_load_bool(&s_scratch_playing[deck]) &&
+             (scratch_phase == AE_SCRATCH_HANDOFF_NONE ||
+              scratch_phase == AE_SCRATCH_HANDOFF_FADE_OUT)) ||
+            atomic_load_bool(&s_deck_hold[deck]);
         out_snapshot->scratch_position_authoritative[deck] =
             scratch_position_authoritative;
         float speed = scratch_position_authoritative ? 0.0f :

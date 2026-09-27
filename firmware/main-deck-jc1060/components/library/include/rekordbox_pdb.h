@@ -60,10 +60,13 @@ extern "C" {
 #define PDB_STR_MAX       128u   /* title, artist, album                      */
 #define PDB_PATH_MAX      256u   /* file_path, anlz_path                      */
 #define PDB_STR_NAME_MAX   96u   /* internal: name-table entry buffer         */
+#define PDB_PLAYLIST_NAME_MAX 64u /* playlist / folder name (UTF-8, truncated) */
+#define PDB_ARTWORK_PATH_MAX  64u /* artwork JPEG path on the stick            */
 
 /* ── Parsed track descriptor ─────────────────────────────────────────────── */
 typedef struct {
     uint32_t track_id;                  /* Rekordbox internal track ID            */
+    uint32_t artwork_id;                /* Artwork table id, 0 = no artwork       */
     uint16_t bpm;                       /* BPM, rounded (bpm_x100 / 100)         */
     uint16_t duration_s;                /* Duration in seconds                    */
     char     key[8];                    /* Musical key name from the Keys table   */
@@ -82,6 +85,8 @@ typedef struct {
     uint32_t total_tracks;
     bool tracks_truncated;
     bool names_truncated;
+    bool playlists_truncated;        /* PlaylistTree or PlaylistEntries capped */
+    bool artwork_truncated;          /* Artwork table capped                   */
 } pdb_import_stats_t;
 void pdb_get_import_stats(const pdb_t *pdb, pdb_import_stats_t *stats);
 
@@ -90,7 +95,8 @@ void pdb_get_import_stats(const pdb_t *pdb, pdb_import_stats_t *stats);
 /**
  * Open and parse export.pdb.
  *
- * Reads one bounded page at a time, parsing Tracks, Artists, Albums and Keys.
+ * Reads one bounded page at a time, parsing Tracks, Artists, Albums, Keys,
+ * the playlist tree/entries and the Artwork table.
  * Backend reads release media_io_gate after at most 8 KiB.
  * Allocates pdb_t on heap; call pdb_close() when done.
  *
@@ -119,6 +125,44 @@ int pdb_track_count(const pdb_t *pdb);
  * @return ESP_OK, or ESP_ERR_INVALID_ARG if index out of range.
  */
 esp_err_t pdb_get_track(const pdb_t *pdb, int index, pdb_track_t *out);
+
+/* ── Playlists (JC1060, additive to the upstream parser) ─────────────────── *
+ *
+ * PlaylistTree (table 0x07) nodes in PDB row order, folders included, and the
+ * PlaylistEntries (table 0x08) rows that reference tracks by track_id. Both are
+ * parsed by pdb_open() and freed by pdb_close(). A PDB without these tables
+ * simply reports zero playlists. */
+typedef struct {
+    uint32_t id;
+    uint32_t parent_id;                     /* 0 = root                       */
+    uint32_t sort_order;                    /* order among siblings           */
+    bool     is_folder;
+    char     name[PDB_PLAYLIST_NAME_MAX];
+} pdb_playlist_t;
+
+int pdb_playlist_count(const pdb_t *pdb);
+esp_err_t pdb_get_playlist(const pdb_t *pdb, int index, pdb_playlist_t *out);
+/* Track ids of `playlist_id` in entry_index order, up to `max`. Returns the
+ * number written; a NULL `out_ids` or `max` 0 returns the entry count. */
+int pdb_playlist_track_ids(const pdb_t *pdb, uint32_t playlist_id,
+                           uint32_t *out_ids, int max);
+
+/* ── Artwork (JC1060, additive) ──────────────────────────────────────────── *
+ *
+ * Artwork table (0x0D) rows: id + path of a JPEG on the stick, relative to
+ * its root ("/PIONEER/Artwork/00001/a3.jpg"). Tracks point at them through
+ * pdb_track_t.artwork_id. Parsed by pdb_open(), freed by pdb_close(); rows
+ * whose path does not fit PDB_ARTWORK_PATH_MAX are dropped. */
+typedef struct {
+    uint32_t id;
+    char     path[PDB_ARTWORK_PATH_MAX];
+} pdb_artwork_t;
+
+int pdb_artwork_count(const pdb_t *pdb);
+/* Rows sorted by id. */
+esp_err_t pdb_get_artwork(const pdb_t *pdb, int index, pdb_artwork_t *out);
+/* Path of `artwork_id`, NULL when unknown. Valid until pdb_close(). */
+const char *pdb_artwork_path(const pdb_t *pdb, uint32_t artwork_id);
 
 #ifdef REKORDBOX_PDB_STANDALONE_TEST
 esp_err_t pdb_test_decode_devicesql_string(const uint8_t *data, size_t data_len,

@@ -91,6 +91,10 @@ esp_err_t audio_engine_deck_stop_session(uint8_t deck,
                                          uint32_t expected_session_generation);
 uint32_t audio_engine_deck_session_generation(uint8_t deck);
 esp_err_t audio_engine_deck_seek(uint8_t deck, uint32_t position_ms);
+/* v265: true while the last seek is still queued for the decoder or its cue
+ * pre-roll is still decoding (v267: or a scratch-abort seek is not served
+ * yet). The jog scrub holds its next seek until then. */
+bool audio_engine_deck_seek_busy(uint8_t deck);
 void audio_engine_deck_set_pitch(uint8_t deck, int16_t raw_pitch);
 void audio_engine_deck_set_pitch_percent(uint8_t deck, float percent);
 void audio_engine_deck_set_master_tempo(uint8_t deck, bool enabled);
@@ -111,12 +115,27 @@ void audio_engine_deck_set_hold(uint8_t deck, bool held);
  * behind CONFIG_AUDIO_SCRATCH_ENABLED at the call site (deck_core). */
 bool audio_engine_deck_scratch_begin(uint8_t deck);
 void audio_engine_deck_scratch_move(uint8_t deck, int16_t delta);
-void audio_engine_deck_scratch_end(uint8_t deck);
+/* v267: +1 / -1 while the scratch head is pinned at the newest / oldest edge
+ * of the frozen window (the platter ran past it), 0 otherwise. A deck_seek()
+ * then leaves scratch through the scratch-abort seek (muted until served). */
+int audio_engine_deck_scratch_edge(uint8_t deck);
+/* v266: position_ms (optional) receives the committed playhead, the new pause
+ * position of a paused deck. False when no scratch was engaged. */
+bool audio_engine_deck_scratch_end(uint8_t deck, uint32_t *position_ms);
 /* Gapless slip-censor. Reverse audio is heard while the normal timeline keeps
  * advancing; release cross-fades back without a transport seek. */
 bool audio_engine_deck_censor_begin(uint8_t deck);
 void audio_engine_deck_censor_end(uint8_t deck);
 uint32_t audio_engine_deck_position_ms(uint8_t deck);
+/* v271: decoded file length once the load has resolved it, 0 before. It
+ * can run past the load duration (Rekordbox analysis span) when the file
+ * holds audio the analysis did not cover; see audio_track_length.h. */
+uint32_t audio_engine_deck_track_length_ms(uint8_t deck);
+/* v262: time from mixing a frame to hearing it (smoothed UAC ring fill +
+ * CONFIG_AUDIO_DISPLAY_LATENCY_MS). The position above is the mixed one; the
+ * audible position is the one it had this long ago. 0 on the PC build.
+ * Lock-free, LVGL task only (the ring reading is smoothed per call). */
+uint32_t audio_engine_output_latency_us(void);
 bool audio_engine_deck_is_playing(uint8_t deck);
 uint16_t audio_engine_get_deck_peak(uint8_t deck);
 
@@ -362,6 +381,12 @@ typedef struct {
 } audio_engine_deck_status_t;
 
 esp_err_t audio_engine_deck_get_status(uint8_t deck, audio_engine_deck_status_t *out);
+/* v285: LVGL task only. Never wait for the engine mutex: while the decoder
+ * holds it (seek, frame decode) they return the last value read for the deck
+ * and count a miss. audio_engine_nowait_lock_misses() is cumulative. */
+esp_err_t audio_engine_deck_get_status_nowait(uint8_t deck, audio_engine_deck_status_t *out);
+uint32_t audio_engine_deck_position_ms_nowait(uint8_t deck);
+uint32_t audio_engine_nowait_lock_misses(void);
 esp_err_t audio_engine_stop_all(void);
 esp_err_t audio_engine_suspend_loads_and_stop_all(void);
 void audio_engine_resume_loads(void);

@@ -2075,6 +2075,8 @@ static esp_err_t api_control_handler(httpd_req_t *req)
         uint32_t duration_ms = 0;
         ui_get_deck_track_info(deck, NULL, 0, NULL, 0, NULL, &duration_ms);
         uint32_t pos_ms = web_api_clamp_seek_ms(value, duration_ms, duration_ms > 0u);
+        ESP_LOGW(TAG, "deck %u seek %lu ms src=WEB", (unsigned)deck + 1u,
+                 (unsigned long)pos_ms);
         esp_err_t rc = audio_engine_deck_seek(deck, pos_ms);
         if (rc != ESP_OK) {
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Seek failed");

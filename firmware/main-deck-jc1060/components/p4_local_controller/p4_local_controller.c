@@ -16,6 +16,15 @@
 #include "freertos/task.h"
 #include "usb_host_manager.h"
 
+/* v292: EXT_RAM_BSS_ATTR moves a static to PSRAM when
+ * CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY is set; empty on host builds. */
+#ifdef ESP_PLATFORM
+#include "esp_attr.h"
+#endif
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
+#endif
+
 static const char *TAG = "p4_controller";
 
 #define LOCAL_DISPATCH_BUDGET 64u
@@ -100,18 +109,82 @@ static esp_err_t local_semantic_callback(const flx4_control_event_t *event,
 #define LOCAL_MIDI_LOG_LIMIT 48u
 static uint32_t s_midi_logged;
 
+/* v289: the USB MIDI IN callback runs in the controller_usb task (CPU1,
+ * prio 6 while UAC streams, above LVGL). The v289 HIL probe measured ~34 ms
+ * of it per 140 ms of fader movement, with the profile mapping inline, and
+ * LVGL starved. The callback now only copies the parsed message into this
+ * single-producer (controller_usb) / single-consumer (p4_ctrl_dispatch) ring
+ * and wakes the dispatch task, which maps at prio 4 before dispatching.
+ * Upstream maps inline. Items carry the connection epoch: a message queued
+ * before an unplug is never mapped against the next device. When the ring
+ * backs up, continuous CC/pitch-bend messages keep LOCAL_MIDI_RING_HEADROOM
+ * slots free for buttons (notes); drops are counted and logged. */
+#define LOCAL_MIDI_RING_SIZE 256u  /* power of two */
+#define LOCAL_MIDI_RING_HEADROOM 32u
+#define LOCAL_MIDI_DROP_LOG_MS 1000u
+typedef struct {
+    usb_midi_message_t message;
+    uint32_t epoch;
+} local_midi_item_t;
+EXT_RAM_BSS_ATTR static local_midi_item_t s_midi_ring[LOCAL_MIDI_RING_SIZE];
+static uint32_t s_midi_ring_head;  /* written by controller_usb only */
+static uint32_t s_midi_ring_tail;  /* written by p4_ctrl_dispatch only */
+static uint32_t s_midi_ring_drops;
+
 static void local_midi_callback(const usb_midi_message_t *message, void *ctx)
 {
     (void)ctx;
-    if (message) {
-        const bool mapped = controller_runtime_handle_midi(message);
+    if (!message) {
+        return;
+    }
+    const uint32_t head = __atomic_load_n(&s_midi_ring_head, __ATOMIC_RELAXED);
+    const uint32_t tail = __atomic_load_n(&s_midi_ring_tail, __ATOMIC_ACQUIRE);
+    const uint8_t kind = message->status & 0xF0u;
+    const uint32_t limit = kind == 0xB0u || kind == 0xE0u
+        ? LOCAL_MIDI_RING_SIZE - LOCAL_MIDI_RING_HEADROOM
+        : LOCAL_MIDI_RING_SIZE;
+    if (head - tail >= limit) {
+        count_inc(&s_midi_ring_drops);
+        return;
+    }
+    s_midi_ring[head & (LOCAL_MIDI_RING_SIZE - 1u)] = (local_midi_item_t) {
+        .message = *message,
+        .epoch = (uint32_t)atomic_load_explicit(&s_connection_epoch,
+                                                memory_order_relaxed),
+    };
+    __atomic_store_n(&s_midi_ring_head, head + 1u, __ATOMIC_RELEASE);
+    const TaskHandle_t dispatch = s_dispatch_task;
+    if (dispatch) {
+        xTaskNotifyGive(dispatch);
+    }
+}
+
+/* p4_ctrl_dispatch only: maps up to max_items queued MIDI messages. */
+static size_t map_queued_midi(size_t max_items)
+{
+    uint32_t tail = __atomic_load_n(&s_midi_ring_tail, __ATOMIC_RELAXED);
+    const uint32_t head = __atomic_load_n(&s_midi_ring_head, __ATOMIC_ACQUIRE);
+    size_t taken = 0u;
+    while (tail != head && taken < max_items) {
+        const local_midi_item_t item =
+            s_midi_ring[tail & (LOCAL_MIDI_RING_SIZE - 1u)];
+        tail++;
+        __atomic_store_n(&s_midi_ring_tail, tail, __ATOMIC_RELEASE);
+        taken++;
+        if (!atomic_load_explicit(&s_local_connected, memory_order_acquire) ||
+            item.epoch != (uint32_t)atomic_load_explicit(
+                              &s_connection_epoch, memory_order_acquire)) {
+            continue;
+        }
+        const bool mapped = controller_runtime_handle_midi(&item.message);
         if (s_midi_logged < LOCAL_MIDI_LOG_LIMIT) {
             s_midi_logged++;
             ESP_LOGW(TAG, "MIDI %02X %02X %02X -> %s",
-                     message->status, message->data1, message->data2,
-                     mapped ? "mapped" : "unmapped");
+                     item.message.status, item.message.data1,
+                     item.message.data2, mapped ? "mapped" : "unmapped");
         }
     }
+    return taken;
 }
 
 static esp_err_t local_led_sink(uint8_t led, uint8_t state, uint8_t deck,
@@ -248,11 +321,26 @@ static void local_connection_callback(bool connected,
 static void local_dispatch_task(void *arg)
 {
     (void)arg;
+    uint32_t drops_logged = 0u;
+    TickType_t drop_log_tick = 0;
     for (;;) {
+        const size_t mapped = map_queued_midi(LOCAL_DISPATCH_BUDGET);
         const size_t dispatched =
             controller_runtime_dispatch_pending(LOCAL_DISPATCH_BUDGET);
-        if (dispatched == 0u) {
-            vTaskDelay(pdMS_TO_TICKS(2));
+        const uint32_t drops =
+            __atomic_load_n(&s_midi_ring_drops, __ATOMIC_RELAXED);
+        const TickType_t now = xTaskGetTickCount();
+        if (drops != drops_logged &&
+            now - drop_log_tick >= pdMS_TO_TICKS(LOCAL_MIDI_DROP_LOG_MS)) {
+            ESP_LOGW(TAG, "MIDI IN ring full: %u messages dropped",
+                     (unsigned)(drops - drops_logged));
+            drops_logged = drops;
+            drop_log_tick = now;
+        }
+        if (mapped == 0u && dispatched == 0u) {
+            /* Woken by the MIDI IN callback; the timeout keeps the previous
+             * 2 ms poll for runtime retries and snapshots. */
+            (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2));
         } else {
             taskYIELD();
         }
@@ -300,14 +388,6 @@ static void local_bootstrap_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(LOCAL_BOOTSTRAP_RETRY_MS));
         }
     }
-    while (!s_dispatch_task) {
-        if (xTaskCreate(local_dispatch_task, "p4_ctrl_dispatch", 4096u,
-                        NULL, 4u, &s_dispatch_task) != pdPASS) {
-            record_bootstrap_failure(ESP_ERR_NO_MEM, "dispatch worker");
-            vTaskDelay(pdMS_TO_TICKS(LOCAL_BOOTSTRAP_RETRY_MS));
-        }
-    }
-
     const controller_usb_host_config_t usb_config = {
         .midi_cb = local_midi_callback,
         .connection_cb = local_connection_callback,
@@ -318,7 +398,10 @@ static void local_bootstrap_task(void *arg)
          * ae_output and refills the UAC isochronous packets; unpinned it
          * could time-slice with the mix on CPU0. */
         .task_core_id = 1,
-        .midi_out_queue_depth = 256u,
+        /* v292: 128 x 8 B of internal RAM (FreeRTOS queue). A full DDJ-400
+         * LED snapshot is under 70 packets; overflow only drops LEDs and
+         * is counted (midi_out_queue_drops). */
+        .midi_out_queue_depth = 128u,
         .max_event_messages = 8,
         .root_port_index = LOCAL_USB1_ROOT_INDEX,
     };
@@ -333,6 +416,18 @@ static void local_bootstrap_task(void *arg)
         }
         record_bootstrap_failure(rc, "USB host");
         vTaskDelay(pdMS_TO_TICKS(LOCAL_BOOTSTRAP_RETRY_MS));
+    }
+    /* v290: the dispatch task is created AFTER usb_host_install — internal
+     * RAM before the host init is ~51 KB free / 31 KB largest block, and
+     * adding this 4 KB task before it pushed usb_host_install into
+     * ESP_ERR_NO_MEM (boot loop). MIDI cannot arrive before the host is
+     * up, so ordering is safe. */
+    while (!s_dispatch_task) {
+        if (xTaskCreate(local_dispatch_task, "p4_ctrl_dispatch", 4096u,
+                        NULL, 4u, &s_dispatch_task) != pdPASS) {
+            record_bootstrap_failure(ESP_ERR_NO_MEM, "dispatch worker");
+            vTaskDelay(pdMS_TO_TICKS(LOCAL_BOOTSTRAP_RETRY_MS));
+        }
     }
     __atomic_store_n(&s_last_bootstrap_error, (int32_t)ESP_OK,
                      __ATOMIC_RELEASE);

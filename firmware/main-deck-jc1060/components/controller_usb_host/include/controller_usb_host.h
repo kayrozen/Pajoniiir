@@ -112,12 +112,35 @@ typedef struct {
     bool faulted;
 } controller_usb_host_audio_stats_t;
 
+/* v289 stall probe: controller task work. Counters and *_cycles wrap; use
+ * differences between two reads and divide cycles by cpu_ticks_per_us.
+ * *_max_cycles is the longest callback since the previous read. Loop cycles
+ * are the housekeeping after usb_host_client_handle_events(); the MIDI IN and
+ * isoc callbacks run inside that call and are counted separately. */
+typedef struct {
+    uint32_t cpu_ticks_per_us;
+    uint32_t loops;
+    uint32_t loop_cycles;
+    uint32_t midi_in_callbacks;
+    uint32_t midi_in_cycles;
+    uint32_t midi_in_max_cycles;
+    uint32_t midi_packets;
+    uint32_t midi_out_submits;
+    uint32_t midi_out_wakeups;
+    uint32_t midi_submit_cycles;  /* MIDI IN/OUT usb_host_transfer_submit() */
+    uint32_t isoc_callbacks;
+    uint32_t isoc_cycles;
+    uint32_t isoc_max_cycles;
+    uint32_t isoc_submit_cycles;  /* part of isoc_cycles */
+} controller_usb_host_work_t;
+
 esp_err_t controller_usb_host_init(const controller_usb_host_config_t *config);
 esp_err_t controller_usb_host_send_packet(const uint8_t packet[4]);
 bool controller_usb_host_is_connected(void);
 bool controller_usb_host_get_identity(controller_usb_identity_t *identity_out);
 void controller_usb_host_get_diagnostics(
     controller_usb_host_diagnostics_t *diag_out);
+void controller_usb_host_get_work(controller_usb_host_work_t *work_out);
 esp_err_t controller_usb_host_write_audio(const int16_t *master_samples,
                                           const int16_t *headphone_samples,
                                           size_t frame_count,
@@ -127,6 +150,8 @@ bool controller_usb_host_audio_pace_ready(size_t frame_count,
                                          bool *ready);
 /* v226: see controller_usb_audio_stream_take_pace_low_water(). */
 uint32_t controller_usb_host_audio_take_pace_low_water(void);
+/* v262: see controller_usb_audio_stream_latency_us(). */
+uint32_t controller_usb_host_audio_latency_us(void);
 void controller_usb_host_get_audio_stats(
     controller_usb_host_audio_stats_t *stats_out);
 

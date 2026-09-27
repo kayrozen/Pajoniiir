@@ -38,6 +38,10 @@
 #define LV_USE_SWITCH 1
 #define LV_USE_TABLE 1
 #define LV_USE_FLEX 1
+
+/* JC1060 artwork thumbnails (ui_artwork_thumb.c), as CONFIG_LV_USE_TJPGD */
+#define LV_USE_TJPGD 1
+
 #define LV_USE_GRID 1
 
 #define LV_USE_SDL 0

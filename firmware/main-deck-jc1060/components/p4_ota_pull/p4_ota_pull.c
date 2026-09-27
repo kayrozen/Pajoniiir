@@ -22,6 +22,15 @@
 
 #include <string.h>
 
+/* v292: EXT_RAM_BSS_ATTR moves a static to PSRAM when
+ * CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY is set; empty on host builds. */
+#ifdef ESP_PLATFORM
+#include "esp_attr.h"
+#endif
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
+#endif
+
 static const char *TAG = "ota_pull";
 
 /* The channel document is small by design. A cap rather than a growing buffer
@@ -169,7 +178,7 @@ done:
 static void check_task(void *arg)
 {
     (void)arg;
-    static char doc[CHANNEL_DOC_MAX];
+    EXT_RAM_BSS_ATTR static char doc[CHANNEL_DOC_MAX];
 
     char ssid[APP_SETTINGS_OTA_SSID_CAP] = {0};
     char pass[APP_SETTINGS_OTA_PASS_CAP] = {0};

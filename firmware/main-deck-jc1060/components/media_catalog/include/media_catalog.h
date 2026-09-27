@@ -14,6 +14,7 @@ typedef struct {
     char title[96];
     char artist[64];
     char album[64];
+    char key[16];                 /* v275: PDB key name for the deck */
 } media_catalog_track_t;
 
 typedef struct {

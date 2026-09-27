@@ -861,12 +861,21 @@ not yet hardware-validated. See
 - [ ] Verify GPIO12 conflict resolution: software I2C on GPIO14/15 for touch
       and codec while hardware I2S uses GPIO12/13.
 
-### Phase 2: LVGL UI Port (planned, after Phase 1 acceptance)
+### Phase 2: LVGL UI Port (dj_ui, code done)
 
-- [ ] Copy UI components from `main-deck-p4/components/ui/`.
-- [ ] Adapt layouts for 1024x600 native landscape.
-- [ ] Remove PPA rotation (native landscape, no rotation needed).
-- [ ] Validate DSI-synchronised dual-waveform at 1024x600.
+The JC1060 UI is the `dj_ui` layer only (`docs/UI_MIGRATION_PLAN_DJUI.md`,
+phases 0-6 done, v293 removed the legacy widgets and
+`CONFIG_UI_PRESENTATION_DJUI`).
+
+- [x] Port UI components from `main-deck-p4/components/ui/`.
+- [x] Adapt layouts for 1024x600 native landscape (`dj_ui`, 40 px tab row
+      with status line instead of the 54 px top bar).
+- [x] Remove PPA rotation (native landscape, no rotation needed).
+- [x] `tests/ui_simulator/run_ui_simulator_e2e_jc1060.sh` green (22 captures).
+- [ ] Firmware build without `.cache/djui.defaults` (the overlay is obsolete).
+- [ ] HIL: two decks playing, zoom min/max, tab switches, screensaver,
+      blackout, seek, PLAY/CUE/MT, controller hotplug; no DSI underrun or
+      LVGL stall report.
 
 ### Phase 3: DDJ-400 Integration (planned, after Phase 2)
 

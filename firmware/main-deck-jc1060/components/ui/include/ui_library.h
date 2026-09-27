@@ -69,49 +69,22 @@ int ui_library_page_selection_after_delta(int total_tracks,
 #include "ui_frame_context.h"
 
 typedef struct {
-    lv_style_t *screen_bg;
-    lv_style_t *btn_primary;
-    lv_style_t *btn_secondary;
-    lv_style_t *btn_disabled;
-    lv_style_t *pressed;
-} ui_library_styles_t;
-
-typedef struct {
     void (*status_hold)(const char *text, lv_color_t color, uint32_t hold_ms);
-    lv_color_t (*status_color_for_text)(const char *status);
-    void (*cache_invalidate)(void);
-    void (*set_header_track)(const char *title, const char *artist, uint16_t bpm);
     void (*clear_deck_track_info)(uint8_t deck);
     void (*set_deck_track_info)(uint8_t deck,
                                 const char *title,
                                 const char *artist,
+                                const char *key,
                                 uint16_t bpm,
                                 uint32_t duration_ms);
     void (*set_deck_anlz)(uint8_t deck, const anlz_metadata_t *meta);
-    void (*load_waveform_data)(uint8_t deck,
-                               uint32_t duration_ms,
-                               const uint8_t waveform_low[400],
-                               bool has_waveform,
-                               const anlz_metadata_t *meta);
-    void (*set_loop_shadow)(uint8_t deck,
-                            bool active,
-                            uint32_t start_ms,
-                            uint32_t end_ms,
-                            int beats);
-    bool (*is_performance_target_active)(uint8_t deck);
-    void (*update_hot_cues)(void);
 } ui_library_actions_t;
 
 typedef struct {
-    ui_library_styles_t styles;
     ui_library_actions_t actions;
-    int hor_res;
-    int content_y;
-    int content_h;
 } ui_library_config_t;
 
 void ui_library_init(const ui_library_config_t *config);
-lv_obj_t *ui_library_create(lv_obj_t *parent);
 void ui_library_load_initial_track(void);
 void ui_trigger_library_refresh(void);
 void ui_refresh_library(void);
@@ -126,9 +99,21 @@ uint16_t ui_library_deck_bpm(uint8_t deck, uint16_t fallback_bpm);
 bool ui_library_get_loaded_waveform(uint8_t deck,
                                     const uint8_t **waveform_low,
                                     bool *has_waveform);
-esp_err_t ui_library_load_track_index_for_deck(int index, uint8_t deck);
 esp_err_t ui_library_load_track_identity_for_deck(uint32_t track_key,
                                                    uint32_t generation,
                                                    uint8_t deck);
+
+/* dj_ui Library page callbacks (LVGL task).
+ * Rows are the visible page; sort takes dj_sort_t values. */
+void ui_library_djui_on_select(uint8_t row);
+void ui_library_djui_on_load(uint8_t deck, uint8_t row);
+void ui_library_djui_on_sort(uint8_t sort);
+void ui_library_djui_on_page(int8_t dir);
+void ui_library_djui_on_source(void);
+/* PLAYLISTS / ALL TRACKS / BACK: local export.pdb playlists. */
+void ui_library_djui_on_playlists(void);
+/* Catalog key of the local track the deck holds, for its thumbnail;
+ * 0 = none or a DJ Link download. */
+uint32_t ui_library_deck_artwork_key(uint8_t deck);
 
 #endif

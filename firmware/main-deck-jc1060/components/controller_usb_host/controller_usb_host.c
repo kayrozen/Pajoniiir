@@ -3,7 +3,9 @@
 
 #include <string.h>
 
+#include "esp_cpu.h"
 #include "esp_heap_caps.h"
+#include "esp_rom_sys.h"
 #include "esp_log.h"
 #include "controller_usb_audio_stream.h"
 #include "controller_usb_recovery_gate.h"
@@ -263,6 +265,30 @@ static uint32_t s_restart_participant;
 static inline void count_inc(uint32_t *value)
 {
     (void)__atomic_add_fetch(value, 1u, __ATOMIC_RELAXED);
+}
+
+/* v289 stall probe: what the controller task (core 1, prio 6 while UAC
+ * streams) does while a MIDI fader starves LVGL. CPU cycles, wrapping,
+ * read as differences by controller_usb_host_get_work(). Counters only. */
+static uint32_t s_work_loops;
+static uint32_t s_work_loop_cycles;
+static uint32_t s_work_midi_in_callbacks;
+static uint32_t s_work_midi_in_cycles;
+static uint32_t s_work_midi_in_max_cycles;
+static uint32_t s_work_midi_out_submits;
+static uint32_t s_work_midi_out_wakeups;
+static uint32_t s_work_midi_submit_cycles;
+/* v289: set by the first MIDI OUT producer after the controller task last
+ * started draining the queue, which alone wakes the task; the LED bursts of
+ * one fader move then cost one wakeup instead of one per packet. */
+static bool s_out_wake_pending;
+
+static inline void work_add(uint32_t *total, uint32_t *max, uint32_t spent)
+{
+    (void)__atomic_add_fetch(total, spent, __ATOMIC_RELAXED);
+    if (max && spent > __atomic_load_n(max, __ATOMIC_RELAXED)) {
+        __atomic_store_n(max, spent, __ATOMIC_RELAXED);
+    }
 }
 
 static inline uint32_t ticks_to_ms(TickType_t ticks)
@@ -618,7 +644,10 @@ static esp_err_t submit_in_if_idle(controller_state_t *state)
     state->in_transfer->bEndpointAddress = state->identity.midi.in_ep_addr;
     state->in_transfer->num_bytes = usb_round_up_to_mps(
         DEFAULT_TRANSFER_BYTES, state->identity.midi.in_ep_mps);
+    const uint32_t submit_start = esp_cpu_get_cycle_count();
     const esp_err_t rc = usb_host_transfer_submit(state->in_transfer);
+    work_add(&s_work_midi_submit_cycles, NULL,
+             esp_cpu_get_cycle_count() - submit_start);
     if (rc == ESP_OK) {
         state->in_active = true;
     } else {
@@ -630,6 +659,9 @@ static esp_err_t submit_in_if_idle(controller_state_t *state)
 
 static esp_err_t submit_out_if_idle(controller_state_t *state)
 {
+    /* Before any drain: a packet queued after this point wakes the task
+     * again (controller_usb_host_send_packet). */
+    __atomic_store_n(&s_out_wake_pending, false, __ATOMIC_SEQ_CST);
     if (!state->opened || !state->claimed || state->closing ||
         !state->out_transfer || state->out_active || !state->out_queue) {
         return ESP_OK;
@@ -657,7 +689,11 @@ static esp_err_t submit_out_if_idle(controller_state_t *state)
     state->out_transfer->device_handle = state->device;
     state->out_transfer->bEndpointAddress = state->identity.midi.out_ep_addr;
     state->out_transfer->num_bytes = (int)(packets * 4u);
+    const uint32_t submit_start = esp_cpu_get_cycle_count();
     const esp_err_t rc = usb_host_transfer_submit(state->out_transfer);
+    work_add(&s_work_midi_submit_cycles, NULL,
+             esp_cpu_get_cycle_count() - submit_start);
+    count_inc(&s_work_midi_out_submits);
     if (s_midi_out_submit_logged < MIDI_OUT_LOG_LIMIT) {
         s_midi_out_submit_logged++;
         const uint8_t *b = state->out_transfer->data_buffer;
@@ -683,7 +719,7 @@ static esp_err_t submit_out_if_idle(controller_state_t *state)
     return rc;
 }
 
-static void midi_in_callback(usb_transfer_t *transfer)
+static void midi_in_callback_body(usb_transfer_t *transfer)
 {
     controller_state_t *state = (controller_state_t *)transfer->context;
     state->in_active = false;
@@ -734,6 +770,15 @@ static void midi_in_callback(usb_transfer_t *transfer)
             ESP_LOGW(TAG, "MIDI IN resubmit: %s", esp_err_to_name(rc));
         }
     }
+}
+
+static void midi_in_callback(usb_transfer_t *transfer)
+{
+    const uint32_t start = esp_cpu_get_cycle_count();
+    midi_in_callback_body(transfer);
+    count_inc(&s_work_midi_in_callbacks);
+    work_add(&s_work_midi_in_cycles, &s_work_midi_in_max_cycles,
+             esp_cpu_get_cycle_count() - start);
 }
 
 static void midi_out_callback(usb_transfer_t *transfer)
@@ -1519,6 +1564,8 @@ static void controller_task(void *arg)
     for (;;) {
         const esp_err_t rc = usb_host_client_handle_events(
             s_state.client, pdMS_TO_TICKS(100));
+        const uint32_t loop_start = esp_cpu_get_cycle_count();
+        count_inc(&s_work_loops);
         if (rc != ESP_OK && rc != ESP_ERR_TIMEOUT) {
             ESP_LOGW(TAG, "client events: %s", esp_err_to_name(rc));
         }
@@ -1563,6 +1610,8 @@ static void controller_task(void *arg)
         }
         (void)submit_in_if_idle(&s_state);
         (void)submit_out_if_idle(&s_state);
+        work_add(&s_work_loop_cycles, NULL,
+                 esp_cpu_get_cycle_count() - loop_start);
     }
 }
 
@@ -1643,7 +1692,9 @@ esp_err_t controller_usb_host_send_packet(const uint8_t packet[4])
         count_inc(&s_midi_out_queue_drops);
         return ESP_ERR_TIMEOUT;
     }
-    if (s_state.client) {
+    if (s_state.client &&
+        !__atomic_exchange_n(&s_out_wake_pending, true, __ATOMIC_SEQ_CST)) {
+        count_inc(&s_work_midi_out_wakeups);
         (void)usb_host_client_unblock(s_state.client);
     }
     return ESP_OK;
@@ -1661,6 +1712,36 @@ bool controller_usb_host_get_identity(controller_usb_identity_t *identity_out)
     }
     *identity_out = s_state.identity;
     return true;
+}
+
+void controller_usb_host_get_work(controller_usb_host_work_t *work_out)
+{
+    if (!work_out) {
+        return;
+    }
+    *work_out = (controller_usb_host_work_t) {
+        .cpu_ticks_per_us = esp_rom_get_cpu_ticks_per_us(),
+        .loops = __atomic_load_n(&s_work_loops, __ATOMIC_RELAXED),
+        .loop_cycles = __atomic_load_n(&s_work_loop_cycles, __ATOMIC_RELAXED),
+        .midi_in_callbacks =
+            __atomic_load_n(&s_work_midi_in_callbacks, __ATOMIC_RELAXED),
+        .midi_in_cycles =
+            __atomic_load_n(&s_work_midi_in_cycles, __ATOMIC_RELAXED),
+        .midi_in_max_cycles =
+            __atomic_exchange_n(&s_work_midi_in_max_cycles, 0u,
+                                __ATOMIC_RELAXED),
+        .midi_packets = __atomic_load_n(&s_midi_packets, __ATOMIC_RELAXED),
+        .midi_out_submits =
+            __atomic_load_n(&s_work_midi_out_submits, __ATOMIC_RELAXED),
+        .midi_out_wakeups =
+            __atomic_load_n(&s_work_midi_out_wakeups, __ATOMIC_RELAXED),
+        .midi_submit_cycles =
+            __atomic_load_n(&s_work_midi_submit_cycles, __ATOMIC_RELAXED),
+    };
+    controller_usb_audio_stream_get_work(&work_out->isoc_callbacks,
+                                         &work_out->isoc_cycles,
+                                         &work_out->isoc_max_cycles,
+                                         &work_out->isoc_submit_cycles);
 }
 
 void controller_usb_host_get_diagnostics(
@@ -1747,6 +1828,11 @@ bool controller_usb_host_audio_pace_ready(size_t frame_count,
 uint32_t controller_usb_host_audio_take_pace_low_water(void)
 {
     return controller_usb_audio_stream_take_pace_low_water();
+}
+
+uint32_t controller_usb_host_audio_latency_us(void)
+{
+    return controller_usb_audio_stream_latency_us();
 }
 
 void controller_usb_host_get_audio_stats(

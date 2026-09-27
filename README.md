@@ -100,7 +100,9 @@ The following integration runs on the active
   mounting with hub-port routing (v160-v169), end-to-end pull OTA over
   Ethernet (v126) with flicker-free PSRAM XIP (v142-v147), and a working
   USB-audio (UAC) path to the DDJ-400 (44.1 kHz, 4-channel, 24-bit, hot DSP
-  code relocated to internal RAM, v211-v215). See
+  code relocated to internal RAM, v211-v215). The UI is the `dj_ui` layer
+  only since v293 (legacy widgets removed, see
+  [`docs/UI_MIGRATION_PLAN_DJUI.md`](docs/UI_MIGRATION_PLAN_DJUI.md)). See
   [`firmware/main-deck-jc1060/BRING_UP_GUIDE.md`](firmware/main-deck-jc1060/BRING_UP_GUIDE.md)
   and [`docs/recherche/eth-jc1060p470-phy-is-busy.md`](docs/recherche/eth-jc1060p470-phy-is-busy.md).
 

@@ -70,11 +70,6 @@ const char *ui_settings_master_trim_label(uint8_t preset)
     return s_master_trim_presets[preset].label;
 }
 
-bool ui_settings_is_active_tab(int active_tab, int settings_tab_index)
-{
-    return settings_tab_index >= 0 && active_tab == settings_tab_index;
-}
-
 #ifndef UI_SETTINGS_HOST_TEST
 
 #include "esp_log.h"
@@ -88,257 +83,17 @@ bool ui_settings_is_active_tab(int active_tab, int settings_tab_index)
 #include "esp_system.h"
 #include "firmware_health.h"
 #include "controller_profile_manager.h"
+#include "deck_core.h"
+#include "dj_link.h"
+#include "ui_djui_bridge.h"
 #endif
 
 static const char *TAG = "ui_settings";
 
-typedef struct {
-    bool valid;
-    char text[80];
-} ui_settings_text_cache_t;
-
-typedef struct {
-    bool valid;
-    uint32_t color;
-} ui_settings_color_cache_t;
-
-static ui_settings_config_t s_config;
-static ui_settings_widgets_t s_widgets;
-static lv_obj_t *s_label_brightness_val = NULL;
-static lv_obj_t *s_label_cue_mode = NULL;
-static lv_obj_t *s_label_master_trim = NULL;
-static lv_obj_t *s_label_wifi_remote = NULL;
 static uint8_t s_master_trim_preset = 0;
 static ui_settings_wifi_toggle_cb_t s_wifi_toggle_cb = NULL;
 static ui_settings_recording_toggle_cb_t s_recording_toggle_cb = NULL;
-static lv_obj_t *s_label_main_out = NULL;
-/* v245: controller-dependent labels ("CUE: <NAME>", "MIXER: <NAME>"). */
-static lv_obj_t *s_label_cue_controller = NULL;
-static lv_obj_t *s_label_mixer_controller = NULL;
-static uint32_t s_controller_name_generation = 0;
-static bool s_controller_name_valid = false;
-#ifndef WIN32
-static void ui_settings_update_controller_name_labels(void);
-#endif
-
-static void main_out_event_cb(lv_event_t *event)
-{
-    lv_obj_t *btn = lv_event_get_target(event);
-#ifndef WIN32
-    app_settings_t cfg = app_settings_get();
-    uint8_t next = cfg.main_out_usb ? 0u : 1u;
-    app_settings_set_main_out_usb(next);
-    audio_engine_main_sink_refresh();
-    if (s_label_main_out) {
-        lv_label_set_text(s_label_main_out,
-                          next ? "MAIN: USB (DDJ)" : "MAIN: PCM5102A RCA");
-        lv_obj_set_style_text_color(s_label_main_out,
-                                    next ? COL_ACCENT : COL_GREEN, LV_PART_MAIN);
-    }
-    ESP_LOGI(TAG, "MAIN output: %s", next ? "USB UAC (DDJ)" : "PCM5102A I2S");
-#else
-    (void)btn;
-#endif
-}
-static lv_obj_t *s_label_ui_blackout = NULL;
-
-static void ui_blackout_apply_label(bool on)
-{
-    if (s_label_ui_blackout) {
-        lv_label_set_text(s_label_ui_blackout,
-                          on ? "TEST: UI OFF on PLAY" : "UI render: normal");
-        lv_obj_set_style_text_color(s_label_ui_blackout,
-                                    on ? COL_AMBER : COL_TEXT, LV_PART_MAIN);
-    }
-}
-
-/* v204 play-crash test: freeze all LVGL work while a deck plays (see
- * ui_lvgl_backend.c). Persisted so the test survives a WDT reboot. */
-static void ui_blackout_event_cb(lv_event_t *event)
-{
-    (void)event;
-#ifndef WIN32
-    uint8_t next = app_settings_get().ui_blackout_play ? 0u : 1u;
-    app_settings_set_ui_blackout_play(next);
-    ui_blackout_apply_label(next != 0u);
-    ESP_LOGW(TAG, "TEST UI blackout on PLAY: %s", next ? "ON" : "OFF");
-#endif
-}
-#if CONFIG_AUDIO_RECORDER_ENABLED
-static lv_obj_t *s_btn_rec = NULL;
-static lv_obj_t *s_label_rec_btn = NULL;
-static lv_obj_t *s_label_rec_status = NULL;
-#endif
-static lv_obj_t *s_label_svc_log = NULL;
-static ui_settings_color_cache_t s_cache_controller_color;
-static ui_settings_color_cache_t s_cache_sd_color;
-static int s_cache_controller_state = -1;
-static int s_cache_sd_state = -1;
-static uint32_t s_cache_sd_free_mib = UINT32_MAX;
-static uint32_t s_cache_sd_total_mib = UINT32_MAX;
-static uint32_t s_cache_sd_last_poll_ms = 0;
-static ui_settings_text_cache_t s_cache_sd_text;
-
-static void ui_settings_copy_str(char *dst, size_t dst_len, const char *src)
-{
-    if (!dst || dst_len == 0) {
-        return;
-    }
-    dst[0] = '\0';
-    if (!src) {
-        return;
-    }
-    size_t i = 0;
-    while (i + 1u < dst_len && src[i] != '\0') {
-        dst[i] = src[i];
-        i++;
-    }
-    dst[i] = '\0';
-}
-
-static void ui_settings_label_set_text_cached(lv_obj_t *label,
-                                              ui_settings_text_cache_t *cache,
-                                              const char *text)
-{
-    if (!label || !cache) {
-        return;
-    }
-    const char *safe_text = text ? text : "";
-    if (cache->valid && strncmp(cache->text, safe_text, sizeof(cache->text)) == 0) {
-        return;
-    }
-    lv_label_set_text(label, safe_text);
-    ui_settings_copy_str(cache->text, sizeof(cache->text), safe_text);
-    cache->valid = true;
-}
-
-static void ui_settings_obj_set_text_color_cached(lv_obj_t *obj,
-                                                  ui_settings_color_cache_t *cache,
-                                                  lv_color_t color)
-{
-    if (!obj || !cache) {
-        return;
-    }
-    uint32_t color_u32 = lv_color_to_u32(color);
-    if (cache->valid && cache->color == color_u32) {
-        return;
-    }
-    lv_obj_set_style_text_color(obj, color, LV_PART_MAIN);
-    cache->color = color_u32;
-    cache->valid = true;
-}
-
-static void ui_settings_label_small_caps(lv_obj_t *label, const char *text, lv_color_t color)
-{
-    if (!label) {
-        return;
-    }
-    lv_label_set_text(label, text);
-    lv_obj_set_style_text_font(label, &lv_font_montserrat_12, LV_PART_MAIN);
-    lv_obj_set_style_text_color(label, color, LV_PART_MAIN);
-}
-
-static lv_obj_t *ui_settings_section(lv_obj_t *parent,
-                                     int x,
-                                     int y,
-                                     int w,
-                                     int h,
-                                     const char *title)
-{
-    lv_obj_t *section = lv_obj_create(parent);
-    lv_obj_remove_style_all(section);
-    if (s_config.panel_frame) {
-        lv_obj_add_style(section, s_config.panel_frame, LV_PART_MAIN);
-    }
-    lv_obj_set_size(section, w, h);
-    lv_obj_set_pos(section, x, y);
-    lv_obj_clear_flag(section, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *label = lv_label_create(section);
-    ui_settings_label_small_caps(label, title, COL_TEXT_MUTED);
-    lv_obj_set_pos(label, 14, 12);
-    return section;
-}
-
-static lv_obj_t *ui_settings_value_label(lv_obj_t *parent,
-                                         const char *text,
-                                         lv_color_t color,
-                                         const lv_font_t *font,
-                                         int x,
-                                         int y)
-{
-    lv_obj_t *label = lv_label_create(parent);
-    lv_label_set_text(label, text);
-    lv_obj_set_style_text_font(label, font, LV_PART_MAIN);
-    lv_obj_set_style_text_color(label, color, LV_PART_MAIN);
-    lv_obj_set_pos(label, x, y);
-    return label;
-}
-
-static lv_obj_t *ui_settings_static_tile(lv_obj_t *parent,
-                                         int x,
-                                         int y,
-                                         int w,
-                                         int h,
-                                         const char *text,
-                                         lv_color_t text_color,
-                                         lv_color_t fill_color,
-                                         lv_color_t border_color)
-{
-    lv_obj_t *tile = lv_obj_create(parent);
-    lv_obj_remove_style_all(tile);
-    lv_obj_set_style_bg_color(tile, fill_color, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_color(tile, border_color, LV_PART_MAIN);
-    lv_obj_set_style_border_width(tile, 1, LV_PART_MAIN);
-    lv_obj_set_style_radius(tile, 2, LV_PART_MAIN);
-    lv_obj_set_size(tile, w, h);
-    lv_obj_set_pos(tile, x, y);
-    lv_obj_remove_flag(tile, LV_OBJ_FLAG_CLICKABLE);
-
-    lv_obj_t *label = lv_label_create(tile);
-    lv_label_set_text(label, text);
-    lv_obj_set_style_text_font(label, &lv_font_montserrat_12, LV_PART_MAIN);
-    lv_obj_set_style_text_color(label, text_color, LV_PART_MAIN);
-    lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
-    return tile;
-}
-
-static void ui_settings_style_wireless_switch(lv_obj_t *sw, lv_color_t active_color)
-{
-    if (!sw) {
-        return;
-    }
-
-    lv_obj_set_size(sw, 54, 24);
-    lv_obj_set_style_bg_color(sw, COL_PANEL_DK, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_color(sw, COL_BORDER_LT, LV_PART_MAIN);
-    lv_obj_set_style_border_width(sw, 1, LV_PART_MAIN);
-    lv_obj_set_style_radius(sw, 12, LV_PART_MAIN);
-
-    lv_obj_set_style_bg_color(sw, COL_PANEL_DK, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(sw, active_color, LV_PART_INDICATOR | LV_STATE_CHECKED);
-    lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_PART_INDICATOR | LV_STATE_CHECKED);
-
-    lv_obj_set_style_bg_color(sw, COL_DISABLED, LV_PART_KNOB);
-    lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_PART_KNOB);
-    lv_obj_set_style_bg_color(sw, COL_BG, LV_PART_KNOB | LV_STATE_CHECKED);
-    lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_PART_KNOB | LV_STATE_CHECKED);
-}
-
-static void slider_brightness_event_cb(lv_event_t *event)
-{
-    lv_obj_t *slider = lv_event_get_target(event);
-    int val = lv_slider_get_value(slider);
-    lv_label_set_text_fmt(s_label_brightness_val, "%d%%", val);
-#ifndef WIN32
-    bsp_display_set_backlight((uint8_t)val);
-    app_settings_set_backlight((uint8_t)val);
-#endif
-    ESP_LOGI(TAG, "Backlight brightness set to %d%%", val);
-}
+static ui_settings_dj_link_toggle_cb_t s_dj_link_toggle_cb = NULL;
 
 #ifndef WIN32
 static const char *ui_settings_reset_reason_str(void)
@@ -361,129 +116,66 @@ static const char *ui_settings_reset_reason_str(void)
 }
 #endif
 
-static void wifi_remote_event_cb(lv_event_t *event)
-{
-    lv_obj_t *sw = lv_event_get_target(event);
-    bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
-#ifndef WIN32
-    app_settings_set_wifi_remote(on ? 1 : 0);
-#endif
-    if (s_wifi_toggle_cb) {
-        s_wifi_toggle_cb(on);
-    }
-    if (s_label_wifi_remote) {
-        lv_label_set_text(s_label_wifi_remote, on ? "P4 REMOTE: ON" : "P4 REMOTE: OFF");
-        lv_obj_set_style_text_color(s_label_wifi_remote,
-                                    on ? COL_GREEN : COL_TEXT_DIM, LV_PART_MAIN);
-    }
-    ESP_LOGI(TAG, "Wi-Fi remote: %s", on ? "on" : "off");
-}
-
-#if !defined(WIN32) && CONFIG_AUDIO_RECORDER_ENABLED
-static void ui_settings_update_recording_label(void)
-{
-    audio_recorder_status_t st;
-    if (audio_recorder_get_status(&st) != ESP_OK) {
-        return;
-    }
-    bool active = (st.state == AUDIO_RECORDER_RECORDING ||
-                   st.state == AUDIO_RECORDER_STARTING ||
-                   st.state == AUDIO_RECORDER_STOPPING);
-    if (s_label_rec_btn) {
-        lv_label_set_text(s_label_rec_btn, active ? "STOP REC" : "RECORD");
-    }
-    if (s_label_rec_status) {
-        char buf[48];
-        lv_color_t col = COL_TEXT_DIM;
-        if (st.state == AUDIO_RECORDER_ERROR) {
-            snprintf(buf, sizeof(buf), "SD error - press to reset");
-            col = COL_RED;
-        } else if (active && st.sample_rate > 0u) {
-            uint32_t secs = (uint32_t)(st.frames_written / st.sample_rate);
-            snprintf(buf, sizeof(buf), "REC %02u:%02u  %llu MB",
-                     (unsigned)(secs / 60u), (unsigned)(secs % 60u),
-                     (unsigned long long)(st.bytes_written >> 20));
-            col = COL_RED;
-        } else {
-            snprintf(buf, sizeof(buf), "Master out -> /sd/recordings");
-        }
-        lv_label_set_text(s_label_rec_status, buf);
-        lv_obj_set_style_text_color(s_label_rec_status, col, LV_PART_MAIN);
-    }
-}
-#endif  /* !WIN32 && CONFIG_AUDIO_RECORDER_ENABLED */
-
-#ifndef WIN32
-static void ui_settings_update_service_log_label(void)
-{
-    if (!s_label_svc_log) {
-        return;
-    }
-    service_log_status_t st;
-    if (service_log_get_status(&st) != ESP_OK) {
-        return;
-    }
-    char buf[64];
-    snprintf(buf, sizeof(buf), "SD Log: %s  %luKB  drop %lu",
-             st.available ? "OK" : "off",
-             (unsigned long)(st.current_bytes >> 10),
-             (unsigned long)st.dropped);
-    lv_label_set_text(s_label_svc_log, buf);
-    lv_obj_set_style_text_color(s_label_svc_log,
-                                st.dropped > 0u ? COL_RED
-                                    : (st.available ? COL_TEXT_DIM : COL_TEXT_MUTED),
-                                LV_PART_MAIN);
-}
-#endif  /* !WIN32 */
-
-#if !defined(WIN32) && CONFIG_AUDIO_RECORDER_ENABLED
-static void recording_event_cb(lv_event_t *event)
-{
-    (void)event;
-    if (!s_recording_toggle_cb) {
-        return;
-    }
-    audio_recorder_state_t st = audio_recorder_get_state();
-    bool active = (st == AUDIO_RECORDER_RECORDING || st == AUDIO_RECORDER_STARTING);
-    bool ok = s_recording_toggle_cb(!active);
-    ESP_LOGI(TAG, "recording toggle -> %s (%s)", active ? "stop" : "start",
-             ok ? "ok" : "failed");
-    ui_settings_update_recording_label();
-}
-#endif  /* !WIN32 && CONFIG_AUDIO_RECORDER_ENABLED */
-
 void ui_settings_set_recording_toggle_cb(ui_settings_recording_toggle_cb_t cb)
 {
     s_recording_toggle_cb = cb;
 }
 
 #ifndef WIN32
-static void master_trim_event_cb(lv_event_t *event)
+
+static const char *jog_mode_name(uint8_t cdj)
 {
-    (void)event;
-    s_master_trim_preset = ui_settings_master_trim_next_preset(s_master_trim_preset);
-    float gain = ui_settings_master_trim_gain(s_master_trim_preset);
-    audio_engine_set_master_trim(gain);
-    app_settings_set_master_trim_preset(s_master_trim_preset);
-    if (s_label_master_trim) {
-        lv_label_set_text(s_label_master_trim, ui_settings_master_trim_label(s_master_trim_preset));
-    }
-    ESP_LOGI(TAG, "Master trim set: %s (gain %.3f)",
-             ui_settings_master_trim_label(s_master_trim_preset),
-             (double)gain);
+    return cdj ? "JOG: CDJ" : "JOG: VINYL";
 }
 
-static void cue_mode_event_cb(lv_event_t *event)
+/* v267: persisted jog mode, applied to deck_core at once (docs/JOG_MODES_VINYL_VS_CDJ.md). */
+static uint8_t jog_mode_toggle(void)
 {
-    (void)event;
-    app_settings_t cfg = app_settings_get();
-    uint8_t next = (uint8_t)((cfg.cue_mode + 1u) % 2u);
-    app_settings_set_cue_mode(next);
-    audio_engine_set_cue_mode(next);
-    if (s_label_cue_mode) {
-        lv_label_set_text_fmt(s_label_cue_mode, "%s", ui_settings_cue_mode_name(next));
+    uint8_t next = app_settings_get().jog_cdj_mode ? 0u : 1u;
+    app_settings_set_jog_cdj_mode(next);
+    deck_core_set_jog_cdj_mode(next != 0u);
+    ESP_LOGI(TAG, "Jog mode saved: %s", jog_mode_name(next));
+    return next;
+}
+
+static const char *tempo_range_name(uint8_t pct)
+{
+    switch (pct) {
+    case 6:  return "TEMPO: +/-6%";
+    case 16: return "TEMPO: +/-16%";
+    default: return "TEMPO: +/-10%";
     }
-    ESP_LOGI(TAG, "Cue mode saved: %s", ui_settings_cue_mode_name(next));
+}
+
+/* v275: persisted tempo fader range for both decks, cycles 6 -> 10 -> 16
+ * like Shift+TEMPO RANGE; deck_core rescales the pitch faders on its task. */
+static uint8_t tempo_range_cycle(void)
+{
+    uint8_t cur = (uint8_t)deck_core_get_tempo_range_percent();
+    uint8_t next = cur == 6u ? 10u : (cur == 10u ? 16u : 6u);
+    app_settings_set_tempo_range_pct(next);
+    deck_core_set_tempo_range_percent(next);
+    ESP_LOGI(TAG, "Tempo range saved: %s", tempo_range_name(next));
+    return next;
+}
+
+/* v275: Shift+TEMPO RANGE changes the range on the deck task, which must not
+ * block on NVS; the UI task persists it here, like every other setting.
+ * Returns the live range. */
+static uint8_t tempo_range_sync(void)
+{
+    static uint8_t s_tried;   /* one NVS attempt per value, not one per frame */
+    uint8_t live = (uint8_t)deck_core_get_tempo_range_percent();
+    if (app_settings_get().tempo_range_pct == live) {
+        s_tried = 0u;
+        return live;
+    }
+    if (s_tried != live) {
+        s_tried = live;
+        app_settings_set_tempo_range_pct(live);
+        ESP_LOGI(TAG, "Tempo range saved: %s", tempo_range_name(live));
+    }
+    return live;
 }
 
 #endif
@@ -493,467 +185,304 @@ void ui_settings_set_wifi_toggle_cb(ui_settings_wifi_toggle_cb_t cb)
     s_wifi_toggle_cb = cb;
 }
 
-void ui_settings_configure(const ui_settings_config_t *config)
+void ui_settings_set_dj_link_toggle_cb(ui_settings_dj_link_toggle_cb_t cb)
 {
-    s_config = (ui_settings_config_t){0};
-    if (config) {
-        s_config = *config;
-    }
+    s_dj_link_toggle_cb = cb;
 }
 
-lv_obj_t *ui_settings_create(lv_obj_t *parent)
-{
-    lv_obj_t *screen = lv_obj_create(parent);
-    lv_obj_remove_style_all(screen);
-    if (s_config.screen_bg) {
-        lv_obj_add_style(screen, s_config.screen_bg, LV_PART_MAIN);
-    }
-    lv_obj_set_size(screen, s_config.hor_res, s_config.content_h);
-    lv_obj_set_pos(screen, 0, s_config.content_y);
+#ifndef WIN32
+
+#endif
 
 #ifndef WIN32
+/* UI migration phase 2: the same settings, actions and polls behind the dj_ui
+ * Settings page. The legacy widgets above are never built in this mode; the
+ * action bodies mirror their event callbacks so the legacy build is untouched. */
+static ui_djui_settings_view_t s_djui_view;
+static bool s_djui_settings_visible;
+static uint32_t s_djui_poll_ms;
+static uint32_t s_djui_link_poll_ms;
+static char s_djui_controller[CPM_ID_MAX];
+static uint32_t s_djui_controller_generation;
+static bool s_djui_controller_valid;
+static char s_djui_link_text[80];
+
+void ui_settings_djui_init(void)
+{
     app_settings_t cfg = app_settings_get();
-    int bl_init = cfg.backlight_pct;
+    ui_djui_settings_view_t *v = &s_djui_view;
+    memset(v, 0, sizeof(*v));
+
+    /* What ui_settings_create() applies at boot. */
     s_master_trim_preset = ui_settings_master_trim_sanitize_preset(cfg.master_trim_preset);
     audio_engine_set_master_trim(ui_settings_master_trim_gain(s_master_trim_preset));
-    bool wifi_remote_init = (cfg.wifi_remote != 0);
-#else
-    int bl_init = 80;
-    s_master_trim_preset = 0;
-    bool wifi_remote_init = false;
-#endif
 
-    const int left_x = 30;
-    const int left_w = 350;
-
-    lv_obj_t *display_section = ui_settings_section(screen, left_x, 20, left_w, 86, "DISPLAY");
-    lv_obj_t *slider_backlight = lv_slider_create(display_section);
-    lv_obj_set_size(slider_backlight, 230, 18);
-    lv_obj_set_pos(slider_backlight, 16, 48);
-    lv_slider_set_range(slider_backlight, 10, 100);
-    lv_slider_set_value(slider_backlight, bl_init, LV_ANIM_OFF);
-    lv_obj_add_event_cb(slider_backlight, slider_brightness_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
-
-    s_label_brightness_val = ui_settings_value_label(display_section, "", COL_TEXT,
-                                                     &lv_font_montserrat_14, 270, 44);
-    lv_label_set_text_fmt(s_label_brightness_val, "%d%%", bl_init);
-
-    lv_obj_t *master_section = ui_settings_section(screen, left_x, 118, left_w, 86, "MASTER OUTPUT");
-    lv_obj_t *btn_master_trim = lv_button_create(master_section);
-    lv_obj_remove_style_all(btn_master_trim);
-    if (s_config.btn_secondary) {
-        lv_obj_add_style(btn_master_trim, s_config.btn_secondary, LV_PART_MAIN);
-    }
-    if (s_config.pressed) {
-        lv_obj_add_style(btn_master_trim, s_config.pressed, LV_STATE_PRESSED);
-    }
-    lv_obj_set_size(btn_master_trim, 168, 32);
-    lv_obj_set_pos(btn_master_trim, 16, 40);
-#ifndef WIN32
-    lv_obj_add_event_cb(btn_master_trim, master_trim_event_cb, LV_EVENT_CLICKED, NULL);
-#endif
-
-    s_label_master_trim = lv_label_create(btn_master_trim);
-    lv_label_set_text(s_label_master_trim, ui_settings_master_trim_label(s_master_trim_preset));
-    lv_obj_set_style_text_font(s_label_master_trim, &lv_font_montserrat_12, LV_PART_MAIN);
-    lv_obj_set_style_text_color(s_label_master_trim, COL_TEXT, LV_PART_MAIN);
-    lv_obj_align(s_label_master_trim, LV_ALIGN_CENTER, 0, 0);
-
-    ui_settings_value_label(master_section,
-                            "Lower if limiter stays active",
-                            COL_TEXT_DIM,
-                            &lv_font_montserrat_12,
-                            198,
-                            48);
-
-    lv_obj_t *output_section = ui_settings_section(screen, left_x, 216, left_w, 86, "OUTPUT");
-    {
-        /* MAIN sink toggle: PCM5102A RCA vs DDJ UAC (runtime, persisted). */
-        bool main_usb_init = false;
-#ifndef WIN32
-        main_usb_init = (cfg.main_out_usb != 0);
-#endif
-        lv_obj_t *btn_main_out = lv_button_create(output_section);
-        lv_obj_remove_style_all(btn_main_out);
-        if (s_config.btn_secondary) {
-            lv_obj_add_style(btn_main_out, s_config.btn_secondary, LV_PART_MAIN);
-        }
-        if (s_config.pressed) {
-            lv_obj_add_style(btn_main_out, s_config.pressed, LV_STATE_PRESSED);
-        }
-        lv_obj_set_size(btn_main_out, 150, 26);
-        lv_obj_set_pos(btn_main_out, 16, 30);
-#ifndef WIN32
-        lv_obj_add_event_cb(btn_main_out, main_out_event_cb, LV_EVENT_CLICKED, NULL);
-#endif
-
-        s_label_main_out = lv_label_create(btn_main_out);
-        lv_label_set_text(s_label_main_out,
-                          main_usb_init ? "MAIN: USB (DDJ)" : "MAIN: PCM5102A RCA");
-        lv_obj_set_style_text_font(s_label_main_out, &lv_font_montserrat_12, LV_PART_MAIN);
-        lv_obj_set_style_text_color(s_label_main_out,
-                                    main_usb_init ? COL_ACCENT : COL_GREEN, LV_PART_MAIN);
-        lv_obj_align(s_label_main_out, LV_ALIGN_CENTER, 0, 0);
-
-        bool ui_blackout_init = false;
-#ifndef WIN32
-        ui_blackout_init = (cfg.ui_blackout_play != 0);
-#endif
-        lv_obj_t *btn_ui_blackout = lv_button_create(output_section);
-        lv_obj_remove_style_all(btn_ui_blackout);
-        if (s_config.btn_secondary) {
-            lv_obj_add_style(btn_ui_blackout, s_config.btn_secondary, LV_PART_MAIN);
-        }
-        if (s_config.pressed) {
-            lv_obj_add_style(btn_ui_blackout, s_config.pressed, LV_STATE_PRESSED);
-        }
-        lv_obj_set_size(btn_ui_blackout, 150, 26);
-        lv_obj_set_pos(btn_ui_blackout, 176, 30);
-#ifndef WIN32
-        lv_obj_add_event_cb(btn_ui_blackout, ui_blackout_event_cb, LV_EVENT_CLICKED, NULL);
-#endif
-
-        s_label_ui_blackout = lv_label_create(btn_ui_blackout);
-        lv_obj_set_style_text_font(s_label_ui_blackout, &lv_font_montserrat_12, LV_PART_MAIN);
-        lv_obj_align(s_label_ui_blackout, LV_ALIGN_CENTER, 0, 0);
-        ui_blackout_apply_label(ui_blackout_init);
-    }
-    s_label_cue_controller = ui_settings_value_label(output_section,
-                            "CUE: USB",
-                            COL_ACCENT,
-                            &lv_font_montserrat_12,
-                            16,
-                            56);
-    ui_settings_value_label(output_section,
+    v->brightness_pct = ui_djui_bridge_brightness_clamp(cfg.backlight_pct);
+    v->wireless_on = cfg.wifi_remote != 0;
+    v->master_trim = ui_settings_master_trim_label(s_master_trim_preset);
+    v->main_out_usb = cfg.main_out_usb != 0;
+    v->ui_blackout_play = cfg.ui_blackout_play != 0;
 #if defined(CONFIG_BSP_ES8311_MONITOR) && CONFIG_BSP_ES8311_MONITOR
-                            "LOCAL: ES8311 monitor",
-                            COL_TEXT_DIM,
-#else
-                            "LOCAL: disabled",
-                            COL_TEXT_DIM,
+    v->local_monitor = true;
 #endif
-                            &lv_font_montserrat_12,
-                            176,
-                            56);
+    v->cue_mode = ui_settings_cue_mode_name(cfg.cue_mode);
+    v->jog_cdj = cfg.jog_cdj_mode != 0u;
+    v->tempo_range_pct = cfg.tempo_range_pct;
+    v->controller_name = s_djui_controller;
+    v->sd_state = UI_DJUI_SD_CHECKING;
 
+    firmware_health_info_t info;
+    if (firmware_health_get_info(&info) == ESP_OK) {
+        v->fw_version = info.version;
+        v->fw_partition = info.partition_label;
+    }
+    esp_reset_reason_t rr = esp_reset_reason();
+    v->reset_reason = ui_settings_reset_reason_str();
+    v->reset_bad = rr == ESP_RST_PANIC || rr == ESP_RST_BROWNOUT || rr == ESP_RST_INT_WDT ||
+                   rr == ESP_RST_TASK_WDT || rr == ESP_RST_WDT;
+
+    v->link_enabled = cfg.dj_link_enable != 0;
+    v->link_status = v->link_enabled ? "DJ LINK: ON" : "DJ LINK: OFF";
+    v->link_tone = v->link_enabled ? DJ_TONE_NORMAL : DJ_TONE_MUTED;
 #if CONFIG_AUDIO_RECORDER_ENABLED
-    /* Compact section that fits the gap between OUTPUT and the full-width
-     * MIXER STATUS bar (y=356): button and status share one row. */
-    lv_obj_t *rec_section = ui_settings_section(screen, left_x, 304, left_w, 48, "RECORDING");
-    s_btn_rec = lv_button_create(rec_section);
-    lv_obj_remove_style_all(s_btn_rec);
-    if (s_config.btn_secondary) {
-        lv_obj_add_style(s_btn_rec, s_config.btn_secondary, LV_PART_MAIN);
-    }
-    if (s_config.pressed) {
-        lv_obj_add_style(s_btn_rec, s_config.pressed, LV_STATE_PRESSED);
-    }
-    lv_obj_set_size(s_btn_rec, 150, 24);
-    lv_obj_set_pos(s_btn_rec, 16, 20);
-#ifndef WIN32
-    lv_obj_add_event_cb(s_btn_rec, recording_event_cb, LV_EVENT_CLICKED, NULL);
-#endif
-    s_label_rec_btn = lv_label_create(s_btn_rec);
-    lv_label_set_text(s_label_rec_btn, "RECORD");
-    lv_obj_set_style_text_font(s_label_rec_btn, &lv_font_montserrat_12, LV_PART_MAIN);
-    lv_obj_set_style_text_color(s_label_rec_btn, COL_TEXT, LV_PART_MAIN);
-    lv_obj_align(s_label_rec_btn, LV_ALIGN_CENTER, 0, 0);
-
-    s_label_rec_status = ui_settings_value_label(rec_section,
-                                                 "-> /sd/recordings",
-                                                 COL_TEXT_DIM,
-                                                 &lv_font_montserrat_12, 176, 24);
-    lv_obj_set_width(s_label_rec_status, 160);
-    lv_label_set_long_mode(s_label_rec_status, LV_LABEL_LONG_CLIP);
-
-#endif  /* CONFIG_AUDIO_RECORDER_ENABLED */
-
-    lv_obj_t *status_section = ui_settings_section(screen, 410, 20, 360, 210, "SYSTEM STATUS");
-
-    lv_obj_t *label_controller_status =
-        ui_settings_value_label(status_section,
-                                "Controller (USB1): Disconnected",
-                                COL_RED, &lv_font_montserrat_12, 16, 40);
-    lv_obj_set_width(label_controller_status, 320);
-    lv_label_set_long_mode(label_controller_status, LV_LABEL_LONG_CLIP);
-
-    ui_settings_value_label(status_section, "SD Card", COL_TEXT_MUTED,
-                            &lv_font_montserrat_12, 16, 76);
-    lv_obj_t *label_sd_status =
-        ui_settings_value_label(status_section, "Checking /sd...",
-                                COL_TEXT_DIM, &lv_font_montserrat_12, 16, 96);
-    lv_obj_set_width(label_sd_status, 320);
-    lv_label_set_long_mode(label_sd_status, LV_LABEL_LONG_CLIP);
-
-    s_label_svc_log = ui_settings_value_label(status_section, "SD Log: --",
-                                              COL_TEXT_DIM, &lv_font_montserrat_12, 16, 118);
-    lv_obj_set_width(s_label_svc_log, 320);
-    lv_label_set_long_mode(s_label_svc_log, LV_LABEL_LONG_CLIP);
-
-#ifndef WIN32
-    {
-        firmware_health_info_t info;
-        char p4_text[80];
-        if (firmware_health_get_info(&info) == ESP_OK) {
-            snprintf(p4_text, sizeof(p4_text), "P4: %s [%s]",
-                     info.version, info.partition_label);
-        } else {
-            snprintf(p4_text, sizeof(p4_text), "P4: firmware status unavailable");
-        }
-        ui_settings_value_label(status_section, p4_text,
-                                COL_GREEN, &lv_font_montserrat_12, 16, 146);
-    }
+    v->rec_state = UI_DJUI_REC_IDLE;
 #else
-    {
-        ui_settings_value_label(status_section, "P4: Simulator Mode",
-                                COL_GREEN, &lv_font_montserrat_12, 16, 146);
-    }
-#endif
-#ifndef WIN32
-    {
-        esp_reset_reason_t rr = esp_reset_reason();
-        bool rr_bad = (rr == ESP_RST_PANIC || rr == ESP_RST_BROWNOUT ||
-                       rr == ESP_RST_INT_WDT || rr == ESP_RST_TASK_WDT ||
-                       rr == ESP_RST_WDT);
-        char rr_buf[64];
-        snprintf(rr_buf, sizeof(rr_buf), "Last reset: %s", ui_settings_reset_reason_str());
-        ui_settings_value_label(status_section, rr_buf,
-                                rr_bad ? COL_RED : COL_TEXT_DIM,
-                                &lv_font_montserrat_12, 16, 174);
-    }
+    v->rec_state = UI_DJUI_REC_OFF;
 #endif
 
-    lv_obj_t *wifi_section = ui_settings_section(screen, 410, 240, 360, 82, "WIRELESS");
-    lv_obj_t *sw_wifi = lv_switch_create(wifi_section);
-    ui_settings_style_wireless_switch(sw_wifi, COL_GREEN);
-    lv_obj_set_pos(sw_wifi, 16, 38);
-    lv_obj_add_event_cb(sw_wifi, wifi_remote_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
-    if (wifi_remote_init) {
-        lv_obj_add_state(sw_wifi, LV_STATE_CHECKED);
-    }
-
-    s_label_wifi_remote = ui_settings_value_label(wifi_section,
-                                                  wifi_remote_init ? "P4 REMOTE: ON" : "P4 REMOTE: OFF",
-                                                  wifi_remote_init ? COL_GREEN : COL_TEXT_DIM,
-                                                  &lv_font_montserrat_14,
-                                                  96, 41);
-
-    lv_obj_t *mixer_section = ui_settings_section(screen, 30, 356, 740, 64, "MIXER STATUS");
-    lv_obj_t *mixer_tile = ui_settings_static_tile(mixer_section, 18, 34, 110, 22,
-                                                   "MIXER: USB", COL_TEXT_MUTED,
-                                                   COL_PANEL_DK, COL_BORDER);
-    s_label_mixer_controller = lv_obj_get_child(mixer_tile, 0);
-    if (s_label_mixer_controller) {
-        /* Long profile names must stay inside the 110 px tile. */
-        lv_label_set_long_mode(s_label_mixer_controller, LV_LABEL_LONG_MODE_DOTS);
-        lv_obj_set_width(s_label_mixer_controller, 104);
-        lv_obj_set_style_text_align(s_label_mixer_controller, LV_TEXT_ALIGN_CENTER,
-                                    LV_PART_MAIN);
-        lv_obj_align(s_label_mixer_controller, LV_ALIGN_CENTER, 0, 0);
-    }
-    s_controller_name_valid = false;
-#ifndef WIN32
-    ui_settings_update_controller_name_labels();
-#endif
-    ui_settings_static_tile(mixer_section, 140, 34, 104, 22,
-                            "CH FADERS", COL_ACCENT, COL_PANEL_DK, COL_BORDER);
-    ui_settings_static_tile(mixer_section, 256, 34, 112, 22,
-                            "CROSSFADER", COL_TEXT_MUTED, COL_PANEL_DK, COL_BORDER);
-    ui_settings_static_tile(mixer_section, 380, 34, 104, 22,
-                            "PFL D1/D2", COL_AMBER, COL_PANEL_DK, COL_BORDER);
-
-    lv_obj_t *btn_cue = lv_button_create(mixer_section);
-    lv_obj_remove_style_all(btn_cue);
-    if (s_config.btn_secondary) {
-        lv_obj_add_style(btn_cue, s_config.btn_secondary, LV_PART_MAIN);
-    }
-    if (s_config.pressed) {
-        lv_obj_add_style(btn_cue, s_config.pressed, LV_STATE_PRESSED);
-    }
-    lv_obj_set_size(btn_cue, 142, 22);
-    lv_obj_set_pos(btn_cue, 570, 34);
-#ifndef WIN32
-    lv_obj_add_event_cb(btn_cue, cue_mode_event_cb, LV_EVENT_CLICKED, NULL);
-#endif
-
-    s_label_cue_mode = lv_label_create(btn_cue);
-#ifndef WIN32
-    lv_label_set_text_fmt(s_label_cue_mode, "%s", ui_settings_cue_mode_name(cfg.cue_mode));
-#else
-    lv_label_set_text(s_label_cue_mode, "CUE: STEREO");
-#endif
-    lv_obj_set_style_text_font(s_label_cue_mode, &lv_font_montserrat_12, LV_PART_MAIN);
-    lv_obj_set_style_text_color(s_label_cue_mode, COL_TEXT, LV_PART_MAIN);
-    lv_obj_align(s_label_cue_mode, LV_ALIGN_CENTER, 0, 0);
-
-    ui_settings_widgets_t settings_widgets = {
-        .controller_status = label_controller_status,
-        .sd_status = label_sd_status,
-    };
-    ui_settings_init(&settings_widgets);
-    ui_settings_refresh_storage();
-
-    return screen;
+    s_djui_settings_visible = false;
+    s_djui_poll_ms = 0;
+    s_djui_link_poll_ms = 0;
+    s_djui_controller[0] = '\0';
+    s_djui_controller_valid = false;
+    ui_djui_bridge_settings_invalidate();
 }
 
-void ui_settings_init(const ui_settings_widgets_t *widgets)
+void ui_settings_djui_set_visible(bool visible)
 {
-    memset(&s_widgets, 0, sizeof(s_widgets));
-    if (widgets) {
-        s_widgets = *widgets;
+    if (visible && !s_djui_settings_visible) {
+        s_djui_poll_ms = 0;   /* fresh SD / log / recorder values on entry */
     }
-    ui_settings_invalidate();
+    s_djui_settings_visible = visible;
 }
 
-void ui_settings_invalidate(void)
+static void ui_settings_djui_poll_link(ui_djui_settings_view_t *v, uint32_t now_ms)
 {
-    s_cache_controller_color.valid = false;
-    s_cache_sd_color.valid = false;
-    s_cache_controller_state = -1;
-    s_cache_sd_state = -1;
-    s_cache_sd_free_mib = UINT32_MAX;
-    s_cache_sd_total_mib = UINT32_MAX;
-    s_cache_sd_last_poll_ms = 0;
-    s_cache_sd_text.valid = false;
-}
-
-static void ui_settings_format_storage_size(uint64_t bytes, char *out, size_t out_size)
-{
-    const uint64_t gib = 1024ull * 1024ull * 1024ull;
-    const uint64_t mib = 1024ull * 1024ull;
-    uint64_t scale = mib;
-    const char *unit = "MB";
-    if (bytes >= gib) {
-        scale = gib;
-        unit = "GB";
-    }
-
-    uint64_t whole = bytes / scale;
-    uint64_t frac = ((bytes % scale) * 10ull) / scale;
-    snprintf(out, out_size, "%llu.%llu %s",
-             (unsigned long long)whole,
-             (unsigned long long)frac,
-             unit);
-}
-
-#ifndef WIN32
-/* v245: re-read the active profile name only when the profile manager's
- * generation moved (atomic load per frame; try-lock copy on change). */
-static void ui_settings_update_controller_name_labels(void)
-{
-    if (!s_label_cue_controller && !s_label_mixer_controller) {
+    if (!ui_settings_should_poll(now_ms, s_djui_link_poll_ms, false, 500u)) {
         return;
     }
+    s_djui_link_poll_ms = now_ms;
+
+    /* Static: the peer names below point into it until the next poll. */
+    static dj_link_summary_t s_summary;
+    const dj_link_summary_t *summary = &s_summary;
+    dj_link_get_summary(&s_summary);
+    dj_link_format_status(summary, s_djui_link_text, sizeof(s_djui_link_text));
+    v->link_status = s_djui_link_text;
+    v->link_tone = DJ_TONE_MUTED;
+    if (summary->state == DJ_LINK_STATE_WAIT_IP || summary->state == DJ_LINK_STATE_ERROR) {
+        v->link_tone = DJ_TONE_WARN;
+    } else if (summary->state == DJ_LINK_STATE_LISTENING) {
+        v->link_tone = summary->has_master ? DJ_TONE_OK : DJ_TONE_NORMAL;
+    }
+
+    /* Players with a known IP; BPM and flags only for the master, the only
+     * peer the summary carries in full. */
+    uint8_t count = 0;
+    for (uint8_t i = 0; i < summary->player_count && count < DJ_LINK_ROWS; i++) {
+        const dj_link_player_t *p = &summary->players[i];
+        const dj_link_peer_t *m = &summary->master;
+        bool is_master = summary->has_master && m->device_number == p->number;
+        v->link_peers[count++] = (dj_ui_link_peer_t){
+            .number = p->number,
+            .name = p->name,
+            .bpm = is_master ? m->bpm : 0.0f,
+            .master = is_master && summary->master_confirmed,
+            .on_air = is_master && m->has_status && m->on_air,
+            .playing = is_master && m->has_status && m->playing,
+        };
+    }
+    v->link_peer_count = count;
+
+    /* Top bar. Polled at 2 Hz, so the beat-in-bar would lag: left unknown. */
+    v->link_master_valid = summary->state != DJ_LINK_STATE_OFF;
+    v->link_master = (dj_ui_link_master_t){
+        .player = summary->has_master ? summary->master.device_number : 0,
+        .bpm = summary->has_master ? summary->master.bpm : 0.0f,
+        .beat = 0,
+        .confirmed = summary->master_confirmed,
+    };
+}
+
+static void ui_settings_djui_poll_controller(ui_djui_settings_view_t *v)
+{
     uint32_t generation = controller_profile_manager_active_generation();
-    if (s_controller_name_valid && generation == s_controller_name_generation) {
+    if (s_djui_controller_valid && generation == s_djui_controller_generation) {
         return;
     }
     char name[CPM_ID_MAX];
     if (!controller_profile_manager_get_active_short_name(name, sizeof(name))) {
         return;   /* manager busy: retry next frame */
     }
-    const char *shown = name[0] != '\0' ? name : "USB";
-    char text[CPM_ID_MAX + 8];
-    if (s_label_cue_controller) {
-        snprintf(text, sizeof(text), "CUE: %s", shown);
-        lv_label_set_text(s_label_cue_controller, text);
-    }
-    if (s_label_mixer_controller) {
-        snprintf(text, sizeof(text), "MIXER: %s", shown);
-        lv_label_set_text(s_label_mixer_controller, text);
-    }
-    s_controller_name_generation = generation;
-    s_controller_name_valid = true;
+    snprintf(s_djui_controller, sizeof(s_djui_controller), "%s", name);
+    v->controller_name = s_djui_controller;
+    s_djui_controller_generation = generation;
+    s_djui_controller_valid = true;
 }
 
-static void ui_settings_update_controller_status_label(const deck_state_t *state)
+static void ui_settings_djui_poll_page(ui_djui_settings_view_t *v)
 {
-    if (!s_widgets.controller_status || !state) {
-        return;
+    bsp_sd_status_t sd;
+    if (bsp_sd_get_status(&sd) == ESP_OK && sd.mounted) {
+        v->sd_state = UI_DJUI_SD_MOUNTED;
+        v->sd_free_bytes = sd.free_bytes;
+        v->sd_total_bytes = sd.total_bytes;
+    } else {
+        v->sd_state = UI_DJUI_SD_OFFLINE;
     }
 
-    const int display_state = state->controller_connected ? 1 : 0;
-    if (s_cache_controller_state != display_state) {
-        lv_label_set_text(s_widgets.controller_status,
-                          state->controller_connected
-                              ? "Controller (USB1): Connected"
-                              : "Controller (USB1): Disconnected");
-        s_cache_controller_state = display_state;
-    }
-    ui_settings_obj_set_text_color_cached(
-        s_widgets.controller_status, &s_cache_controller_color,
-        state->controller_connected ? COL_GREEN : COL_RED);
-}
-
-static void ui_settings_update_sd_status_label(bool force)
-{
-    if (!s_widgets.sd_status) {
-        return;
+    service_log_status_t log;
+    v->sd_log_valid = service_log_get_status(&log) == ESP_OK;
+    if (v->sd_log_valid) {
+        v->sd_log_available = log.available;
+        v->sd_log_kb = (uint32_t)(log.current_bytes >> 10);
+        v->sd_log_dropped = (uint32_t)log.dropped;
     }
 
-    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ull);
-    if (!ui_settings_should_poll(now_ms, s_cache_sd_last_poll_ms, force, 1000u)) {
-        return;
-    }
-    s_cache_sd_last_poll_ms = now_ms;
-
-    bsp_sd_status_t status;
-    esp_err_t rc = bsp_sd_get_status(&status);
-    if (rc != ESP_OK || !status.mounted) {
-        if (s_cache_sd_state != 0) {
-            ui_settings_label_set_text_cached(s_widgets.sd_status,
-                                              &s_cache_sd_text,
-                                              "Offline (/sd unavailable)");
-            s_cache_sd_state = 0;
-            s_cache_sd_free_mib = UINT32_MAX;
-            s_cache_sd_total_mib = UINT32_MAX;
-        }
-        ui_settings_obj_set_text_color_cached(s_widgets.sd_status, &s_cache_sd_color, COL_RED);
-        return;
-    }
-
-    uint32_t free_mib = (uint32_t)(status.free_bytes / (1024ull * 1024ull));
-    uint32_t total_mib = (uint32_t)(status.total_bytes / (1024ull * 1024ull));
-    if (s_cache_sd_state != 1 ||
-        s_cache_sd_free_mib != free_mib ||
-        s_cache_sd_total_mib != total_mib) {
-        char free_buf[24];
-        char total_buf[24];
-        char text[80];
-        ui_settings_format_storage_size(status.free_bytes, free_buf, sizeof(free_buf));
-        ui_settings_format_storage_size(status.total_bytes, total_buf, sizeof(total_buf));
-        snprintf(text, sizeof(text), "Mounted: %s free / %s", free_buf, total_buf);
-        ui_settings_label_set_text_cached(s_widgets.sd_status, &s_cache_sd_text, text);
-        s_cache_sd_state = 1;
-        s_cache_sd_free_mib = free_mib;
-        s_cache_sd_total_mib = total_mib;
-    }
-    ui_settings_obj_set_text_color_cached(s_widgets.sd_status, &s_cache_sd_color, COL_GREEN);
-}
-
-#endif
-
-void ui_settings_update(const ui_frame_context_t *ctx)
-{
-    if (!ctx || !ui_settings_is_active_tab(ctx->active_tab, s_config.settings_tab_index)) {
-        return;
-    }
-#ifndef WIN32
-    ui_settings_update_controller_status_label(&ctx->deck_state[CTRL_DECK_1]);
-    ui_settings_update_controller_name_labels();
-    ui_settings_update_sd_status_label(false);
 #if CONFIG_AUDIO_RECORDER_ENABLED
-    ui_settings_update_recording_label();
-#endif
-    ui_settings_update_service_log_label();
+    audio_recorder_status_t rec;
+    if (audio_recorder_get_status(&rec) == ESP_OK) {
+        bool active = rec.state == AUDIO_RECORDER_RECORDING || rec.state == AUDIO_RECORDER_STARTING ||
+                      rec.state == AUDIO_RECORDER_STOPPING;
+        v->rec_state = rec.state == AUDIO_RECORDER_ERROR ? UI_DJUI_REC_ERROR
+                       : active                          ? UI_DJUI_REC_ACTIVE
+                                                         : UI_DJUI_REC_IDLE;
+        v->rec_secs = rec.sample_rate > 0u ? (uint32_t)(rec.frames_written / rec.sample_rate) : 0u;
+        v->rec_mb = (uint32_t)(rec.bytes_written >> 20);
+    }
 #endif
 }
 
-void ui_settings_refresh_storage(void)
+void ui_settings_djui_update(const ui_frame_context_t *ctx)
 {
-#ifndef WIN32
-    ui_settings_update_sd_status_label(true);
+    if (!ctx) {
+        return;
+    }
+    ui_djui_settings_view_t *v = &s_djui_view;
+    v->controller_connected = ctx->deck_state[CTRL_DECK_1].controller_connected;
+    bool playing = false;
+    for (uint8_t deck = 0; deck < DECK_CORE_DECK_COUNT; deck++) {
+        playing = playing || ctx->deck_state[deck].playing;
+    }
+    /* Best effort: ui_lvgl_backend stops rendering once it sees the deck
+     * play, so this frame only shows when it was drawn first. */
+    v->blackout_now = v->ui_blackout_play && playing;
+
+    v->tempo_range_pct = tempo_range_sync();
+    ui_settings_djui_poll_link(v, ctx->now_ms);
+    ui_settings_djui_poll_controller(v);
+    if (s_djui_settings_visible &&
+        ui_settings_should_poll(ctx->now_ms, s_djui_poll_ms, false, 1000u)) {
+        s_djui_poll_ms = ctx->now_ms;
+        ui_settings_djui_poll_page(v);
+    }
+    ui_djui_bridge_settings_update(v);
+}
+
+void ui_settings_djui_on_brightness(uint8_t pct)
+{
+    uint8_t val = ui_djui_bridge_brightness_clamp(pct);
+    s_djui_view.brightness_pct = val;
+    bsp_display_set_backlight(val);
+    app_settings_set_backlight(val);
+    ESP_LOGI(TAG, "Backlight brightness set to %u%%", (unsigned)val);
+}
+
+void ui_settings_djui_on_wireless(bool on)
+{
+    s_djui_view.wireless_on = on;
+    app_settings_set_wifi_remote(on ? 1 : 0);
+    if (s_wifi_toggle_cb) {
+        s_wifi_toggle_cb(on);
+    }
+    ESP_LOGI(TAG, "Wi-Fi remote: %s", on ? "on" : "off");
+}
+
+void ui_settings_djui_on_link(bool on)
+{
+    ui_djui_settings_view_t *v = &s_djui_view;
+    app_settings_set_dj_link_enable(on ? 1 : 0);
+    if (s_dj_link_toggle_cb) {
+        s_dj_link_toggle_cb(on);
+    }
+    /* Show the switch position now; the next poll brings the observer state. */
+    v->link_enabled = on;
+    v->link_status = on ? "DJ LINK: ON" : "DJ LINK: OFF";
+    v->link_tone = on ? DJ_TONE_NORMAL : DJ_TONE_MUTED;
+    s_djui_link_poll_ms = 0;
+    ESP_LOGI(TAG, "DJ Link: %s", on ? "on" : "off");
+}
+
+void ui_settings_djui_on_record(void)
+{
+#if CONFIG_AUDIO_RECORDER_ENABLED
+    if (!s_recording_toggle_cb) {
+        return;
+    }
+    audio_recorder_state_t st = audio_recorder_get_state();
+    bool active = (st == AUDIO_RECORDER_RECORDING || st == AUDIO_RECORDER_STARTING);
+    bool ok = s_recording_toggle_cb(!active);
+    ESP_LOGI(TAG, "recording toggle -> %s (%s)", active ? "stop" : "start", ok ? "ok" : "failed");
+    ui_settings_djui_poll_page(&s_djui_view);
 #endif
 }
+
+void ui_settings_djui_on_field(dj_field_t field)
+{
+    ui_djui_settings_view_t *v = &s_djui_view;
+    switch (field) {
+    case DJ_F_MASTER: {
+        s_master_trim_preset = ui_settings_master_trim_next_preset(s_master_trim_preset);
+        float gain = ui_settings_master_trim_gain(s_master_trim_preset);
+        audio_engine_set_master_trim(gain);
+        app_settings_set_master_trim_preset(s_master_trim_preset);
+        v->master_trim = ui_settings_master_trim_label(s_master_trim_preset);
+        ESP_LOGI(TAG, "Master trim set: %s (gain %.3f)", v->master_trim, (double)gain);
+        break;
+    }
+    case DJ_F_OUT_MAIN: {
+        uint8_t next = app_settings_get().main_out_usb ? 0u : 1u;
+        app_settings_set_main_out_usb(next);
+        audio_engine_main_sink_refresh();
+        v->main_out_usb = next != 0u;
+        ESP_LOGI(TAG, "MAIN output: %s", next ? "USB UAC (DDJ)" : "PCM5102A I2S");
+        break;
+    }
+    case DJ_F_UI_RENDER: {
+        uint8_t next = app_settings_get().ui_blackout_play ? 0u : 1u;
+        app_settings_set_ui_blackout_play(next);
+        v->ui_blackout_play = next != 0u;
+        ESP_LOGW(TAG, "TEST UI blackout on PLAY: %s", next ? "ON" : "OFF");
+        break;
+    }
+    case DJ_F_MIX_CUE: {
+        uint8_t next = (uint8_t)((app_settings_get().cue_mode + 1u) % 2u);
+        app_settings_set_cue_mode(next);
+        audio_engine_set_cue_mode(next);
+        v->cue_mode = ui_settings_cue_mode_name(next);
+        ESP_LOGI(TAG, "Cue mode saved: %s", v->cue_mode);
+        break;
+    }
+    case DJ_F_MIX_JOG:
+        v->jog_cdj = jog_mode_toggle() != 0u;
+        break;
+    case DJ_F_MIX_TEMPO:
+        v->tempo_range_pct = tempo_range_cycle();
+        break;
+    default:
+        break;   /* DJ_F_LOCAL: build-time route, nothing to toggle */
+    }
+}
+#endif  /* !WIN32 */
 
 #endif

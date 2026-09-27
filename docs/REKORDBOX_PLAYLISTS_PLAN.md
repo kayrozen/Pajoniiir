@@ -1,6 +1,32 @@
 # Rekordbox Playlists — Integration Plan (jc1060)
 
-Status: proposal, not started. Owner: agent + operator review.
+Status (2026-09-27): phases 1, 2, 3 and 5 (host) implemented, not built or
+HIL-tested yet. Phase 0 was skipped: the table IDs (0x07 PlaylistTree, 0x08
+PlaylistEntries) and row layouts come from crate-digger and are documented in
+`docs/rekordbox-format-analysis.md`. Phase 4 (controller mapping) is open.
+Owner: agent + operator review.
+
+## Implemented (2026-09-27)
+
+- `rekordbox_pdb.c`: `pdb_playlist_count()`, `pdb_get_playlist()`,
+  `pdb_playlist_track_ids()`; tree nodes + entries in PSRAM, entries sorted by
+  (playlist_id, entry_index), caps 256 nodes / 8192 entries.
+- `library_playlists.c`: flattened list (depth-first, siblings by sort_order,
+  folder name kept per playlist), entries resolved against the published
+  catalog ids (missing counted, duplicates kept). Built in `library_init()`,
+  published and freed with the track store (same lock, same generation).
+- `library.h`: `library_playlist_count()`, `library_playlist_get()`,
+  `library_playlist_track_keys()`. Keys are catalog track keys (= track_id),
+  so a playlist survives a catalog sort.
+- `ui_library.c` (dj_ui presentation): PLAYLISTS button in the Library
+  sidebar. ALL TRACKS -> playlist list (name, folder, `N TR`) -> tap or LOAD
+  opens a playlist -> its tracks load like the normal browse; the button reads
+  ALL TRACKS / BACK. Sorting is refused inside playlists (rekordbox order);
+  DJ Link peer sources, USB removal and catalog rebuilds return to ALL. At most
+  2048 tracks per opened playlist (PSRAM buffer allocated once).
+- Host test: `tests/rekordbox_pdb_playlists_jc1060` (synthetic PDB).
+- Not done: the legacy (non-dj_ui) table has no PLAYLISTS button; no
+  controller BACK / category mapping (Phase 4).
 
 ## Goal
 

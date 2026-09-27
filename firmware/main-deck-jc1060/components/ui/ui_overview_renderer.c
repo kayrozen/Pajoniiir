@@ -11,6 +11,9 @@
 #define WAVE_TIP_PALETTE_INDEX 4
 #define WAVE_TIP_MIN_BAR_PX 6
 
+/* Zoom columns sampled per block on the stack (v285). */
+#define WAVE_COLUMN_BLOCK 64
+
 /* Active-loop region highlight on the main (zoom) waveform: columns inside the
  * loop get an amber background (palette index 10) and the loop in/out edges get
  * a bright white marker line (reuses the white tip index). */
@@ -624,11 +627,34 @@ void ui_overview_renderer_draw_main_rgb565_column_span_cues(uint16_t *pixels,
 
     if (source && source->kind != UI_WAVEFORM_SOURCE_NONE && source->samples &&
         source->sample_count > 0 && duration_ms > 0 && window_ms > 0) {
+        /* v285: main_waveform_column_for_display sampled each column three
+         * times (itself and both neighbours as their centre). Sample every
+         * column once per block, then keep the same winner: centre, left on a
+         * strictly higher peak, then right. Out-of-range neighbours are
+         * zero columns, which never win. */
+        ui_waveform_column_t sampled[WAVE_COLUMN_BLOCK + 2];
         for (int i = 0; i < column_count; i++) {
             int logical_x = logical_x_px + i;
             int dest_x = dest_x_px + i;
-            ui_waveform_column_t col = main_waveform_column_for_display(
-                source, duration_ms, window_start_ms, window_ms, logical_x, logical_width_px);
+            int k = i % WAVE_COLUMN_BLOCK;
+            if (k == 0) {
+                int n = column_count - i;
+                if (n > WAVE_COLUMN_BLOCK) {
+                    n = WAVE_COLUMN_BLOCK;
+                }
+                for (int j = 0; j < n + 2; j++) {
+                    sampled[j] = ui_waveform_column_for_column(
+                        source, duration_ms, window_start_ms, window_ms,
+                        logical_x - 1 + j, logical_width_px);
+                }
+            }
+            ui_waveform_column_t col = sampled[k + 1];
+            if (sampled[k].peak > col.peak) {
+                col = sampled[k];
+            }
+            if (sampled[k + 2].peak > col.peak) {
+                col = sampled[k + 2];
+            }
             int amp = col.peak;
             int h = 2 + (amp * (height_px - 8)) / 31;
             if (h < 1) h = 1;
@@ -695,20 +721,28 @@ void ui_overview_renderer_draw_main_rgb565_column_span_cues(uint16_t *pixels,
             }
             int cue_x = (int)(((int64_t)cues[c].start_ms - window_start_ms) *
                               (int64_t)logical_width_px / (int64_t)window_ms);
-            if (cue_x < logical_x_px || cue_x >= logical_x_px + column_count) {
+            /* v285: the head is 3 px wide and may start in the previous span
+             * (strip tiles, ring wrap, edge batches). */
+            if (cue_x + 2 < logical_x_px || cue_x >= logical_x_px + column_count) {
                 continue;
             }
-            int dest_x = dest_x_px + (cue_x - logical_x_px);
             uint16_t cue_color = rgb565_palette_color(palette, palette_count,
                                                       WAVE_CUE_BASE_PALETTE_INDEX + slot);
-            for (int y = 0; y < height_px; y++) {
-                pixels[y * stride_px + dest_x] = cue_color;
+            if (cue_x >= logical_x_px) {
+                int dest_x = dest_x_px + (cue_x - logical_x_px);
+                for (int y = 0; y < height_px; y++) {
+                    pixels[y * stride_px + dest_x] = cue_color;
+                }
             }
             for (int hx = 0; hx < 3; hx++) {
-                int head_dx = dest_x + hx;
-                if (head_dx >= dest_x_px + column_count || head_dx >= stride_px) {
+                int head_x = cue_x + hx;
+                if (head_x < logical_x_px) {
+                    continue;
+                }
+                if (head_x >= logical_x_px + column_count) {
                     break;
                 }
+                int head_dx = dest_x_px + (head_x - logical_x_px);
                 for (int y = 0; y < head_h; y++) {
                     pixels[y * stride_px + head_dx] = cue_color;
                 }

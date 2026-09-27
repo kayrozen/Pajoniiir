@@ -30,6 +30,10 @@ USB:/
     rekordbox/
       export.pdb         ← Pioneer Hardware Database (title, artist, anlz path, ...)
       exportLibrary.db   ← encrypted / OneLibrary database (NOT USED; export.pdb is primary when present)
+    Artwork/
+      00001/
+        a3.jpg           ← cover thumbnail 80x80 (baseline JPEG), path in the Artwork table
+        a3_m.jpg         ← same cover 240x240 (not referenced by export.pdb)
     USBANLZ/
       P000/
         00000832/
@@ -108,6 +112,7 @@ Subtype `0x0024` at offset 0 identifies a track row.
 
 | Offset | Type | Content |
 |--------|-----|---------|
+| +0x1C | uint32 LE | artwork_id (0 = none), see Artwork rows |
 | +0x38 | uint32 LE | BPM × 100 |
 | +0x3C | uint32 LE | genre_id |
 | +0x40 | uint32 LE | album_id |
@@ -127,6 +132,62 @@ String indices in the offset table:
 | 18 | title |
 | 19 | filename |
 | 20 | file_path — `/Contents/...` |
+
+### Playlist rows (JC1060, `rekordbox_pdb.c`)
+
+Layouts from crate-digger (`rekordbox_pdb.ksy`), parsed additively by the
+jc1060 library component; covered by `tests/rekordbox_pdb_playlists_jc1060`.
+
+**PlaylistTree (0x07)** — one row per folder or playlist:
+
+| Offset | Type | Content |
+|--------|------|---------|
+| +0x00 | uint32 LE | parent_id (0 = root) |
+| +0x04 | uint32 LE | unknown |
+| +0x08 | uint32 LE | sort_order among siblings |
+| +0x0C | uint32 LE | id (0 is skipped) |
+| +0x10 | uint32 LE | raw_is_folder (non-zero = folder) |
+| +0x14 | DeviceSQL string | name |
+
+**PlaylistEntries (0x08)** — fixed 12-byte rows:
+
+| Offset | Type | Content |
+|--------|------|---------|
+| +0x00 | uint32 LE | entry_index (order inside the playlist) |
+| +0x04 | uint32 LE | track_id (joins Tracks +0x48) |
+| +0x08 | uint32 LE | playlist_id (joins PlaylistTree id) |
+
+Rows are not stored in playlist order: the parser sorts entries by
+(playlist_id, entry_index). Caps: 256 tree nodes, 8192 entries
+(`playlists_truncated` in the import stats). The Library flattens the tree
+depth-first (siblings by sort_order); folders are not rows, each playlist
+shows its immediate folder. Entries whose track is not in the published
+catalog are skipped and counted as `missing`; duplicates keep their order.
+
+### Artwork rows (JC1060, `rekordbox_pdb.c`)
+
+**Artwork (0x0D)**, one row per cover, joined from the track row's
+`artwork_id` (+0x1C):
+
+| Offset | Type | Content |
+|--------|------|---------|
+| +0x00 | uint32 LE | id (0 skipped) |
+| +0x04 | DeviceSQL | path, e.g. `/PIONEER/Artwork/00001/a3.jpg` |
+
+Checked on a real export (52 tracks, 28 covers, 28/28 tracks resolved,
+2026-09-27): plain `.jpg` files, no `.DAT` container. The table points at the
+80x80 `aN.jpg`; rekordbox writes `aN_m.jpg` (240x240) next to it without a
+PDB row. The jc1060 parser keeps absolute paths that fit 64 bytes, at most
+1024 rows (PSRAM, sorted by id); `library_artwork_path_for_key()` resolves a
+catalog track key to `/usb/PIONEER/Artwork/...`. Covered by
+`tests/rekordbox_pdb_artwork_jc1060` (synthetic PDB, optional real PDB).
+
+The dj_ui presentation decodes these JPEGs off the LVGL task
+(`ui_artwork.c`: worker on core 1, priority 1, reads under `media_io_gate`,
+paused during track loads) with LVGL's TJpgDec (`CONFIG_LV_USE_TJPGD`) into
+40x40 row and 34x34 deck RGB565 thumbnails (`ui_artwork_thumb.c`), cached in
+24 PSRAM slots (LRU, invalidated by the library generation). Baseline JPEGs
+only: TJpgDec refuses progressive files, which then show no thumbnail.
 
 ### DeviceSQL string format
 

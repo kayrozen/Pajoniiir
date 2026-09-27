@@ -6,6 +6,7 @@
 
 #include "controller_audio_resampler.h"
 #include "controller_audio_ring.h"
+#include "esp_cpu.h"
 #include "esp_log.h"
 #include "esp_memory_utils.h"
 #include "flx4_uac_descriptors.h"
@@ -157,6 +158,12 @@ static bool s_faulted;
 static uint32_t s_write_gate;
 /* Set by the first pace query of a stream; see STREAM_PACE_CEILING_FRAMES. */
 static bool s_consumer_paced;
+/* v263: ring fill as the UI sees it, smoothed (x16, EMA 1/16 per read,
+ * ~0.5 s at 30 reads/s). The ring part of the output latency the UI
+ * subtracts. Reader-owned: the output task no longer touches it (v262 updated
+ * it per block). 0 = no sample yet. */
+#define STREAM_LATENCY_EMA_SHIFT 4u
+static uint32_t s_latency_ema_x16;
 static void set_accepting(bool accepting)
 {
     if (accepting) __atomic_fetch_or(&s_write_gate, WRITE_ACCEPTING, __ATOMIC_RELEASE);
@@ -365,6 +372,14 @@ static void mark_fault(bool configuration_failure, const char *site,
     lower_to_transition_priority();
 }
 
+/* v289 stall probe: cycles spent in isoc callbacks (controller task, core 1)
+ * and in their URB resubmits, read by controller_usb_audio_stream_get_work().
+ * Counters only. */
+static uint32_t s_work_isoc_callbacks;
+static uint32_t s_work_isoc_cycles;
+static uint32_t s_work_isoc_max_cycles;
+static uint32_t s_work_isoc_submit_cycles;
+
 static esp_err_t prepare_and_submit(usb_transfer_t *transfer)
 {
     const int index = transfer_index(transfer);
@@ -422,14 +437,18 @@ static esp_err_t prepare_and_submit(usb_transfer_t *transfer)
     transfer->bEndpointAddress = s_format.endpoint_addr;
     transfer->num_bytes = (int)offset;
     s_isoc_active[index] = true;
+    const uint32_t submit_start = esp_cpu_get_cycle_count();
     const esp_err_t rc = usb_host_transfer_submit(transfer);
+    __atomic_add_fetch(&s_work_isoc_submit_cycles,
+                       esp_cpu_get_cycle_count() - submit_start,
+                       __ATOMIC_RELAXED);
     if (rc != ESP_OK) {
         s_isoc_active[index] = false;
     }
     return rc;
 }
 
-static void isoc_callback(usb_transfer_t *transfer)
+static void isoc_callback_body(usb_transfer_t *transfer)
 {
     const int index = transfer_index(transfer);
     if (index >= 0) {
@@ -504,6 +523,31 @@ static void isoc_callback(usb_transfer_t *transfer)
             mark_fault(false, "isoc resubmit", rc);
         }
     }
+}
+
+static void isoc_callback(usb_transfer_t *transfer)
+{
+    const uint32_t start = esp_cpu_get_cycle_count();
+    isoc_callback_body(transfer);
+    const uint32_t spent = esp_cpu_get_cycle_count() - start;
+    __atomic_add_fetch(&s_work_isoc_callbacks, 1u, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&s_work_isoc_cycles, spent, __ATOMIC_RELAXED);
+    if (spent > __atomic_load_n(&s_work_isoc_max_cycles, __ATOMIC_RELAXED)) {
+        __atomic_store_n(&s_work_isoc_max_cycles, spent, __ATOMIC_RELAXED);
+    }
+}
+
+void controller_usb_audio_stream_get_work(uint32_t *callbacks,
+                                          uint32_t *cycles,
+                                          uint32_t *max_cycles,
+                                          uint32_t *submit_cycles)
+{
+    *callbacks = __atomic_load_n(&s_work_isoc_callbacks, __ATOMIC_RELAXED);
+    *cycles = __atomic_load_n(&s_work_isoc_cycles, __ATOMIC_RELAXED);
+    *max_cycles = __atomic_exchange_n(&s_work_isoc_max_cycles, 0u,
+                                      __ATOMIC_RELAXED);
+    *submit_cycles = __atomic_load_n(&s_work_isoc_submit_cycles,
+                                     __ATOMIC_RELAXED);
 }
 
 static const char *step_name(uint8_t step)
@@ -1170,6 +1214,25 @@ uint32_t controller_usb_audio_stream_take_pace_low_water(void)
     s_pace_low_water = UINT32_MAX;
     portEXIT_CRITICAL(&s_mux);
     return low;
+}
+
+uint32_t controller_usb_audio_stream_latency_us(void)
+{
+    if ((__atomic_load_n(&s_write_gate, __ATOMIC_ACQUIRE) &
+         WRITE_ACCEPTING) == 0u) {
+        __atomic_store_n(&s_latency_ema_x16, 0u, __ATOMIC_RELAXED);
+        return 0u;
+    }
+    /* Aligned word written under s_mux; a plain load cannot tear, so the
+     * reader never takes the spinlock the isoc callback and writer use. */
+    const uint32_t sample_x16 =
+        __atomic_load_n(&s_ring.queued_frames, __ATOMIC_RELAXED) << 4;
+    uint32_t ema = __atomic_load_n(&s_latency_ema_x16, __ATOMIC_RELAXED);
+    ema = ema == 0u ? sample_x16
+                    : ema - (ema >> STREAM_LATENCY_EMA_SHIFT) +
+                          (sample_x16 >> STREAM_LATENCY_EMA_SHIFT);
+    __atomic_store_n(&s_latency_ema_x16, ema, __ATOMIC_RELAXED);
+    return (uint32_t)(((uint64_t)ema * 1000000u) / (16u * STREAM_RATE_HZ));
 }
 
 void controller_usb_audio_stream_get_stats(

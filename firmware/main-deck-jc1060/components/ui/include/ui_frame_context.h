@@ -30,6 +30,7 @@ typedef struct {
     bool valid;
     char title[96];
     char artist[64];
+    char key[16];                     /* v275: "" = unknown */
     uint16_t bpm;
     uint32_t duration_ms;
 } ui_deck_track_info_t;
@@ -43,7 +44,8 @@ typedef struct {
     deck_state_t deck_state[DECK_CORE_DECK_COUNT];
     deck_state_t active_state;
 
-    uint32_t deck_duration_ms[DECK_CORE_DECK_COUNT];
+    uint32_t deck_duration_ms[DECK_CORE_DECK_COUNT];   /* track length (v271) */
+    uint32_t deck_wave_span_ms[DECK_CORE_DECK_COUNT];  /* waveform/analysis time base */
     uint16_t deck_bpm[DECK_CORE_DECK_COUNT];
     uint32_t deck_speed_permille[DECK_CORE_DECK_COUNT];
 

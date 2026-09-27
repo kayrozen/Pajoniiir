@@ -11,4 +11,17 @@ config AUDIO_SCRATCH_ENABLED
         Additive: with this off the output path is unchanged and touching the
         platter does the Phase 1 hold/scrub. See docs/VINYL_SCRATCH_PLAN.md.
 
+config AUDIO_DISPLAY_LATENCY_MS
+    int "Output latency past the UAC ring, for the displayed position (ms)"
+    range 0 200
+    default 12
+    help
+        The engine position counts frames when they are mixed; they become
+        audible only after the output chain. The UI shows the position that
+        was mixed this long ago: the measured UAC ring fill (smoothed, read
+        by the UI) plus this constant, which covers the isoc URBs in flight
+        (3 x 4 ms) and the controller's own buffering. v260 HB logs: ring
+        ~830-1280 frames at 48 kHz (17-27 ms), so ~35 ms in total.
+        Raise it if the waveform still leads the audio, 0 = ring only.
+
 endmenu

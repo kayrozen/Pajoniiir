@@ -226,6 +226,10 @@ typedef enum {
 /* Flat global overflow region (no namespace). */
 #define CTRL_ID_BEAT_FX_BEAT_DEC_SHIFT 0x83
 #define CTRL_ID_BEAT_FX_BEAT_INC_SHIFT 0x84
+/* 0x85..0x89 are the S3 service IDs on the S3/P4 link. */
+/* Touch beat buttons (v264): value = deck_core_beat_fx_beat_t, CTRL_EV_PITCH
+ * like CTRL_ID_BEAT_FX_DEPTH. P4-local, never sent by a controller. */
+#define CTRL_ID_BEAT_FX_BEAT_SET       0x8A
 #define CTRL_DESC_CAP_MIDI_IN   0x0001
 #define CTRL_DESC_CAP_MIDI_OUT  0x0002
 #define CTRL_DESC_CAP_USB_AUDIO 0x0004
@@ -378,6 +382,57 @@ typedef struct {
     uint8_t           control;  // low-nibble semantic control for deck IDs
 } ctrl_event_t;
 
+/* Whether a controller event may be spent on waking the idle screensaver
+ * (the wake then consumes it, like a touch). Only stateless actions qualify:
+ * relative jog/browse ticks and button presses. Releases, held modifiers
+ * (SHIFT, platter touch, CUE/censor holds) and absolute faders/knobs always
+ * reach deck_core, so no release is lost and no fader position goes stale. */
+static inline bool control_link_event_wake_consumable(const ctrl_event_t *ev)
+{
+    if (!ev) return false;
+    if (ev->type == CTRL_EV_JOG || ev->type == CTRL_EV_BROWSE) return true;
+    if (ev->type != CTRL_EV_BUTTON) return false;
+    if (control_link_id_is_deck(ev->id)) {
+        switch (control_link_id_control(ev->id)) {
+        case CTRL_DECK_CTL_CUE:
+        case CTRL_DECK_CTL_JOG_TOUCH:
+        case CTRL_DECK_CTL_JOG_SEARCH_TOUCH:
+        case CTRL_DECK_CTL_SHIFT:
+        case CTRL_DECK_CTL_EXT_ACTION:
+            return false;
+        case CTRL_DECK_CTL_PAD_ACTION:
+            return CTRL_PAD_ACTION_PRESSED(ev->value);
+        default:
+            return ev->value != 0;
+        }
+    }
+    switch (ev->id) {
+    case CTRL_ID_SMART_CFX:
+    case CTRL_ID_SMART_FADER:
+    case CTRL_ID_BEAT_FX_SELECT_NEXT:
+    case CTRL_ID_BEAT_FX_SELECT_PREV:
+    case CTRL_ID_BEAT_FX_BEAT_DEC:
+    case CTRL_ID_BEAT_FX_BEAT_INC:
+    case CTRL_ID_BEAT_FX_BEAT_DEC_SHIFT:
+    case CTRL_ID_BEAT_FX_BEAT_INC_SHIFT:
+    case CTRL_ID_BEAT_FX_TARGET:
+    case CTRL_ID_BEAT_FX_ON:
+    case CTRL_ID_BEAT_FX_CLEAR:
+    case CTRL_ID_MASTER_CUE:
+    case CTRL_ID_DECK1_PFL:
+    case CTRL_ID_DECK2_PFL:
+    case CTRL_ID_LOAD_DECK1:
+    case CTRL_ID_LOAD_DECK2:
+    case CTRL_ID_BROWSE_PRESS:
+    case CTRL_ID_BROWSE_SHIFT_PRESS:
+    case CTRL_ID_SHIFT_LOAD_DECK1:
+    case CTRL_ID_SHIFT_LOAD_DECK2:
+        return ev->value != 0;
+    default:
+        return false;
+    }
+}
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 // Bind the P4-local controller producer to deck_core's event queue.
@@ -390,6 +445,12 @@ void control_link_send_led_deck(led_id_t led, uint8_t state, uint8_t deck);
 typedef esp_err_t (*control_link_led_sink_fn_t)(uint8_t led, uint8_t state,
                                                 uint8_t deck, void *user_ctx);
 void control_link_set_led_sink(control_link_led_sink_fn_t sink, void *user_ctx);
+
+/* Where injected controller events go instead of the raw queue. app_main
+ * points it at deck_core_queue_event so controller activity also wakes the
+ * idle screensaver (the direct queue send bypassed it). */
+typedef esp_err_t (*control_link_event_sink_fn_t)(const ctrl_event_t *ev);
+void control_link_set_event_sink(control_link_event_sink_fn_t sink);
 
 // Inject one transport-neutral semantic event from the direct USB runtime.
 esp_err_t control_link_inject_semantic(uint8_t type, uint8_t id, int16_t value);

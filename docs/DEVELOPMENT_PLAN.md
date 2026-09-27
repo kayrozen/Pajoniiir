@@ -2940,14 +2940,21 @@ Validated on hardware (v117, 2026-09-21):
 - On-screen heartbeat shows uptime + ETH IP (bypasses esp_log levels).
 - Main task stack 16 KB required (UI/log/console/ETH bring-up in main).
 
-### Phase 2: LVGL UI Porting (planned)
+### Phase 2: LVGL UI Porting (done in code; full HIL acceptance pending)
 
-- Copy UI components from `firmware/main-deck-p4/components/ui/` to the
-  `jc1060` target.
-- Adapt all layouts for 1024x600 native landscape (vs current 800x480 portrait
-  rotated). Redimension waveforms, panels and fonts.
-- Remove the PPA rotation logic since the panel is native landscape.
-- Validate DSI-synchronised dual-waveform rendering at the higher resolution.
+- The UI components were ported from `firmware/main-deck-p4/components/ui/`
+  and then replaced by the `dj_ui` presentation layer (1024x600 native
+  landscape, 4 tabs). See `docs/UI_MIGRATION_PLAN_DJUI.md`: migration phases
+  0-6 are done (v250-v293, 2026-09-27).
+- Phase 6 (v293) removed the legacy widget code and the
+  `CONFIG_UI_PRESENTATION_DJUI` switch. `dj_ui` is the only JC1060 UI. The
+  40 px `dj_ui` tab row with its status line replaces the 54 px top bar
+  (`ui_status.c` and `UI_TOPBAR_H`/`UI_CONTENT_*` are gone).
+  `CONFIG_UI_DJUI_DIRECT_STRIPS` (PPA blit of the zoom strips) stays as a
+  perf fallback.
+- Gate: `tests/ui_simulator/run_ui_simulator_e2e_jc1060.sh` (22 captures).
+  Still open: full HIL acceptance (two-deck perf, zoom, tab switches,
+  screensaver, blackout, hotplug).
 
 ### Phase 3: DDJ-400 Integration (planned)
 

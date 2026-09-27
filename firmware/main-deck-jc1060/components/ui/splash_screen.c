@@ -79,37 +79,6 @@ void splash_screen_show(void (*loaded_cb)(void))
 
 /* ── Idle screensaver ─────────────────────────────────────────────────────── */
 
-static lv_obj_t *saver_scr = NULL;
-static lv_obj_t *saver_prev_scr = NULL;
-
-void splash_screen_screensaver_show(void)
-{
-    if (saver_scr) return;
-    saver_prev_scr = lv_screen_active();
-    saver_scr = splash_build("touch me.....or don't ;)");
-    if (!saver_scr) return;
-    lv_screen_load(saver_scr);
-    ESP_LOGI(TAG, "screensaver on");
-}
-
-void splash_screen_screensaver_hide(void)
-{
-    if (!saver_scr) return;
-    /* Load the previous screen first: deleting the screen LVGL is currently
-     * showing leaves it drawing into freed objects. */
-    if (saver_prev_scr) {
-        lv_screen_load(saver_prev_scr);
-    }
-    lv_obj_del(saver_scr);   /* also cancels the per-label opacity animations */
-    saver_scr = NULL;
-    saver_prev_scr = NULL;
-    ESP_LOGI(TAG, "screensaver off");
-}
-
-bool splash_screen_screensaver_active(void)
-{
-    return saver_scr != NULL;
-}
 
 static lv_obj_t *splash_build(const char *caption)
 {

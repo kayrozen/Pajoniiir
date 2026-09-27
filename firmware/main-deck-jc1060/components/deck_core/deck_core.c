@@ -9,6 +9,9 @@
 #include "audio_engine.h"
 #include "beat_jump.h"
 #include "hot_cue_store.h"
+#include "deck_cue_park.h"
+#include "deck_jog_scrub.h"
+#include "deck_hot_cue_recall.h"
 #include "rekordbox_anlz.h"
 #if !defined(DECK_CORE_PC_TEST)
 #include "esp_timer.h"
@@ -35,6 +38,8 @@ static const char *TAG = "deck";
 #define DECK_CORE_TEST_UI_COMMAND_QUEUE_LEN 32u
 #define DECK_CORE_INTERNAL_RESET_ID 0xFEu
 #define DECK_CORE_INTERNAL_LOAD_CUE_ID 0xFDu
+#define DECK_CORE_INTERNAL_TEMPO_RANGE_ID 0xFCu
+#define DECK_CORE_TEMPO_RANGE_QUEUE_TIMEOUT_MS 100u
 #define DECK_CORE_LOAD_CUE_QUEUE_TIMEOUT_MS 100u
 #define DECK_CORE_RESET_TIMEOUT_MS 2000u
 #define BEAT_FX_ECHO_FALLBACK_BPM 120.0f
@@ -79,8 +84,18 @@ static bool              s_deck_shift_held[DECK_CORE_DECK_COUNT];
  * and jogs then scrub the position; s_jog_hold_active[] remembers a hold was
  * entered so release resumes forward playback. */
 static bool              s_jog_touched[DECK_CORE_DECK_COUNT];
+static deck_jog_scrub_t  s_jog_scrub[DECK_CORE_DECK_COUNT];
 static bool              s_jog_hold_active[DECK_CORE_DECK_COUNT];
 static bool              s_jog_scratch_active[DECK_CORE_DECK_COUNT];
+/* v267: CDJ jog mode, set from the Settings UI (deck_core_set_jog_cdj_mode). */
+static bool              s_jog_cdj_mode;
+/* v275: tempo range (6/10/16) shared by both decks. Settings and Shift+TEMPO
+ * RANGE both change it, so a track load (deck reset) or a reboot keeps it. */
+static uint16_t          s_tempo_range_percent = DEFAULT_TEMPO_RANGE_PERCENT;
+/* v267/v268: deck_jog_show_t of each deck (deck_jog_scrub.h); readers from
+ * other tasks take state->position_ms, the target, unless it is ENGINE. */
+static uint8_t           s_jog_show_pub[DECK_CORE_DECK_COUNT];
+static void jog_show_publish(uint8_t deck);
 /* CDJ cue preview: CUE pressed while paused on the cue point plays from it
  * until release, which returns to the cue paused (unless PLAY latched it). */
 static bool              s_cue_preview[DECK_CORE_DECK_COUNT];
@@ -183,12 +198,16 @@ static void snapshot_write_end(void)
     __atomic_store_n(&s_snapshot_writer, false, __ATOMIC_RELEASE);
 }
 
+static uint16_t beat_fx_time_ms(const deck_core_beat_fx_state_t *fx);
+
 static void publish_state_snapshot(void)
 {
+    const uint16_t fx_time_ms = beat_fx_time_ms(&s_beat_fx);
     snapshot_write_begin();
     memcpy(s_published_decks, s_decks, sizeof(s_published_decks));
     memcpy(s_published_loop_shadow, s_loop_shadow, sizeof(s_published_loop_shadow));
     s_published_beat_fx = s_beat_fx;
+    s_published_beat_fx.time_ms = fx_time_ms;
     snapshot_write_end();
 }
 
@@ -343,7 +362,7 @@ static void init_deck_state(deck_state_t *state)
     memset(state, 0, sizeof(*state));
     state->pitch = PITCH_CENTER;
     state->pitch_centipercent = 0;
-    state->tempo_range_percent = DEFAULT_TEMPO_RANGE_PERCENT;
+    state->tempo_range_percent = deck_core_get_tempo_range_percent();
     state->pad_mode = CTRL_PAD_MODE_HOT_CUE;
 }
 
@@ -456,6 +475,19 @@ static uint32_t beat_fx_flanger_period_ms(deck_core_beat_fx_beat_t beat,
         period_ms = BEAT_FX_FLANGER_MAX_PERIOD_MS;
     }
     return period_ms;
+}
+
+static uint16_t beat_fx_time_ms(const deck_core_beat_fx_state_t *fx)
+{
+    switch (fx->effect) {
+    case DECK_CORE_BEAT_FX_ECHO:
+    case DECK_CORE_BEAT_FX_DELAY:
+        return (uint16_t)beat_fx_delay_ms(fx->beat, fx->target);
+    case DECK_CORE_BEAT_FX_FLANGER:
+        return (uint16_t)beat_fx_flanger_period_ms(fx->beat, fx->target);
+    default:
+        return 0u;
+    }
 }
 
 static deck_core_beat_fx_effect_t beat_fx_next_effect(
@@ -578,6 +610,30 @@ static uint16_t next_tempo_range_percent(uint16_t current)
         return 16;
     default:
         return 6;
+    }
+}
+
+static bool tempo_range_percent_valid(uint16_t pct)
+{
+    return pct == 6u || pct == 10u || pct == 16u;
+}
+
+/* Deck task only: rescale both faders to the shared range. As upstream's
+ * Shift+TEMPO RANGE, a range change drops sync. */
+static void apply_tempo_range_all(uint16_t pct)
+{
+    bool sync_dropped = false;
+    for (uint8_t deck = 0; deck < DECK_CORE_DECK_COUNT; ++deck) {
+        deck_state_t *state = &s_decks[deck];
+        if (state->tempo_range_percent == pct) continue;
+        sync_dropped |= state->sync_enabled;
+        state->sync_enabled = false;
+        state->tempo_range_percent = pct;
+        apply_deck_pitch(deck, state);
+    }
+    ESP_LOGI(TAG, "tempo range -> ±%u%% (both decks)", (unsigned)pct);
+    if (sync_dropped) {
+        publish_flx4_led_snapshot(false);
     }
 }
 
@@ -769,12 +825,51 @@ static uint8_t hot_cue_exists_mask_for_deck(uint8_t deck)
     return mask;
 }
 
+static void cue_park_cancel(uint8_t deck, const char *why);
+
+/* Every deck_core seek goes through here, tagged with who asked (v261). */
+static esp_err_t deck_seek(uint8_t deck, uint32_t position_ms, const char *src)
+{
+    ESP_LOGW(TAG, "deck %u seek %lu ms src=%s", (unsigned)deck + 1,
+             (unsigned long)position_ms, src);
+    return audio_engine_deck_seek(deck, position_ms);
+}
+
+static void sync_legacy_compat_leds(uint8_t deck);
+
+/* CDJ hot cue: after the jump the deck plays (deck_hot_cue_recall.h). */
+static void hot_cue_recall_play(uint8_t deck, deck_state_t *state)
+{
+    const uint8_t idx = normalize_deck(deck);
+    const bool uses_audio = deck_uses_audio_engine(deck);
+    const bool playing = uses_audio ? audio_engine_deck_is_playing(deck) : state->playing;
+    switch (deck_hot_cue_recall_transport(playing, s_cue_preview[idx])) {
+    case DECK_HOT_CUE_KEEP_PLAYING:
+        return;
+    case DECK_HOT_CUE_LATCH_PREVIEW:
+        s_cue_preview[idx] = false;
+        break;
+    case DECK_HOT_CUE_START_PLAY: {
+        esp_err_t rc = uses_audio ? audio_engine_deck_play(deck) : ESP_OK;
+        if (rc != ESP_OK) {
+            ESP_LOGW(TAG, "deck %u hot cue play failed: %s", (unsigned)deck + 1,
+                     esp_err_to_name(rc));
+            return;
+        }
+        state->playing = true;
+        break;
+    }
+    }
+    sync_legacy_compat_leds(deck);
+}
+
 static void handle_hot_cue_pad_action(uint8_t deck, uint8_t pad, bool shifted, deck_state_t *state)
 {
     if (deck >= DECK_CORE_DECK_COUNT || pad >= HOT_CUE_STORE_SLOT_COUNT || !state) {
         return;
     }
 
+    cue_park_cancel(deck, "hot cue pad");
     uint32_t track_key = loaded_track_key_for_deck(deck);
     if (track_key == 0) {
         ESP_LOGW(TAG, "deck %u hot cue pad %u ignored: no loaded track key",
@@ -822,13 +917,15 @@ static void handle_hot_cue_pad_action(uint8_t deck, uint8_t pad, bool shifted, d
 
     if ((blob.valid_mask & bit) != 0) {
         uint32_t pos_ms = blob.slots[pad].pos_ms;
-        rc = audio_engine_deck_seek(deck, pos_ms);
+        rc = deck_seek(deck, pos_ms, "CONTROLLER_HOT_CUE");
         if (rc == ESP_OK) {
             state->position_ms = pos_ms;
-            ESP_LOGI(TAG, "deck %u hot cue %u recall -> %lu ms",
+            hot_cue_recall_play(deck, state);
+            ESP_LOGW(TAG, "deck %u hot cue pad %u recall -> %lu ms (%s)",
                      (unsigned)deck + 1,
                      (unsigned)pad + 1,
-                     (unsigned long)pos_ms);
+                     (unsigned long)pos_ms,
+                     state->playing ? "PLAYING" : "PAUSED");
         } else {
             ESP_LOGW(TAG, "deck %u hot cue %u recall failed: %s",
                      (unsigned)deck + 1,
@@ -920,7 +1017,7 @@ static void handle_beat_jump(uint8_t deck,
         position_ms, bpm, beat_numerator, beat_denominator, meta_ptr);
     anlz_snapshot_release(snapshot);
 
-    esp_err_t rc = audio_engine_deck_seek(deck, target_ms);
+    esp_err_t rc = deck_seek(deck, target_ms, "CONTROLLER_BEAT_JUMP");
     if (rc == ESP_OK) {
         state->position_ms = target_ms;
         ESP_LOGI(TAG, "deck %u beat jump %+d/%u -> %lu ms",
@@ -1967,6 +2064,16 @@ static bool on_system_value(const ctrl_event_t *ev)
         return true;
     }
 
+    if (ev->id == CTRL_ID_BEAT_FX_BEAT_SET) {
+        if (ev->value >= DECK_CORE_BEAT_FX_BEAT_1_4 && ev->value < DECK_CORE_BEAT_FX_BEAT_COUNT &&
+            ev->value != (int16_t)s_beat_fx.beat) {
+            s_beat_fx.beat = (deck_core_beat_fx_beat_t)ev->value;
+            sync_beat_fx_audio_state();
+            ESP_LOGI(TAG, "beat fx beat -> %d", (int)s_beat_fx.beat);
+        }
+        return true;
+    }
+
     if (ev->id != CTRL_ID_BEAT_FX_DEPTH) {
         return false;
     }
@@ -1990,7 +2097,7 @@ static void return_to_cue_paused(uint8_t deck, deck_state_t *state, bool uses_au
 {
     if (uses_audio) {
         audio_engine_deck_pause(deck);
-        audio_engine_deck_seek(deck, state->cue_point_ms);
+        deck_seek(deck, state->cue_point_ms, "CUE_RETURN");
     }
     state->playing     = false;
     state->position_ms = state->cue_point_ms;
@@ -1999,12 +2106,15 @@ static void return_to_cue_paused(uint8_t deck, deck_state_t *state, bool uses_au
 static void on_cue_release(uint8_t deck)
 {
     const uint8_t idx = normalize_deck(deck);
-    if (!s_cue_preview[idx]) return;
+    if (!s_cue_preview[idx]) {
+        ESP_LOGW(TAG, "deck %u CUE release: no preview", (unsigned)deck + 1);
+        return;
+    }
     s_cue_preview[idx] = false;
 
     deck_state_t *state = &s_decks[idx];
     return_to_cue_paused(deck, state, deck_uses_audio_engine(deck));
-    ESP_LOGI(TAG, "deck %u cue preview end -> %lu ms (paused)", (unsigned)deck + 1,
+    ESP_LOGW(TAG, "deck %u CUE release: preview end -> %lu ms (paused)", (unsigned)deck + 1,
              (unsigned long)state->cue_point_ms);
     sync_legacy_compat_leds(deck);
 }
@@ -2033,58 +2143,233 @@ static void hot_cue_seed_from_anlz(const anlz_metadata_t *meta, uint32_t duratio
     }
 }
 
-/* Seed the store from Rekordbox only while the track has no local hot cue:
- * any cue set on the pads keeps priority and nothing is overwritten. A store
- * read error other than "not found" also leaves the store alone. */
-static void seed_hot_cues_from_anlz(uint8_t deck, uint32_t track_key,
-                                    const hot_cue_store_blob_t *seed)
+/* One store read and at most one write per load. Rekordbox hot cues are seeded
+ * only while the track has no local hot cue (pads keep priority). The cue point
+ * resolves local cue > Rekordbox memory cue > track start; a memory cue with no
+ * local cue is seeded like the hot cues, and a local cue past the track end is
+ * dropped. A store read error other than "not found" leaves the store alone. */
+static uint32_t load_track_cues(uint8_t deck, uint32_t track_key, uint32_t duration_ms,
+                                const hot_cue_store_blob_t *seed,
+                                bool rb_cue, uint32_t rb_cue_ms, const char **source)
 {
-    if (track_key == 0u || seed->valid_mask == 0u) {
-        return;
+    uint32_t cue_ms = rb_cue ? rb_cue_ms : 0u;
+    *source = rb_cue ? "memory cue" : "track start";
+    if (track_key == 0u) {
+        return cue_ms;
     }
     hot_cue_store_blob_t stored = {0};
     esp_err_t rc = hot_cue_store_load(track_key, &stored);
-    if (rc == ESP_OK && (stored.valid_mask & 0xFFu) != 0u) {
-        ESP_LOGI(TAG, "deck %u hot cues: local mask 0x%02x kept, Rekordbox ignored",
-                 (unsigned)deck + 1, (unsigned)(stored.valid_mask & 0xFFu));
-        hot_cue_mask_cache_store(deck, track_key, &stored);
-        return;
-    }
-    if (rc != ESP_OK && rc != ESP_ERR_NOT_FOUND) {
-        ESP_LOGW(TAG, "deck %u hot cue seed skipped: load failed: %s",
+    if (rc == ESP_ERR_NOT_FOUND) {
+        memset(&stored, 0, sizeof(stored));
+    } else if (rc != ESP_OK) {
+        ESP_LOGW(TAG, "deck %u track cues skipped: load failed: %s",
                  (unsigned)deck + 1, esp_err_to_name(rc));
-        return;
+        return cue_ms;
     }
-    rc = hot_cue_store_save(track_key, seed);
-    if (rc != ESP_OK) {
-        ESP_LOGW(TAG, "deck %u hot cue seed save failed: %s",
-                 (unsigned)deck + 1, esp_err_to_name(rc));
-        return;
+
+    hot_cue_store_blob_t next = stored;
+    bool seeded = false;
+    if ((stored.valid_mask & 0xFFu) != 0u) {
+        if (seed->valid_mask != 0u) {
+            ESP_LOGI(TAG, "deck %u hot cues: local mask 0x%02x kept, Rekordbox ignored",
+                     (unsigned)deck + 1, (unsigned)(stored.valid_mask & 0xFFu));
+        }
+    } else if (seed->valid_mask != 0u) {
+        next.valid_mask = seed->valid_mask;
+        memcpy(next.slots, seed->slots, sizeof(next.slots));
+        seeded = true;
     }
-    hot_cue_mask_cache_store(deck, track_key, seed);
-    ESP_LOGI(TAG, "deck %u hot cues seeded from Rekordbox: mask 0x%02x",
-             (unsigned)deck + 1, (unsigned)(seed->valid_mask & 0xFFu));
+    if (stored.has_cue && (duration_ms == 0u || stored.cue_point_ms < duration_ms)) {
+        cue_ms = stored.cue_point_ms;
+        *source = "local cue";
+    } else {
+        next.has_cue = rb_cue ? 1u : 0u;
+        next.cue_point_ms = rb_cue ? rb_cue_ms : 0u;
+    }
+
+    if (memcmp(&next, &stored, sizeof(next)) != 0) {
+        rc = hot_cue_store_save(track_key, &next);
+        if (rc != ESP_OK) {
+            ESP_LOGW(TAG, "deck %u track cues save failed: %s",
+                     (unsigned)deck + 1, esp_err_to_name(rc));
+            next = stored;
+            seeded = false;
+        }
+    }
+    if (seeded) {
+        ESP_LOGI(TAG, "deck %u hot cues seeded from Rekordbox: mask 0x%02x",
+                 (unsigned)deck + 1, (unsigned)(next.valid_mask & 0xFFu));
+    }
+    hot_cue_mask_cache_store(deck, track_key, &next);
+    return cue_ms;
 }
 
-/* Actor side of a track load: the cue point starts at the Rekordbox memory cue
- * (track start without one) and a paused deck parks on it, so the first CUE
- * press previews instead of overwriting it. `generation` is the low 16 bits of
- * the loaded-track store generation the load published; a newer load or clear
- * makes the request stale. */
+/* Manual cue point of the loaded track, kept in the same hot_cue_store blob as
+ * the pads (same direct NVS write, actor task). has_cue false forgets it;
+ * eject never calls this, so the cue outlives the load. */
+static void persist_cue_point(uint8_t deck, bool has_cue, uint32_t cue_ms)
+{
+    uint32_t track_key = loaded_track_key_for_deck(deck);
+    if (track_key == 0u) {
+        return;
+    }
+    hot_cue_store_blob_t blob = {0};
+    esp_err_t rc = hot_cue_store_load(track_key, &blob);
+    if (rc == ESP_ERR_NOT_FOUND) {
+        if (!has_cue) {
+            return;
+        }
+        memset(&blob, 0, sizeof(blob));
+    } else if (rc != ESP_OK) {
+        ESP_LOGW(TAG, "deck %u cue not saved: load failed: %s",
+                 (unsigned)deck + 1, esp_err_to_name(rc));
+        return;
+    }
+    if (blob.has_cue == (has_cue ? 1u : 0u) && (!has_cue || blob.cue_point_ms == cue_ms)) {
+        return;
+    }
+    blob.has_cue = has_cue ? 1u : 0u;
+    blob.cue_point_ms = has_cue ? cue_ms : 0u;
+    rc = hot_cue_store_save(track_key, &blob);
+    if (rc != ESP_OK) {
+        ESP_LOGW(TAG, "deck %u cue save failed: %s", (unsigned)deck + 1, esp_err_to_name(rc));
+    }
+}
+
+/* Load cue the engine refused while its loader was still binding the file. */
+static deck_cue_park_t s_cue_park[DECK_CORE_DECK_COUNT];
+
+static uint32_t deck_now_ms(void)
+{
+    return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+}
+
+/* Any operator transport action on the deck supersedes a parked load cue. */
+static void cue_park_cancel(uint8_t deck, const char *why)
+{
+    const uint8_t idx = normalize_deck(deck);
+    if (!s_cue_park[idx].active) {
+        return;
+    }
+    ESP_LOGW(TAG, "deck %u load cue %lu ms dropped: %s", (unsigned)idx + 1,
+             (unsigned long)s_cue_park[idx].cue_ms, why);
+    deck_cue_park_cancel(&s_cue_park[idx]);
+}
+
+/* Park the deck on its cue. The engine takes a seek only once its loader has
+ * bound the file, which can finish after this load's LOAD_CUE event; a
+ * refused seek is parked and retried by the deck task (cue_park_service). */
+static void park_on_load_cue(uint8_t idx, deck_state_t *state, uint16_t generation,
+                             uint32_t cue_ms, const char *source)
+{
+    const bool uses_audio = deck_uses_audio_engine(idx);
+    const bool playing = uses_audio ? audio_engine_deck_is_playing(idx)
+                                    : state->playing;
+    if (playing) {
+        ESP_LOGW(TAG, "deck %u load cue -> %lu ms (%s), deck playing: position kept",
+                 (unsigned)idx + 1, (unsigned long)cue_ms, source);
+        return;
+    }
+    if (uses_audio && cue_ms != current_deck_position_ms(idx, state)) {
+        esp_err_t rc = deck_seek(idx, cue_ms, "LOAD_CUE");
+        if (rc == ESP_ERR_INVALID_STATE) {
+            deck_cue_park_arm(&s_cue_park[idx], generation, cue_ms, deck_now_ms());
+            ESP_LOGW(TAG, "deck %u load cue -> %lu ms (%s) deferred: engine still loading",
+                     (unsigned)idx + 1, (unsigned long)cue_ms, source);
+            return;
+        }
+        if (rc != ESP_OK) {
+            ESP_LOGW(TAG, "deck %u load cue -> %lu ms (%s) seek failed: %s",
+                     (unsigned)idx + 1, (unsigned long)cue_ms, source, esp_err_to_name(rc));
+            return;
+        }
+    }
+    state->position_ms = cue_ms;
+    ESP_LOGW(TAG, "deck %u load cue -> %lu ms (%s)", (unsigned)idx + 1,
+             (unsigned long)cue_ms, source);
+}
+
+/* Deck task: retry parked load cues. Returns true while one is still armed. */
+static bool cue_park_service(void)
+{
+    bool armed = false;
+    for (uint8_t idx = 0; idx < DECK_CORE_DECK_COUNT; idx++) {
+        deck_cue_park_t *park = &s_cue_park[idx];
+        if (!park->active) continue;
+        deck_state_t *state = &s_decks[idx];
+        deck_loaded_track_summary_t loaded = {0};
+        const bool valid = deck_loaded_track_store_get(&s_loaded_tracks, idx, &loaded) &&
+                           loaded.valid;
+        const bool playing = deck_uses_audio_engine(idx) ? audio_engine_deck_is_playing(idx)
+                                                         : state->playing;
+        const uint32_t cue_ms = park->cue_ms;
+        switch (deck_cue_park_check(park, valid, (uint16_t)loaded.generation, playing,
+                                    deck_now_ms())) {
+        case DECK_CUE_PARK_TRY: {
+            esp_err_t rc = deck_seek(idx, cue_ms, "LOAD_CUE_RETRY");
+            const deck_cue_park_seek_t res =
+                rc == ESP_OK ? DECK_CUE_PARK_SEEK_OK :
+                rc == ESP_ERR_INVALID_STATE ? DECK_CUE_PARK_SEEK_NOT_READY :
+                                              DECK_CUE_PARK_SEEK_FAILED;
+            const uint32_t attempts = park->attempts + 1u;
+            if (!deck_cue_park_seek_result(park, res)) {
+                armed = true;
+            } else if (res == DECK_CUE_PARK_SEEK_OK) {
+                state->position_ms = cue_ms;
+                ESP_LOGW(TAG, "deck %u load cue -> %lu ms applied after %lu retries",
+                         (unsigned)idx + 1, (unsigned long)cue_ms, (unsigned long)attempts);
+                sync_legacy_compat_leds(idx);
+            } else {
+                ESP_LOGW(TAG, "deck %u load cue %lu ms seek failed: %s",
+                         (unsigned)idx + 1, (unsigned long)cue_ms, esp_err_to_name(rc));
+            }
+            break;
+        }
+        case DECK_CUE_PARK_DROP_STALE:
+            ESP_LOGW(TAG, "deck %u load cue %lu ms dropped: track replaced",
+                     (unsigned)idx + 1, (unsigned long)cue_ms);
+            break;
+        case DECK_CUE_PARK_DROP_PLAYING:
+            ESP_LOGW(TAG, "deck %u load cue %lu ms dropped: deck playing",
+                     (unsigned)idx + 1, (unsigned long)cue_ms);
+            break;
+        case DECK_CUE_PARK_DROP_TIMEOUT:
+            ESP_LOGW(TAG, "deck %u load cue %lu ms dropped: engine not ready after %u ms",
+                     (unsigned)idx + 1, (unsigned long)cue_ms, (unsigned)DECK_CUE_PARK_TIMEOUT_MS);
+            break;
+        case DECK_CUE_PARK_IDLE:
+            break;
+        }
+    }
+    return armed;
+}
+
+/* Actor side of a track load: the cue point starts at the track's saved cue,
+ * else the Rekordbox memory cue, else the track start, and a paused deck parks
+ * on it, so the first CUE press previews instead of overwriting it.
+ * `generation` is the low 16 bits of the loaded-track store generation the
+ * load published; a newer load or clear makes the request stale. The saved
+ * cue comes from hot_cue_store by track key and never waits for ANLZ (the
+ * store publishes ANLZ together with the track, or none at all). Every exit
+ * logs at WARN: the "deck" tag is filtered to WARN on firmware. */
 static void apply_loaded_memory_cue(uint8_t deck, uint16_t generation)
 {
     const uint8_t idx = normalize_deck(deck);
     deck_loaded_track_summary_t loaded = {0};
     anlz_snapshot_t *snapshot = NULL;
     if (!acquire_loaded_track_for_deck(idx, &loaded, &snapshot)) {
+        ESP_LOGW(TAG, "deck %u load cue skipped: no loaded track (gen %u)",
+                 (unsigned)idx + 1, (unsigned)generation);
         return;
     }
     const anlz_metadata_t *meta = anlz_snapshot_metadata(snapshot);
     const bool current = loaded.valid && (uint16_t)loaded.generation == generation;
-    uint32_t cue_ms = 0u;
+    bool rb_cue = false;
+    uint32_t rb_cue_ms = 0u;
     if (current && loaded.has_anlz && meta && meta->has_memory_cue &&
         (loaded.duration_ms == 0u || meta->memory_cue_ms < loaded.duration_ms)) {
-        cue_ms = meta->memory_cue_ms;
+        rb_cue = true;
+        rb_cue_ms = meta->memory_cue_ms;
     }
     hot_cue_store_blob_t hot_cue_seed = {0};
     if (current && loaded.has_anlz && meta) {
@@ -2092,28 +2377,24 @@ static void apply_loaded_memory_cue(uint8_t deck, uint16_t generation)
     }
     anlz_snapshot_release(snapshot);
     if (!current) {
+        ESP_LOGW(TAG, "deck %u load cue skipped: stale gen %u (loaded gen %u)",
+                 (unsigned)idx + 1, (unsigned)generation, (unsigned)(uint16_t)loaded.generation);
         return;
     }
 
-    seed_hot_cues_from_anlz(idx, loaded.track_key, &hot_cue_seed);
+    /* A new load replaces whatever the previous one parked. */
+    deck_cue_park_cancel(&s_cue_park[idx]);
+    const char *cue_source = NULL;
+    const uint32_t cue_ms = load_track_cues(idx, loaded.track_key, loaded.duration_ms,
+                                            &hot_cue_seed, rb_cue, rb_cue_ms, &cue_source);
     /* The pad bank was published when the load was submitted, before this
      * track was in the store; bring it to this track's cues (mask diff, so an
      * unchanged bank sends nothing). */
     publish_loaded_track_hot_cue_leds(idx);
 
     deck_state_t *state = &s_decks[idx];
-    const bool uses_audio = deck_uses_audio_engine(idx);
     state->cue_point_ms = cue_ms;
-    const bool playing = uses_audio ? audio_engine_deck_is_playing(idx)
-                                    : state->playing;
-    if (!playing) {
-        if (uses_audio && cue_ms != current_deck_position_ms(idx, state)) {
-            audio_engine_deck_seek(idx, cue_ms);
-        }
-        state->position_ms = cue_ms;
-    }
-    ESP_LOGI(TAG, "deck %u load cue -> %lu ms (%s)", (unsigned)idx + 1,
-             (unsigned long)cue_ms, cue_ms != 0u ? "memory cue" : "track start");
+    park_on_load_cue(idx, state, generation, cue_ms, cue_source);
     sync_legacy_compat_leds(idx);
 }
 
@@ -2127,13 +2408,17 @@ static void on_button(uint8_t deck, button_id_t btn, bool pressed)
     deck_state_t *state = &s_decks[normalize_deck(deck)];
     bool uses_audio = deck_uses_audio_engine(deck);
 
+    if (btn == BTN_PLAY || btn == BTN_CUE || btn == BTN_EJECT) {
+        cue_park_cancel(deck, "operator transport");
+    }
+
     switch (btn) {
     case BTN_PLAY:
         if (s_cue_preview[normalize_deck(deck)]) {
             /* PLAY during a cue preview latches playback (CDJ): releasing CUE
              * then no longer returns to the cue. */
             s_cue_preview[normalize_deck(deck)] = false;
-            ESP_LOGI(TAG, "deck %u cue preview latched -> PLAYING", (unsigned)deck + 1);
+            ESP_LOGW(TAG, "deck %u PLAY: cue preview latched -> PLAYING", (unsigned)deck + 1);
             sync_legacy_compat_leds(deck);
             break;
         }
@@ -2158,8 +2443,10 @@ static void on_button(uint8_t deck, button_id_t btn, bool pressed)
                 state->playing = !state->playing;
             }
         }
-        ESP_LOGI(TAG, "deck %u play -> %s", (unsigned)deck + 1,
-                 state->playing ? "PLAYING" : "PAUSED");
+        ESP_LOGW(TAG, "deck %u PLAY: -> %s at %lu ms (cue %lu ms)", (unsigned)deck + 1,
+                 state->playing ? "PLAYING" : "PAUSED",
+                 (unsigned long)current_deck_position_ms(deck, state),
+                 (unsigned long)state->cue_point_ms);
         sync_legacy_compat_leds(deck);
         break;
 
@@ -2175,7 +2462,7 @@ static void on_button(uint8_t deck, button_id_t btn, bool pressed)
         if (playing) {
             s_cue_preview[normalize_deck(deck)] = false;
             return_to_cue_paused(deck, state, uses_audio);
-            ESP_LOGI(TAG, "deck %u cue -> %lu ms (paused)", (unsigned)deck + 1,
+            ESP_LOGW(TAG, "deck %u CUE: return to cue -> %lu ms (paused)", (unsigned)deck + 1,
                      (unsigned long)state->cue_point_ms);
         } else {
             const uint32_t position_ms = current_deck_position_ms(deck, state);
@@ -2184,7 +2471,7 @@ static void on_button(uint8_t deck, button_id_t btn, bool pressed)
                 if (rc == ESP_OK) {
                     state->playing = true;
                     s_cue_preview[normalize_deck(deck)] = true;
-                    ESP_LOGI(TAG, "deck %u cue preview from %lu ms", (unsigned)deck + 1,
+                    ESP_LOGW(TAG, "deck %u CUE: preview from %lu ms", (unsigned)deck + 1,
                              (unsigned long)state->cue_point_ms);
                 } else {
                     ESP_LOGW(TAG, "deck %u cue preview failed: %s", (unsigned)deck + 1,
@@ -2196,12 +2483,13 @@ static void on_button(uint8_t deck, button_id_t btn, bool pressed)
                 if (uses_audio && cue_ms != position_ms) {
                     /* Park on the snapped cue so the deck reads as "on cue" and
                      * the next press previews instead of setting again. */
-                    audio_engine_deck_seek(deck, cue_ms);
+                    deck_seek(deck, cue_ms, "CUE_SET_SNAP");
                 }
                 state->position_ms = cue_ms;
-                ESP_LOGI(TAG, "deck %u cue set -> %lu ms (from %lu ms, paused)",
+                ESP_LOGW(TAG, "deck %u CUE: set -> %lu ms (from %lu ms, paused)",
                          (unsigned)deck + 1, (unsigned long)cue_ms,
                          (unsigned long)position_ms);
+                persist_cue_point(normalize_deck(deck), true, cue_ms);
             }
         }
         sync_legacy_compat_leds(deck);
@@ -2254,7 +2542,7 @@ static void on_button(uint8_t deck, button_id_t btn, bool pressed)
         uint32_t current = uses_audio ? audio_engine_deck_position_ms(deck) : state->position_ms;
         int32_t target = (int32_t)current + (btn == BTN_SEARCH_FWD ? SEARCH_STEP_MS : -SEARCH_STEP_MS);
         if (target < 0) target = 0;
-        esp_err_t rc = uses_audio ? audio_engine_deck_seek(deck, (uint32_t)target) : ESP_OK;
+        esp_err_t rc = uses_audio ? deck_seek(deck, (uint32_t)target, "CONTROLLER_SEARCH") : ESP_OK;
         if (rc == ESP_OK) {
             state->position_ms = (uint32_t)target;
             ESP_LOGI(TAG, "deck %u search %s -> %lu ms", (unsigned)deck + 1,
@@ -2388,6 +2676,11 @@ static void handle_jog_touch(uint8_t deck, bool pressed, deck_state_t *state)
     if (pressed && state->loop_adjust_mode != DECK_CORE_LOOP_ADJUST_NONE) {
         return;
     }
+    /* v267 CDJ mode: the platter top is inert (no grab, no stop). A release
+     * still runs, so a touch latched in VINYL mode is always undone. */
+    if (pressed && deck_core_get_jog_cdj_mode()) {
+        return;
+    }
 
     if (pressed) {
         /* Touch is a level on the wire, but scratch begin/end are edge-driven.
@@ -2398,6 +2691,7 @@ static void handle_jog_touch(uint8_t deck, bool pressed, deck_state_t *state)
             return;
         }
         s_jog_touched[deck] = true;
+        s_jog_scrub[deck].ignored = 0u;
 #if CONFIG_AUDIO_SCRATCH_ENABLED
         if (deck_uses_audio_engine(deck)) {
             s_jog_hold_active[deck] = true;
@@ -2433,12 +2727,29 @@ static void handle_jog_touch(uint8_t deck, bool pressed, deck_state_t *state)
         return; /* duplicate release: no second handoff/hold transition */
     }
     s_jog_touched[deck] = false;
+    const bool transport = s_jog_scrub[deck].transport;
+    if (deck_jog_scrub_release(&s_jog_scrub[deck]) && deck_uses_audio_engine(deck)) {
+        deck_seek(deck, state->position_ms, "JOG_SCRUB_RELEASE");
+    }
+    jog_show_publish(deck);
+    if (transport) {
+        /* v267: the engine already has (or just got) the last target, where
+         * the audio restarts; hold is released below. */
+        ESP_LOGI(TAG, "deck %u jog transport end -> %lu ms", (unsigned)deck + 1,
+                 (unsigned long)state->position_ms);
+    }
     if (s_jog_hold_active[deck]) {
         s_jog_hold_active[deck] = false;
 #if CONFIG_AUDIO_SCRATCH_ENABLED
         if (s_jog_scratch_active[deck]) {
-            audio_engine_deck_scratch_end(deck);
-            ESP_LOGI(TAG, "deck %u scratch end", (unsigned)deck + 1);
+            uint32_t released_ms = 0u;
+            if (audio_engine_deck_scratch_end(deck, &released_ms)) {
+                /* v266: the release is the new pause position. A stale
+                 * shadow here was the base of the next scrub and of CUE. */
+                state->position_ms = released_ms;
+            }
+            ESP_LOGI(TAG, "deck %u scratch end -> %lu ms", (unsigned)deck + 1,
+                     (unsigned long)state->position_ms);
         } else {
             audio_engine_deck_set_hold(deck, false);
         }
@@ -2479,15 +2790,17 @@ static bool on_deck_extension_button(const ctrl_event_t *ev)
         if (!pressed) {
             return true;
         }
+        cue_park_cancel(deck, "cue+shift");
         if (uses_audio) {
             audio_engine_deck_pause(deck);
-            audio_engine_deck_seek(deck, 0);
+            deck_seek(deck, 0, "CONTROLLER_TO_START");
         }
         s_cue_preview[normalize_deck(deck)] = false;
         state->playing = false;
         state->position_ms = 0;
         state->cue_point_ms = 0;
         ESP_LOGI(TAG, "deck %u cue+shift -> track start", (unsigned)deck + 1);
+        persist_cue_point(normalize_deck(deck), false, 0u);
         sync_legacy_compat_leds(deck);
         send_momentary_led(LED_CUE_SHIFT, deck);
         return true;
@@ -2511,15 +2824,12 @@ static bool on_deck_extension_button(const ctrl_event_t *ev)
 
     case CTRL_DECK_CTL_TEMPO_RANGE:
         if (pressed) {
-            bool sync_was_enabled = state->sync_enabled;
-            state->sync_enabled = false;
-            state->tempo_range_percent = next_tempo_range_percent(state->tempo_range_percent);
-            apply_deck_pitch(deck, state);
-            ESP_LOGI(TAG, "deck %u tempo range -> ±%u%%",
-                     (unsigned)deck + 1, (unsigned)state->tempo_range_percent);
-            if (sync_was_enabled) {
-                publish_flx4_led_snapshot(false);
-            }
+            /* v275: upstream cycles this deck only; here the range is the
+             * shared Settings one, so a track load cannot drop it and the UI
+             * task persists it. */
+            const uint16_t next = next_tempo_range_percent(state->tempo_range_percent);
+            __atomic_store_n(&s_tempo_range_percent, next, __ATOMIC_RELEASE);
+            apply_tempo_range_all(next);
         }
         return true;
 
@@ -2726,19 +3036,85 @@ static bool on_deck_extension_button(const ctrl_event_t *ev)
     }
 }
 
+/* v268: publish what the deck shows. The target is in the state snapshot
+ * already, so publish that first: the flag never points at a stale target. */
+static void jog_show_publish(uint8_t deck)
+{
+    const uint8_t idx = normalize_deck(deck);
+    const deck_jog_show_t show = deck_jog_scrub_show(&s_jog_scrub[idx],
+                                                     deck_core_get_jog_cdj_mode());
+    if (show != DECK_JOG_SHOW_ENGINE) {
+        publish_state_snapshot();
+    }
+    __atomic_store_n(&s_jog_show_pub[idx], (uint8_t)show, __ATOMIC_RELEASE);
+}
+
+#if CONFIG_AUDIO_SCRATCH_ENABLED
+/* v267: the platter kept turning past the scratch window edge. Leave scratch
+ * for a transport from the head position: the next seek (deck_jog_scrub gate)
+ * goes through the engine's scratch-abort seek, a playing deck is held muted
+ * until the release. True when this delta is the first transport step. */
+static bool jog_scratch_edge_to_transport(uint8_t deck, int16_t delta, deck_state_t *state)
+{
+    if (delta == 0 || !deck_uses_audio_engine(deck)) {
+        return false;
+    }
+    const int edge = audio_engine_deck_scratch_edge(deck);
+    if (edge == 0 || (edge > 0) != (delta > 0)) {
+        return false;
+    }
+    const uint32_t from_ms = audio_engine_deck_position_ms(deck);
+    s_jog_scratch_active[deck] = false;
+    deck_jog_transport_begin(&s_jog_scrub[deck], from_ms);
+    state->position_ms = from_ms;
+    jog_show_publish(deck);
+    if (state->playing) {
+        audio_engine_deck_set_hold(deck, true);
+    }
+    ESP_LOGI(TAG, "deck %u scratch edge %+d -> jog transport from %lu ms",
+             (unsigned)deck + 1, edge, (unsigned long)from_ms);
+    return true;
+}
+#endif
+
+/* v271: the decoded file length once the engine knows it, which can run
+ * past the load duration (audio_track_length.h); 0 = no track. */
+static uint32_t deck_track_length_ms(uint8_t deck)
+{
+    deck_loaded_track_summary_t loaded = {0};
+    if (!deck_loaded_track_store_get(&s_loaded_tracks, deck, &loaded) || !loaded.valid) {
+        return 0u;
+    }
+    const uint32_t file_ms = deck_uses_audio_engine(deck) ? audio_engine_deck_track_length_ms(deck) : 0u;
+    return file_ms > loaded.duration_ms ? file_ms : loaded.duration_ms;
+}
+
+/* Last position a seek may target: EOF has no frame to start from. */
+static uint32_t jog_last_valid_ms(uint8_t deck)
+{
+    const uint32_t length_ms = deck_track_length_ms(deck);
+    return length_ms > 0u ? length_ms - 1u : UINT32_MAX;
+}
+
 static void on_jog(uint8_t deck, uint8_t control, int16_t delta)
 {
     deck_state_t *state = &s_decks[normalize_deck(deck)];
     bool touched = deck < DECK_CORE_DECK_COUNT && s_jog_touched[deck];
+    const bool cdj_mode = deck_core_get_jog_cdj_mode();
 
     /* Platter and side-ring deltas edit the selected boundary exclusively. */
     if (adjust_loop_boundary_from_jog(deck, delta, state)) {
         return;
     }
 
+    const deck_jog_route_t route = deck_jog_route(
+        cdj_mode, state->playing, touched,
+        touched && s_jog_scratch_active[normalize_deck(deck)],
+        control == CTRL_DECK_CTL_JOG_SCRATCH, control == CTRL_DECK_CTL_JOG_BEND);
+
 #if CONFIG_AUDIO_SCRATCH_ENABLED
-    if (touched && s_jog_scratch_active[deck] &&
-        control == CTRL_DECK_CTL_JOG_SCRATCH) {
+    if (route == DECK_JOG_ROUTE_SCRATCH &&
+        !jog_scratch_edge_to_transport(deck, delta, state)) {
         // Scratch (vinyl mode Phase 4): the jog drives the read-head velocity;
         // the audio engine renders the deck from the capture buffer at the head.
         if (deck_uses_audio_engine(deck)) {
@@ -2749,11 +3125,12 @@ static void on_jog(uint8_t deck, uint8_t control, int16_t delta)
     }
 #endif
 
-    if (state->playing && (!touched || control == CTRL_DECK_CTL_JOG_BEND)) {
+    if (route == DECK_JOG_ROUTE_BEND) {
         /* JOG_BEND is explicitly the platter side-ring / vinyl-off stream and
          * must remain a tempo nudge even if the platter top is also touched.
          * A scratch-stream event without a matching touch is safely treated as
-         * bend rather than entering scratch from stale/reordered touch state. */
+         * bend rather than entering scratch from stale/reordered touch state.
+         * In CDJ mode the whole wheel bends a playing deck (v267). */
         if (deck_uses_audio_engine(deck)) {
             audio_engine_deck_jog_nudge(deck, delta);
         }
@@ -2765,11 +3142,32 @@ static void on_jog(uint8_t deck, uint8_t control, int16_t delta)
     // Scrub: advance/rewind the position. Used while paused, and (Phase 1 build)
     // while the platter is held during playback — audio is muted + frozen by the
     // hold, so scrubbing drags the playhead; release resumes.
-    int32_t pos = (int32_t)state->position_ms + delta * 3;
-    state->position_ms = (pos < 0) ? 0 : (uint32_t)pos;
-    if (deck_uses_audio_engine(deck)) {
-        audio_engine_deck_seek(deck, state->position_ms);
+    // Only a touched platter scrubs, at most one seek per
+    // DECK_JOG_SCRUB_MIN_INTERVAL_MS and none while the engine still serves
+    // the previous one (deck_jog_scrub.h); jog_scrub_service() flushes the rest.
+    // CDJ mode engages the gate without a touch and moves by fine bounded steps.
+    deck_jog_scrub_t *scrub = &s_jog_scrub[normalize_deck(deck)];
+    const bool uses_audio = deck_uses_audio_engine(deck);
+    const deck_jog_scrub_action_t action = deck_jog_scrub_tick(
+        scrub, touched || cdj_mode, uses_audio && audio_engine_deck_seek_busy(deck),
+        deck_now_ms());
+    if (action == DECK_JOG_SCRUB_IGNORE) {
+        if (scrub->ignored == 1u || scrub->ignored % 64u == 0u) {
+            ESP_LOGW(TAG, "deck %u jog %+d ignored: paused, platter not touched (%lu ticks)",
+                     (unsigned)deck + 1, delta, (unsigned long)scrub->ignored);
+        }
+        return;
     }
+    if (scrub->transport) {
+        state->position_ms = deck_jog_transport_move(scrub, delta, jog_last_valid_ms(deck));
+    } else {
+        int32_t pos = (int32_t)state->position_ms + deck_jog_scrub_step_ms(cdj_mode, delta);
+        state->position_ms = (pos < 0) ? 0 : (uint32_t)pos;
+    }
+    if (action == DECK_JOG_SCRUB_SEEK && uses_audio) {
+        deck_seek(deck, state->position_ms, "JOG_SCRUB");
+    }
+    jog_show_publish(deck);
     ESP_LOGD(TAG, "deck %u jog scrub -> %lu ms", (unsigned)deck + 1,
              (unsigned long)state->position_ms);
 }
@@ -2806,16 +3204,12 @@ static void on_jog_search(uint8_t deck, int16_t delta)
     /* Never seek to or beyond EOF. At exact EOF there is no frame available
      * to release the startup gate; rapid held-search events used to leave the
      * deck logically PLAYING with a frozen waveform and a full PCM runway. */
-    deck_loaded_track_summary_t loaded = {0};
-    if (deck_loaded_track_store_get(&s_loaded_tracks, deck, &loaded) &&
-        loaded.valid && loaded.duration_ms > 0u) {
-        uint32_t last_valid_ms = loaded.duration_ms - 1u;
-        if (target > (int64_t)last_valid_ms) {
-            target = (int64_t)last_valid_ms;
-        }
+    const uint32_t length_ms = deck_track_length_ms(deck);
+    if (length_ms > 0u && target > (int64_t)(length_ms - 1u)) {
+        target = (int64_t)(length_ms - 1u);
     }
 
-    esp_err_t rc = uses_audio ? audio_engine_deck_seek(deck, (uint32_t)target) : ESP_OK;
+    esp_err_t rc = uses_audio ? deck_seek(deck, (uint32_t)target, "JOG_SEARCH") : ESP_OK;
     if (rc == ESP_OK) {
         state->position_ms = (uint32_t)target;
         ESP_LOGD(TAG, "deck %u jog search %+d -> %lu ms",
@@ -2931,7 +3325,7 @@ static bool apply_beat_sync(uint8_t deck, deck_state_t *state)
     anlz_snapshot_release(target_snapshot);
     anlz_snapshot_release(reference_snapshot);
     if (phase_target_available) {
-        esp_err_t seek_rc = audio_engine_deck_seek(deck, aligned_ms);
+        esp_err_t seek_rc = deck_seek(deck, aligned_ms, "SYNC_PHASE");
         if (seek_rc == ESP_OK) {
             state->position_ms = aligned_ms;
             phase_aligned = true;
@@ -3070,15 +3464,47 @@ static bool event_uses_ui_without_deck_state(const ctrl_event_t *ev)
 
 // ─── Main task ────────────────────────────────────────────────────────────────
 
+/* v265: seeks the scrub target the jog ticks left pending once the engine has
+ * served the previous seek. True while an engaged deck (touched, or any deck
+ * in CDJ mode, v267) still has one. */
+static bool jog_scrub_service(void)
+{
+    bool waiting = false;
+    const bool cdj_mode = deck_core_get_jog_cdj_mode();
+    for (uint8_t deck = 0; deck < DECK_CORE_DECK_COUNT; deck++) {
+        deck_jog_scrub_t *scrub = &s_jog_scrub[deck];
+        if (!(s_jog_touched[deck] || cdj_mode) || !scrub->pending ||
+            !deck_uses_audio_engine(deck)) {
+            continue;
+        }
+        if (deck_jog_scrub_poll(scrub, audio_engine_deck_seek_busy(deck), deck_now_ms())) {
+            deck_seek(deck, s_decks[deck].position_ms, "JOG_SCRUB");
+            jog_show_publish(deck);
+        } else {
+            waiting = true;
+        }
+    }
+    return waiting;
+}
+
 static void deck_task(void *arg)
 {
     ctrl_event_t ev;
     while (1) {
+        const bool cue_parked = cue_park_service();
+        const bool scrub_waiting = jog_scrub_service();
         publish_state_snapshot();
-        if (xQueueReceive(s_queue, &ev, portMAX_DELAY) != pdTRUE) continue;
+        TickType_t wait = portMAX_DELAY;
+        if (cue_parked) {
+            wait = pdMS_TO_TICKS(DECK_CUE_PARK_RETRY_MS);
+        } else if (scrub_waiting) {
+            wait = pdMS_TO_TICKS(DECK_JOG_SCRUB_POLL_MS);
+        }
+        if (xQueueReceive(s_queue, &ev, wait) != pdTRUE) continue;
 
         if (ev.type == CTRL_EV_STATE && ev.id == DECK_CORE_INTERNAL_RESET_ID) {
             const uint8_t idx = normalize_deck(ev.deck);
+            cue_park_cancel(idx, "deck reset");
             if (s_decks[idx].loop_adjust_mode != DECK_CORE_LOOP_ADJUST_NONE) {
                 s_decks[idx].loop_adjust_mode = DECK_CORE_LOOP_ADJUST_NONE;
                 publish_loop_adjust_leds(idx, &s_decks[idx]);
@@ -3090,6 +3516,8 @@ static void deck_task(void *arg)
             s_jog_hold_active[idx] = false;
             s_cue_preview[idx] = false;
             s_jog_scratch_active[idx] = false;
+            memset(&s_jog_scrub[idx], 0, sizeof(s_jog_scrub[idx]));
+            __atomic_store_n(&s_jog_show_pub[idx], DECK_JOG_SHOW_ENGINE, __ATOMIC_RELEASE);
             if (s_sync_master_deck == idx) s_sync_master_deck = CTRL_DECK_NONE;
             memset(&s_loop_shadow[idx], 0, sizeof(s_loop_shadow[idx]));
             memset(&s_shifted_loop_roll[idx], 0, sizeof(s_shifted_loop_roll[idx]));
@@ -3104,6 +3532,11 @@ static void deck_task(void *arg)
 
         if (ev.type == CTRL_EV_STATE && ev.id == DECK_CORE_INTERNAL_LOAD_CUE_ID) {
             apply_loaded_memory_cue(ev.deck, (uint16_t)ev.value);
+            continue;
+        }
+
+        if (ev.type == CTRL_EV_STATE && ev.id == DECK_CORE_INTERNAL_TEMPO_RANGE_ID) {
+            apply_tempo_range_all((uint16_t)ev.value);
             continue;
         }
 
@@ -3277,9 +3710,14 @@ static esp_err_t queue_event_with_wake_policy(const ctrl_event_t *ev,
     if (!s_queue || !ev) return ESP_ERR_INVALID_ARG;
     /* Single choke point for every FLX4 button, jog, fader and web mutation.
      * Physical controls consume a wake press; authenticated remote mutations
-     * dismiss the screensaver but still enter the authoritative deck queue. */
+     * dismiss the screensaver but still enter the authoritative deck queue.
+     * Releases, held modifiers and faders always pass (see
+     * control_link_event_wake_consumable). */
     const bool woke_screensaver = s_activity_cb && s_activity_cb();
-    if (woke_screensaver && consume_wake) return ESP_OK;
+    if (woke_screensaver && consume_wake &&
+        control_link_event_wake_consumable(ev)) {
+        return ESP_OK;
+    }
     if (xQueueSend(s_queue, ev, 0) != pdTRUE) {
         s_drop_count++;
         TickType_t now = xTaskGetTickCount();
@@ -3345,7 +3783,7 @@ static void publish_loaded_track_hot_cue_leds(uint8_t deck)
     s_loaded_hot_cue_mask_valid[deck] = true;
 }
 
-deck_state_t deck_core_get_deck_state(uint8_t deck)
+static deck_state_t deck_state_snapshot(uint8_t deck, bool wait)
 {
     const uint8_t idx = normalize_deck(deck);
     deck_state_t snap = {0};
@@ -3353,9 +3791,28 @@ deck_state_t deck_core_get_deck_state(uint8_t deck)
 
     if (deck_uses_audio_engine(idx)) {
         snap.playing = audio_engine_deck_is_playing(idx);
-        snap.position_ms = audio_engine_deck_position_ms(idx);
+        /* v267/v268: during a jog transport or a CDJ paused nudge the
+         * waveform follows the target on every tick, the engine only has the
+         * last target it was sent. A deck that plays outside a transport
+         * shows the engine even if a nudge target is still pending. */
+        const uint8_t show = __atomic_load_n(&s_jog_show_pub[idx], __ATOMIC_ACQUIRE);
+        if (show == DECK_JOG_SHOW_ENGINE ||
+            (show == DECK_JOG_SHOW_TARGET && snap.playing)) {
+            snap.position_ms = wait ? audio_engine_deck_position_ms(idx)
+                                    : audio_engine_deck_position_ms_nowait(idx);
+        }
     }
     return snap;
+}
+
+deck_state_t deck_core_get_deck_state(uint8_t deck)
+{
+    return deck_state_snapshot(deck, true);
+}
+
+deck_state_t deck_core_get_deck_state_nowait(uint8_t deck)
+{
+    return deck_state_snapshot(deck, false);
 }
 
 deck_core_beat_fx_state_t deck_core_get_beat_fx_state(void)
@@ -3368,6 +3825,44 @@ deck_core_beat_fx_state_t deck_core_get_beat_fx_state(void)
 deck_core_beat_jump_page_t deck_core_get_beat_jump_page(void)
 {
     return __atomic_load_n(&s_beat_jump_page, __ATOMIC_ACQUIRE);
+}
+
+void deck_core_set_jog_cdj_mode(bool on)
+{
+    __atomic_store_n(&s_jog_cdj_mode, on, __ATOMIC_RELEASE);
+}
+
+bool deck_core_get_jog_cdj_mode(void)
+{
+    return __atomic_load_n(&s_jog_cdj_mode, __ATOMIC_ACQUIRE);
+}
+
+void deck_core_set_tempo_range_percent(uint16_t pct)
+{
+    if (!tempo_range_percent_valid(pct)) pct = DEFAULT_TEMPO_RANGE_PERCENT;
+    __atomic_store_n(&s_tempo_range_percent, pct, __ATOMIC_RELEASE);
+    /* Deck state belongs to the deck task; before it exists the decks pick
+     * the range up from init_deck_state(). */
+#if defined(DECK_CORE_PC_TEST)
+    apply_tempo_range_all(pct);
+#else
+    if (s_queue) {
+        ctrl_event_t ev = {
+            .type = CTRL_EV_STATE,
+            .id = DECK_CORE_INTERNAL_TEMPO_RANGE_ID,
+            .value = (int16_t)pct,
+        };
+        if (xQueueSend(s_queue, &ev,
+                       pdMS_TO_TICKS(DECK_CORE_TEMPO_RANGE_QUEUE_TIMEOUT_MS)) != pdTRUE) {
+            ESP_LOGW(TAG, "tempo range event dropped; decks keep their range");
+        }
+    }
+#endif
+}
+
+uint16_t deck_core_get_tempo_range_percent(void)
+{
+    return __atomic_load_n(&s_tempo_range_percent, __ATOMIC_ACQUIRE);
 }
 
 deck_core_loop_display_t deck_core_get_loop_display(uint8_t deck)
@@ -3409,6 +3904,8 @@ void deck_core_reset_deck(uint8_t deck)
     s_jog_hold_active[idx] = false;
     s_cue_preview[idx] = false;
     s_jog_scratch_active[idx] = false;
+    memset(&s_jog_scrub[idx], 0, sizeof(s_jog_scrub[idx]));
+    __atomic_store_n(&s_jog_show_pub[idx], DECK_JOG_SHOW_ENGINE, __ATOMIC_RELEASE);
     if (s_sync_master_deck == idx) s_sync_master_deck = CTRL_DECK_NONE;
     memset(&s_loop_shadow[idx], 0, sizeof(s_loop_shadow[idx]));
     memset(&s_shifted_loop_roll[idx], 0, sizeof(s_shifted_loop_roll[idx]));
@@ -3556,6 +4053,7 @@ uint32_t deck_core_hot_cues_revision(void)
 void deck_core_test_reset(void)
 {
     deck_loaded_track_store_reset(&s_loaded_tracks);
+    __atomic_store_n(&s_tempo_range_percent, DEFAULT_TEMPO_RANGE_PERCENT, __ATOMIC_RELEASE);
     for (uint8_t i = 0; i < DECK_CORE_DECK_COUNT; i++) {
         init_deck_state(&s_decks[i]);
     }
@@ -3577,6 +4075,8 @@ void deck_core_test_reset(void)
     memset(s_beat_jump_pad_led_state, 0, sizeof(s_beat_jump_pad_led_state));
     memset(s_deck_shift_held, 0, sizeof(s_deck_shift_held));
     memset(s_jog_touched, 0, sizeof(s_jog_touched));
+    memset(s_jog_scrub, 0, sizeof(s_jog_scrub));
+    memset(s_jog_show_pub, 0, sizeof(s_jog_show_pub));
     memset(s_jog_hold_active, 0, sizeof(s_jog_hold_active));
     memset(s_cue_preview, 0, sizeof(s_cue_preview));
     memset(s_jog_scratch_active, 0, sizeof(s_jog_scratch_active));

@@ -12,13 +12,23 @@
 static SemaphoreHandle_t s_runtime_mutex;
 #else
 #include <pthread.h>
+
 static pthread_mutex_t s_runtime_mutex = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
+/* v292: EXT_RAM_BSS_ATTR moves a static to PSRAM when
+ * CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY is set; empty on host builds. */
+#ifdef ESP_PLATFORM
+#include "esp_attr.h"
+#endif
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
 #endif
 
 static controller_runtime_config_t s_config;
 static flx4_map_state_t s_map;
 static controller_event_buffer_t s_buffer;
-static flx4_control_event_t
+EXT_RAM_BSS_ATTR static flx4_control_event_t
     s_snapshot_events[CP_MAX_INPUTS];
 static flx4_control_event_t s_retry_event;
 static size_t s_snapshot_count;

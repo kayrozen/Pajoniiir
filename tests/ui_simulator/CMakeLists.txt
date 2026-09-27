@@ -107,41 +107,37 @@ if(MINGW)
 endif()
 
 # ── JC1060 target (1024x600) ──────────────────────────────────────────────────
-add_executable(ui_simulator_e2e_jc1060 ${UI_SIM_SRC})
+# The JC1060 gate renders the dj_ui presentation layer (the JC1060 UI
+# component copy) with the deterministic demo data source. It no longer builds
+# the P4 800x480 UI sources.
+set(JC1060_UI_DIR "${REPO_ROOT}/firmware/main-deck-jc1060/components/ui")
 
-target_compile_definitions(ui_simulator_e2e_jc1060 PRIVATE
-    WIN32=1
-    DECK_CORE_PC_TEST=1
-    REKORDBOX_PDB_STANDALONE_TEST=1
-    CONFIG_AUDIO_RECORDER_ENABLED=0
-    CONFIG_AUDIO_SCRATCH_ENABLED=0
-    UI_TARGET_JC1060=1
+add_executable(ui_simulator_e2e_jc1060
+    dj_ui_simulator_e2e.c
+    dj_ui_demo.c
+    "${JC1060_UI_DIR}/dj_ui.c"
+    "${JC1060_UI_DIR}/ui_djui_bridge.c"
+    "${JC1060_UI_DIR}/ui_djui_text.c"
+    "${JC1060_UI_DIR}/ui_overview_wave_cache.c"
+    "${JC1060_UI_DIR}/ui_overview_renderer.c"
+    "${JC1060_UI_DIR}/ui_overview_grid.c"
+    "${JC1060_UI_DIR}/ui_waveform_model.c"
+    "${JC1060_UI_DIR}/ui_overview_motion.c"
+    "${JC1060_UI_DIR}/ui_artwork_thumb.c"
 )
 
-target_compile_options(ui_simulator_e2e_jc1060 PRIVATE
-    -DUI_HOR_RES=1024
-    -DUI_VER_RES=600
-    -DUI_TOPBAR_H=54
-    -DUI_CONTENT_Y=54
-    -DUI_CONTENT_H=546
-    -DLV_CONF_INCLUDE="\"${CMAKE_CURRENT_SOURCE_DIR}/lv_conf_jc1060.h\""
-)
+# LVGL exports its LV_BUILD_CONF_PATH (lv_conf.h, identical to
+# lv_conf_jc1060.h) to every consumer, so dj_ui and LVGL share one config.
+target_compile_options(ui_simulator_e2e_jc1060 PRIVATE -Wall -Wextra)
 
 target_include_directories(ui_simulator_e2e_jc1060 PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"
-    "${REPO_ROOT}/tests/deck_core_dual/stubs"
-    "${REPO_ROOT}/tests/support/stubs"
-    "${UI_DIR}/include"
-    "${LIBRARY_DIR}/include"
-    "${REPO_ROOT}/firmware/main-deck-p4/components/deck_core/include"
-    "${REPO_ROOT}/firmware/main-deck-p4/components/beat_jump/include"
-    "${REPO_ROOT}/firmware/main-deck-p4/components/control_link/include"
-    "${REPO_ROOT}/firmware/main-deck-p4/components/hot_cue_store/include"
-    "${REPO_ROOT}/firmware/main-deck-p4/components/audio_engine/include"
-    "${REPO_ROOT}/firmware/main-deck-p4/components/audio_mixer/include"
-    "${REPO_ROOT}/firmware/main-deck-p4/components/app_settings/include"
-    "${REPO_ROOT}/firmware/main-deck-p4/components/media_io_gate/include"
+    "${JC1060_UI_DIR}/include"
+    "${REPO_ROOT}/firmware/main-deck-jc1060/components/library/include"
 )
+# Phase 5: the bridge's zoom strip is the firmware ANLZ wave cache; the ANLZ
+# header drops its esp_err.h dependency in standalone mode.
+target_compile_definitions(ui_simulator_e2e_jc1060 PRIVATE ANLZ_STANDALONE_TEST)
 
 target_link_libraries(ui_simulator_e2e_jc1060 PRIVATE lvgl m)
 

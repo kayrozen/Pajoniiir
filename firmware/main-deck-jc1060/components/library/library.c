@@ -1,4 +1,5 @@
 #include "library.h"
+#include "library_playlists.h"
 #include "rekordbox_pdb.h"
 #include "rekordbox_anlz.h"
 #include "track_meta_cache.h"
@@ -14,6 +15,15 @@
 #include <strings.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+/* v292: EXT_RAM_BSS_ATTR moves a static to PSRAM when
+ * CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY is set; empty on host builds. */
+#ifdef ESP_PLATFORM
+#include "esp_attr.h"
+#endif
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
+#endif
 
 /* Host suites compile this source without sdkconfig.h and exercise the product
  * default. Firmware receives the Kconfig value from ESP-IDF. */
@@ -59,9 +69,14 @@ static int              s_track_count = 0;
 static uint32_t         s_generation = 0;
 static pdb_import_stats_t s_import_stats;
 static SemaphoreHandle_t s_library_mutex = NULL;
+/* JC1060 playlists: published and retired together with the track store. */
+static library_playlist_set_t s_playlists;
+/* JC1060 artwork paths (sorted by id), same lifetime as s_playlists. */
+static pdb_artwork_t   *s_artworks;
+static int              s_artwork_count;
 static bool             s_index_building = false;
 
-static anlz_metadata_t s_current_meta;
+EXT_RAM_BSS_ATTR static anlz_metadata_t s_current_meta;
 static bool            s_current_meta_valid = false;
 static int             s_ui_track_idx = 0;
 
@@ -231,6 +246,20 @@ static void library_apply_meta_to_track(library_track_t *track, const anlz_metad
      * no duration at all. Overwriting unconditionally used to truncate playback
      * length to the last beat, and was being undone again by two separate callers
      * downstream; enforce it once, here, where the value is produced. */
+    /* v270: PWV3 refines the PDB length (whole seconds) to 1/150 s. It feeds
+     * the engine's PVBR seeks and every view's time mapping through
+     * media_loaded_track_t, so they all share this one value. */
+    const uint32_t precise_ms = anlz_precise_duration_ms(track->duration_ms,
+                                                         meta->waveform_high_len);
+    if (precise_ms != track->duration_ms) {
+        ESP_LOGW(TAG, "duration %lu ms (pdb) -> %lu ms (pwv3 %lu entries)",
+                 (unsigned long)track->duration_ms, (unsigned long)precise_ms,
+                 (unsigned long)meta->waveform_high_len);
+        track->duration_ms = precise_ms;
+    } else if (meta->waveform_high_len == 0u) {
+        ESP_LOGW(TAG, "duration %lu ms (pdb, no pwv3)",
+                 (unsigned long)track->duration_ms);
+    }
     if (track->duration_ms == 0u && meta->beat_count > 0 && meta->beats) {
         track->duration_ms = meta->beats[meta->beat_count - 1].time_ms;
     }
@@ -243,6 +272,13 @@ static void library_apply_meta_to_track(library_track_t *track, const anlz_metad
         track->has_pvbr = 1;
     }
     track->has_anlz = 1;
+}
+
+static int compare_u32(const void *a, const void *b)
+{
+    uint32_t ua = *(const uint32_t *)a;
+    uint32_t ub = *(const uint32_t *)b;
+    return ua < ub ? -1 : (ua > ub ? 1 : 0);
 }
 
 /* ── library_init ─────────────────────────────────────────────────────────── *
@@ -335,11 +371,49 @@ esp_err_t library_init(void)
         library_copy_str(lt->artist,    sizeof(lt->artist),    pt.artist);
         library_copy_str(lt->album,     sizeof(lt->album),     pt.album);
         lt->track_id = pt.track_id;
+        lt->artwork_id = pt.artwork_id;
         lt->bpm      = pt.bpm;
         lt->duration_ms = (uint32_t)pt.duration_s * 1000u;
         library_copy_str(lt->key, sizeof(lt->key), pt.key);
 
         build_count++;
+    }
+
+    /* Playlists resolve against exactly the rows being published, so a track
+     * dropped by the catalog cap never appears as a dead playlist row. */
+    library_playlist_set_t playlists = {0};
+    if (!media_lost) {
+        const size_t ids_bytes = (size_t)(build_count > 0 ? build_count : 1) * sizeof(uint32_t);
+        uint32_t *ids = heap_caps_malloc(ids_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!ids) ids = malloc(ids_bytes);
+        int id_count = 0;
+        if (ids) {
+            for (int i = 0; i < build_count; ++i) {
+                if (build_index[i].track_id != 0u) ids[id_count++] = build_index[i].track_id;
+            }
+            qsort(ids, (size_t)id_count, sizeof(uint32_t), compare_u32);
+            if (library_playlists_build(pdb, ids, id_count, &playlists) != ESP_OK) {
+                ESP_LOGW(TAG, "Out of memory for playlists; browsing tracks only");
+            }
+            free(ids);
+        }
+    }
+
+    /* Artwork paths are tiny (68 B each), copied whole in id order. */
+    pdb_artwork_t *artworks = NULL;
+    int artwork_count = 0;
+    if (!media_lost && pdb_artwork_count(pdb) > 0) {
+        const int n_art = pdb_artwork_count(pdb);
+        const size_t art_bytes = (size_t)n_art * sizeof(pdb_artwork_t);
+        artworks = heap_caps_malloc(art_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!artworks) artworks = malloc(art_bytes);
+        if (artworks) {
+            for (int i = 0; i < n_art; ++i) {
+                if (pdb_get_artwork(pdb, i, &artworks[artwork_count]) == ESP_OK) artwork_count++;
+            }
+        } else {
+            ESP_LOGW(TAG, "Out of memory for artwork paths; no artwork");
+        }
     }
 
     pdb_import_stats_t import_stats;
@@ -350,6 +424,8 @@ esp_err_t library_init(void)
         media_lost = true;
     }
     if (media_lost) {
+        library_playlists_free(&playlists);
+        free(artworks);
         xSemaphoreTakeRecursive(s_library_mutex, portMAX_DELAY);
         s_index_building = false;
         xSemaphoreGiveRecursive(s_library_mutex);
@@ -367,6 +443,8 @@ esp_err_t library_init(void)
          * because the drive was removed).  Never republish that stale index. */
         s_index_building = false;
         xSemaphoreGiveRecursive(s_library_mutex);
+        library_playlists_free(&playlists);
+        free(artworks);
         ESP_LOGW(TAG, "Discarding stale library index build");
         return ESP_ERR_INVALID_STATE;
     }
@@ -375,6 +453,11 @@ esp_err_t library_init(void)
     s_active_order_buf = build_order_buf;
     s_track_count = build_count;
     s_import_stats = import_stats;
+    library_playlist_set_t superseded_playlists = s_playlists;
+    s_playlists = playlists;
+    pdb_artwork_t *superseded_artworks = s_artworks;
+    s_artworks = artworks;
+    s_artwork_count = artwork_count;
     if (s_ui_track_idx >= build_count) {
         s_ui_track_idx = 0;
     }
@@ -387,10 +470,14 @@ esp_err_t library_init(void)
         release_track_buffer_locked(superseded_buf);
     }
     xSemaphoreGiveRecursive(s_library_mutex);
+    /* Readers copy playlist data under the lock, so the old set is unreachable. */
+    library_playlists_free(&superseded_playlists);
+    free(superseded_artworks);
 
-    ESP_LOGI(TAG, "Library ready: %d tracks from PDB (%u KiB of records)",
+    ESP_LOGI(TAG, "Library ready: %d tracks from PDB (%u KiB of records), %d playlists, %d artworks",
              build_count,
-             (unsigned)(((size_t)build_count * sizeof(library_track_t)) / 1024u));
+             (unsigned)(((size_t)build_count * sizeof(library_track_t)) / 1024u),
+             playlists.list_count, artwork_count);
     return ESP_OK;
 }
 
@@ -434,10 +521,99 @@ void library_clear(void)
     }
     s_track_count = 0;
     s_import_stats = (pdb_import_stats_t){0};
+    library_playlist_set_t cleared_playlists = s_playlists;
+    memset(&s_playlists, 0, sizeof(s_playlists));
+    pdb_artwork_t *cleared_artworks = s_artworks;
+    s_artworks = NULL;
+    s_artwork_count = 0;
     s_generation++;
     s_ui_track_idx = 0;
     xSemaphoreGiveRecursive(s_library_mutex);
+    library_playlists_free(&cleared_playlists);
+    free(cleared_artworks);
     ESP_LOGI(TAG, "Library cleared");
+}
+
+/* ── Playlists (JC1060) ───────────────────────────────────────────────────── *
+ *
+ * Same generation as the track store: a rebuild or clear replaces both under
+ * the lock. Keys are catalog track keys (library_track_key == track_id for
+ * every PDB track that can be in a playlist).
+ */
+int library_playlist_count(void)
+{
+    if (ensure_library_mutex() != ESP_OK) return 0;
+    xSemaphoreTakeRecursive(s_library_mutex, portMAX_DELAY);
+    int count = s_playlists.list_count;
+    xSemaphoreGiveRecursive(s_library_mutex);
+    return count;
+}
+
+esp_err_t library_playlist_get(int index, library_playlist_info_t *out)
+{
+    if (!out) return ESP_ERR_INVALID_ARG;
+    memset(out, 0, sizeof(*out));
+    if (ensure_library_mutex() != ESP_OK) return ESP_ERR_NOT_FOUND;
+    xSemaphoreTakeRecursive(s_library_mutex, portMAX_DELAY);
+    esp_err_t rc = ESP_ERR_NOT_FOUND;
+    if (index >= 0 && index < s_playlists.list_count) {
+        const library_playlist_t *pl = &s_playlists.lists[index];
+        library_copy_str(out->name, sizeof(out->name), pl->name);
+        library_copy_str(out->folder, sizeof(out->folder), pl->folder);
+        out->track_count = pl->count;
+        out->missing = pl->missing;
+        rc = ESP_OK;
+    }
+    xSemaphoreGiveRecursive(s_library_mutex);
+    return rc;
+}
+
+int library_playlist_track_keys(int index, uint32_t *out_keys, int max)
+{
+    if (!out_keys || max <= 0 || ensure_library_mutex() != ESP_OK) return 0;
+    xSemaphoreTakeRecursive(s_library_mutex, portMAX_DELAY);
+    int n = 0;
+    if (index >= 0 && index < s_playlists.list_count) {
+        const library_playlist_t *pl = &s_playlists.lists[index];
+        n = pl->count < max ? pl->count : max;
+        memcpy(out_keys, &s_playlists.keys[pl->first], (size_t)n * sizeof(uint32_t));
+    }
+    xSemaphoreGiveRecursive(s_library_mutex);
+    return n;
+}
+
+/* ── Artwork (JC1060) ─────────────────────────────────────────────────────── *
+ *
+ * One linear key scan plus a binary search, under the library lock. Called by
+ * the artwork worker only, never per frame. */
+bool library_artwork_path_for_key(uint32_t track_key, char *dst, size_t dst_sz)
+{
+    if (!dst || dst_sz == 0u) return false;
+    dst[0] = '\0';
+    if (track_key == 0u || ensure_library_mutex() != ESP_OK) return false;
+    bool found = false;
+    xSemaphoreTakeRecursive(s_library_mutex, portMAX_DELAY);
+    library_track_t *idx = active_tracks();
+    uint32_t artwork_id = 0u;
+    for (int row = 0; idx && row < s_track_count; ++row) {
+        if (library_track_key(&idx[row]) == track_key) {
+            artwork_id = idx[row].artwork_id;
+            break;
+        }
+    }
+    int lo = 0, hi = artwork_id ? s_artwork_count : 0;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (s_artworks[mid].id < artwork_id) lo = mid + 1;
+        else hi = mid;
+    }
+    if (artwork_id && lo < s_artwork_count && s_artworks[lo].id == artwork_id) {
+        int n = snprintf(dst, dst_sz, "%s%s", USB_MOUNT_POINT, s_artworks[lo].path);
+        found = n > 0 && (size_t)n < dst_sz;
+        if (!found) dst[0] = '\0';
+    }
+    xSemaphoreGiveRecursive(s_library_mutex);
+    return found;
 }
 
 /* ── library_get ──────────────────────────────────────────────────────────── */

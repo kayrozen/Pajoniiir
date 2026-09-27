@@ -37,6 +37,7 @@ typedef struct {
     char     album[LIBRARY_STR_MAX];
     char     key[16];
     uint32_t track_id;
+    uint32_t artwork_id;           /* export.pdb Artwork row, 0 = none */
     uint16_t bpm;
     uint32_t duration_ms;
 
@@ -84,6 +85,28 @@ void library_last_anlz_load_stats(uint32_t *out_elapsed_ms, uint8_t *out_source,
                                   bool *out_cache_written);
 esp_err_t library_clone_current_anlz(anlz_metadata_t *out);
 void library_free_current_anlz(void);
+
+/* JC1060 artwork: absolute path of the JPEG export.pdb links to `track_key`
+ * ("/usb/PIONEER/Artwork/00001/a3.jpg"). false = no artwork or unknown track.
+ * Takes the library lock: worker tasks only, not the draw path. */
+bool library_artwork_path_for_key(uint32_t track_key, char *dst, size_t dst_sz);
+
+/* JC1060 playlists (export.pdb PlaylistTree/PlaylistEntries), flattened in
+ * rekordbox order and published with the track store (same generation).
+ * Folders are not listed; `folder` names a playlist's immediate folder. */
+#define LIBRARY_PLAYLIST_TEXT_MAX 64
+typedef struct {
+    char     name[LIBRARY_PLAYLIST_TEXT_MAX];
+    char     folder[LIBRARY_PLAYLIST_TEXT_MAX];
+    uint16_t track_count;          /* playable entries, duplicates kept */
+    uint16_t missing;              /* entries not in the catalog, skipped */
+} library_playlist_info_t;
+
+int       library_playlist_count(void);
+esp_err_t library_playlist_get(int index, library_playlist_info_t *out);
+/* Copies up to `max` catalog track keys of playlist `index`, in playlist
+ * order. Returns the number copied (0 for an unknown index). */
+int       library_playlist_track_keys(int index, uint32_t *out_keys, int max);
 
 /* Selected-row state used by the UI highlight/simulator bridge. This is not a
  * deck-load API; real loads use media_catalog identity + generation. */

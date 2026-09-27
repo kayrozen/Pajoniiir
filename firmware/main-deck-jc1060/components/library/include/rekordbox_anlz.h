@@ -71,6 +71,25 @@ extern "C" {
 #define ANLZ_MAX_CUES              8u   /* hot cues 0–7                    */
 #define ANLZ_WAVEFORM_HIGH_MAX 131072u  /* PWV3: up to 128 KB (observed max ~62 KB) */
 #define ANLZ_PATH_MAX            512u   /* audio path buffer               */
+#define ANLZ_WAVEFORM_HIGH_PER_S 150u   /* PWV3: entries per second of audio */
+/* PWV3 may be at most this far from the PDB length (whole seconds) to be
+ * taken as the track length; beyond it (truncated PWV3, other file) PDB wins. */
+#define ANLZ_DURATION_PWV3_TOLERANCE_MS 1500u
+
+/* v270: the track length used as the time base of the PVBR seek table, the
+ * waveform and the touch mapping. The PDB stores whole seconds, up to ~1 s
+ * off; a PVBR entry lands proportionally off (v269 HW: mini-waveform seeks
+ * desynced from the zoom). PWV3 has 150 entries per second of audio, so its
+ * length is the track length to 1/150 s. 0 = no usable length. */
+static inline uint32_t anlz_precise_duration_ms(uint32_t pdb_ms, uint32_t pwv3_len)
+{
+    if (pwv3_len == 0u || pwv3_len >= ANLZ_WAVEFORM_HIGH_MAX) return pdb_ms;
+    const uint32_t pwv3_ms =
+        (uint32_t)(((uint64_t)pwv3_len * 1000u) / ANLZ_WAVEFORM_HIGH_PER_S);
+    if (pdb_ms == 0u) return pwv3_ms;
+    const uint32_t diff = pwv3_ms > pdb_ms ? pwv3_ms - pdb_ms : pdb_ms - pwv3_ms;
+    return diff <= ANLZ_DURATION_PWV3_TOLERANCE_MS ? pwv3_ms : pdb_ms;
+}
 
 /* ── Beat grid entry (8 bytes, big-endian in file) ────────────────────────── */
 typedef struct {

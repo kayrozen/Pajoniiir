@@ -6,6 +6,7 @@
 static QueueHandle_t s_event_queue;
 static atomic_uint_fast8_t s_sequence;
 static control_link_led_sink_fn_t s_led_sink;
+static _Atomic(control_link_event_sink_fn_t) s_event_sink;
 static void *s_led_sink_context;
 static portMUX_TYPE s_led_sink_mux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -17,6 +18,11 @@ esp_err_t control_link_init(QueueHandle_t ctrl_event_queue)
     s_event_queue = ctrl_event_queue;
     atomic_store_explicit(&s_sequence, 0u, memory_order_relaxed);
     return ESP_OK;
+}
+
+void control_link_set_event_sink(control_link_event_sink_fn_t sink)
+{
+    atomic_store_explicit(&s_event_sink, sink, memory_order_release);
 }
 
 void control_link_set_led_sink(control_link_led_sink_fn_t sink, void *user_ctx)
@@ -83,6 +89,11 @@ esp_err_t control_link_inject_semantic(uint8_t type, uint8_t id, int16_t value)
         return ESP_ERR_INVALID_ARG;
     }
 
+    control_link_event_sink_fn_t sink =
+        atomic_load_explicit(&s_event_sink, memory_order_acquire);
+    if (sink) {
+        return sink(&event);
+    }
     return xQueueSend(s_event_queue, &event, 0) == pdTRUE
                ? ESP_OK
                : ESP_ERR_TIMEOUT;

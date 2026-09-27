@@ -96,13 +96,28 @@ fi
 
 # --- Screenshot comparison ---
 CAPTURES=(
-    overview_deck1
-    overview_deck2
+    overview
+    overview_playing
+    overview_cue
+    overview_external
     library
+    library_busy
+    library_loaded
     hot_cues
     settings
+    settings_link_off
+    overview_restored
     screensaver
-    settings_restored
+    blackout
+    settings_bridge
+    hotcues_bridge_d1
+    hotcues_bridge_d2
+    library_bridge
+    library_bridge_sort_desc
+    library_bridge_peer
+    overview_bridge
+    overview_bridge_scroll
+    overview_bridge_elapsed
 )
 
 declare -A ACTUAL
@@ -142,17 +157,7 @@ else
     fi
 
     MISMATCH=0
-    while IFS= read -r line; do
-        name="$(echo "$line" | cut -d'=' -f1)"
-        expected="${ACTUAL[$name]}"
-        actual="${ACTUAL[$name]}"
-        if [[ -z "$expected" || "$expected" != "$actual" ]]; then
-            echo "Screenshot mismatch: $name expected=$expected actual=$actual" >&2
-            MISMATCH=1
-        else
-            echo "PASS screenshot $name $actual"
-        fi
-    done < <(
+    EXPECTED_LINES="$(
         python3 -c "
 import json, sys
 with open('${MANIFEST_PATH}', 'r', encoding='utf-8') as f:
@@ -163,7 +168,30 @@ if expected['schema'] != 1 or expected['lvgl_commit'] != '${LVGL_COMMIT}' or exp
 for name, h in expected['captures'].items():
     print(f'{name}={h}')
 "
-    )
+    )" || exit 1
+
+    declare -A EXPECTED
+    while IFS='=' read -r name hash; do
+        [[ -n "$name" ]] && EXPECTED[$name]="$hash"
+    done <<< "$EXPECTED_LINES"
+
+    for name in "${CAPTURES[@]}"; do
+        if [[ -z "${EXPECTED[$name]:-}" ]]; then
+            echo "Baseline manifest has no entry for capture: $name" >&2
+            MISMATCH=1
+        fi
+    done
+
+    for name in "${!EXPECTED[@]}"; do
+        expected="${EXPECTED[$name]}"
+        actual="${ACTUAL[$name]:-}"
+        if [[ -z "$actual" || "$expected" != "$actual" ]]; then
+            echo "Screenshot mismatch: $name expected=$expected actual=$actual" >&2
+            MISMATCH=1
+        else
+            echo "PASS screenshot $name $actual"
+        fi
+    done
 
     if [[ $MISMATCH -eq 1 ]]; then
         echo "UI screenshot regression failed. Actual captures: $OUTPUT_DIR" >&2

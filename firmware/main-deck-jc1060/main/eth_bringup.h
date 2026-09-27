@@ -29,6 +29,10 @@ bool eth_bringup_got_ip(void);
 /** v72: current Ethernet IP info (valid after eth_bringup_got_ip()). */
 esp_netif_ip_info_t eth_bringup_ip_info(void);
 
+/** v246: Ethernet esp_netif (NULL before eth_bringup_start()); DJ Link binds
+ *  its UDP PCBs to this interface only. */
+esp_netif_t* eth_bringup_netif(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -16,6 +16,15 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+
+/* v292: EXT_RAM_BSS_ATTR moves a static to PSRAM when
+ * CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY is set; empty on host builds. */
+#ifdef ESP_PLATFORM
+#include "esp_attr.h"
+#endif
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
+#endif
 static SemaphoreHandle_t s_lock;
 #define RT_LOCK()   do { if (s_lock) xSemaphoreTake(s_lock, portMAX_DELAY); } while (0)
 #define RT_UNLOCK() do { if (s_lock) xSemaphoreGive(s_lock); } while (0)
@@ -32,8 +41,8 @@ static void *rt_scratch_alloc(size_t n)
 #define RT_SCRATCH_ALLOC(n) rt_scratch_alloc(n)
 #endif
 
-static cp_profile_t s_profile;
-static cp_runtime_t s_runtime;
+EXT_RAM_BSS_ATTR static cp_profile_t s_profile;
+EXT_RAM_BSS_ATTR static cp_runtime_t s_runtime;
 static bool s_active;
 static controller_profile_runtime_change_cb_t s_change_cb;
 

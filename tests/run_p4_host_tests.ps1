@@ -1276,6 +1276,175 @@ $tests = @(
         )
     },
     @{
+        # JC1060 paused/CUE pre-roll (v251): real timeline + 2 s forward cap.
+        Name = "audio_cue_preroll"
+        Dir = "tests/audio_cue_preroll"
+        Target = "test_audio_cue_preroll.exe"
+        Args = @(
+            "-Wall", "-Wextra", "-Wpedantic", "-Werror=implicit-function-declaration", "-std=c99",
+            "-I../../firmware/main-deck-jc1060/components/audio_engine/include",
+            "-o", "test_audio_cue_preroll.exe",
+            "test_audio_cue_preroll.c",
+            "../../firmware/main-deck-jc1060/components/audio_engine/audio_cue_preroll.c",
+            "../../firmware/main-deck-jc1060/components/audio_engine/audio_pcm_timeline.c",
+            "../../firmware/main-deck-jc1060/components/audio_engine/audio_start_gate.c"
+        )
+    },
+    @{
+        # JC1060 exact PVBR seek (v263): decode skips from the entry to the target.
+        Name = "audio_seek_skip"
+        Dir = "tests/audio_seek_skip"
+        Target = "test_audio_seek_skip.exe"
+        Args = @(
+            "-Wall", "-Wextra", "-Wpedantic", "-Werror=implicit-function-declaration", "-std=c99",
+            "-I../../firmware/main-deck-jc1060/components/audio_engine/include",
+            "-o", "test_audio_seek_skip.exe",
+            "test_audio_seek_skip.c",
+            "../../firmware/main-deck-jc1060/components/audio_engine/audio_seek_skip.c"
+        )
+    },
+    @{
+        Name = "hot_cue_store_jc1060"
+        Dir = "tests/hot_cue_store_jc1060"
+        Target = "test_hot_cue_store_jc1060.exe"
+        Args = @(
+            "-Wall", "-Wextra", "-Wpedantic", "-std=c99",
+            "-DHOT_CUE_STORE_STANDALONE_TEST",
+            "-I../../firmware/main-deck-jc1060/components/hot_cue_store/include",
+            "-o", "test_hot_cue_store_jc1060.exe",
+            "test_hot_cue_store_jc1060.c",
+            "../../firmware/main-deck-jc1060/components/hot_cue_store/hot_cue_store.c"
+        )
+    },
+    @{
+        Name = "ui_djui_text"
+        Dir = "tests/ui_djui_text"
+        Target = "test_ui_djui_text.exe"
+        Args = @(
+            "-Wall", "-Wextra", "-Wpedantic", "-Werror", "-std=c99",
+            "-I../../firmware/main-deck-jc1060/components/ui/include",
+            "-o", "test_ui_djui_text.exe",
+            "test_ui_djui_text.c",
+            "../../firmware/main-deck-jc1060/components/ui/ui_djui_text.c"
+        )
+    },
+    @{
+        Name = "ui_djui_text_latin"
+        Dir = "tests/ui_djui_text"
+        Target = "test_ui_djui_text_latin.exe"
+        Args = @(
+            "-Wall", "-Wextra", "-Wpedantic", "-Werror", "-std=c99",
+            "-DUI_DJUI_FONT_LATIN=1",
+            "-I../../firmware/main-deck-jc1060/components/ui/include",
+            "-o", "test_ui_djui_text_latin.exe",
+            "test_ui_djui_text.c",
+            "../../firmware/main-deck-jc1060/components/ui/ui_djui_text.c"
+        )
+    },
+    @{
+        Name = "deck_cue_park"
+        Dir = "tests/deck_cue_park"
+        Target = "test_deck_cue_park.exe"
+        Args = @(
+            "-Wall", "-Wextra", "-Wpedantic", "-std=c99",
+            "-I../../firmware/main-deck-jc1060/components/deck_core/include",
+            "-o", "test_deck_cue_park.exe",
+            "test_deck_cue_park.c",
+            "../../firmware/main-deck-jc1060/components/deck_core/deck_cue_park.c"
+        )
+    },
+    @{
+        Name = "deck_jog_scrub"
+        Dir = "tests/deck_jog_scrub"
+        Target = "test_deck_jog_scrub.exe"
+        Args = @(
+            "-Wall", "-Wextra", "-Wpedantic", "-std=c99",
+            "-I../../firmware/main-deck-jc1060/components/deck_core/include",
+            "-o", "test_deck_jog_scrub.exe",
+            "test_deck_jog_scrub.c",
+            "../../firmware/main-deck-jc1060/components/deck_core/deck_jog_scrub.c"
+        )
+    },
+    @{
+        Name = "control_link_wake_jc1060"
+        Dir = "tests/control_link_wake_jc1060"
+        Target = "test_control_link_wake.exe"
+        Args = @(
+            "-Wall", "-Wextra", "-Wpedantic", "-std=c99",
+            "-I../support/stubs",
+            "-I../../firmware/main-deck-jc1060/components/control_link/include",
+            "-o", "test_control_link_wake.exe",
+            "test_control_link_wake.c"
+        )
+    },
+    @{
+        Name = "anlz_duration_jc1060"
+        Dir = "tests/anlz_duration_jc1060"
+        Target = "test_anlz_duration.exe"
+        Args = @(
+            "-Wall", "-Wextra", "-Wpedantic", "-std=c99",
+            "-I../support/stubs",
+            "-I../../firmware/main-deck-jc1060/components/library/include",
+            "-o", "test_anlz_duration.exe",
+            "test_anlz_duration.c"
+        )
+    },
+    @{
+        # JC1060 v271-v273: decoded file length past the Rekordbox analysis
+        # span; PVBR entries after the ID3v2 tag at their exact frame times
+        # (real Rekordbox tables), Xing count kept as the length.
+        Name = "audio_track_length_jc1060"
+        Dir = "tests/audio_track_length_jc1060"
+        Target = "test_audio_track_length.exe"
+        Args = @(
+            "-Wall", "-Wextra", "-Wpedantic", "-Werror=implicit-function-declaration", "-std=c99",
+            "-I../../firmware/main-deck-jc1060/components/audio_engine/include",
+            "-o", "test_audio_track_length.exe",
+            "test_audio_track_length.c",
+            "../../firmware/main-deck-jc1060/components/audio_engine/audio_track_length.c",
+            "../../firmware/main-deck-jc1060/components/audio_engine/audio_seek_skip.c"
+        )
+    },
+    @{
+        # JC1060 v274: loop X2 / /2 / exit while the decoder is already past
+        # the old wrap; the ring is cut where the old and new loops part.
+        Name = "audio_loop_resize_jc1060"
+        Dir = "tests/audio_loop_resize_jc1060"
+        Target = "test_audio_loop_resize.exe"
+        Args = @(
+            "-Wall", "-Wextra", "-Wpedantic", "-Werror=implicit-function-declaration", "-std=c99",
+            "-I../../firmware/main-deck-jc1060/components/audio_engine/include",
+            "-o", "test_audio_loop_resize.exe",
+            "test_audio_loop_resize.c",
+            "../../firmware/main-deck-jc1060/components/audio_engine/audio_loop_resize.c"
+        )
+    },
+    @{
+        Name = "deck_hot_cue_recall"
+        Dir = "tests/deck_hot_cue_recall"
+        Target = "test_deck_hot_cue_recall.exe"
+        Args = @(
+            "-Wall", "-Wextra", "-Wpedantic", "-std=c99",
+            "-I../../firmware/main-deck-jc1060/components/deck_core/include",
+            "-o", "test_deck_hot_cue_recall.exe",
+            "test_deck_hot_cue_recall.c",
+            "../../firmware/main-deck-jc1060/components/deck_core/deck_hot_cue_recall.c"
+        )
+    },
+    @{
+        Name = "ui_audible_position"
+        Dir = "tests/ui_audible_position"
+        Target = "test_ui_audible_position.exe"
+        Args = @(
+            "-Wall", "-Wextra", "-Wpedantic", "-std=c99",
+            "-I../../firmware/main-deck-jc1060/components/ui/include",
+            "-o", "test_ui_audible_position.exe",
+            "test_ui_audible_position.c",
+            "../../firmware/main-deck-jc1060/components/ui/ui_audible_position.c",
+            "../../firmware/main-deck-jc1060/components/ui/ui_position_interpolator.c"
+        )
+    },
+    @{
         Name = "audio_keylock"
         Dir = "tests/audio_keylock"
         Target = "test_audio_keylock.exe"

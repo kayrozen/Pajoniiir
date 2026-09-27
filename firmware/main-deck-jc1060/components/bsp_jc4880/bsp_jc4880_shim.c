@@ -73,10 +73,17 @@ esp_err_t bsp_display_init(void)
     return ESP_OK;
 }
 
+/* v256: bsp_backlight_on() used to follow the set and forced 100 %, so the
+ * Settings slider and the NVS value never reached the panel. Floor 10 % as the
+ * slider does: a low stored value must not black the screen out at boot. */
 void bsp_display_set_backlight(uint8_t pct)
 {
+    if (pct < 10u) {
+        pct = 10u;
+    } else if (pct > 100u) {
+        pct = 100u;
+    }
     bsp_backlight_set_brightness(pct);
-    bsp_backlight_on();
 }
 
 esp_err_t bsp_touch_init(void)

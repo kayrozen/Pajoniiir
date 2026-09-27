@@ -77,6 +77,11 @@ bool controller_usb_audio_stream_pace_ready(size_t frame_count,
 /* v226: lowest ring fill (frames) pace_ready() saw since the previous call,
  * then resets. UINT32_MAX = no pace_ready() call in between. */
 uint32_t controller_usb_audio_stream_take_pace_low_water(void);
+/* v262: smoothed UAC ring fill in microseconds at the stream rate, i.e. how
+ * long a frame written now waits in the ring. 0 while the stream is not
+ * accepting audio. Lock-free; updates its own smoothing, so call it from one
+ * task only (the LVGL task). */
+uint32_t controller_usb_audio_stream_latency_us(void);
 void controller_usb_audio_stream_get_stats(
     controller_usb_audio_stream_stats_t *out_stats);
 /* v239: prints the start trace captured by the isoc callback (first
@@ -85,6 +90,13 @@ void controller_usb_audio_stream_get_stats(
  * Controller task only: the stats getters above are also read from audio/UI
  * tasks. */
 void controller_usb_audio_stream_log_trace(void);
+/* v289 stall probe: isoc callbacks completed, CPU cycles spent in them and
+ * in URB submits (wrapping counters, use differences), plus the longest
+ * callback since the previous call. Any task. */
+void controller_usb_audio_stream_get_work(uint32_t *callbacks,
+                                          uint32_t *cycles,
+                                          uint32_t *max_cycles,
+                                          uint32_t *submit_cycles);
 
 #ifdef __cplusplus
 }

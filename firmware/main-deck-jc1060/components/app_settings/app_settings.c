@@ -34,6 +34,9 @@ static portMUX_TYPE s_cfg_mux = portMUX_INITIALIZER_UNLOCKED;
     .wifi_remote   = 0,                          \
     .main_out_usb  = 1,                          \
     .ui_blackout_play = 0,                       \
+    .dj_link_enable = 0,                         \
+    .jog_cdj_mode  = 0,                          \
+    .tempo_range_pct = 10,                       \
 }
 
 static app_settings_t s_cfg = {
@@ -45,6 +48,9 @@ static app_settings_t s_cfg = {
     .wifi_remote   = 0,
     .main_out_usb  = 1,
     .ui_blackout_play = 0,
+    .dj_link_enable = 0,
+    .jog_cdj_mode  = 0,
+    .tempo_range_pct = 10,
 };
 
 static char s_ota_ssid[APP_SETTINGS_OTA_SSID_CAP];
@@ -173,6 +179,10 @@ esp_err_t app_settings_init(void)
         if (nvs_get_u8(handle, "wifi_rem", &value) == ESP_OK && value <= 1) next.wifi_remote = value;
         if (nvs_get_u8(handle, "main_usb", &value) == ESP_OK && value <= 1) next.main_out_usb = value;
         if (nvs_get_u8(handle, "ui_blk", &value) == ESP_OK && value <= 1) next.ui_blackout_play = value;
+        if (nvs_get_u8(handle, "djlink_en", &value) == ESP_OK && value <= 1) next.dj_link_enable = value;
+        if (nvs_get_u8(handle, "jog_cdj", &value) == ESP_OK && value <= 1) next.jog_cdj_mode = value;
+        if (nvs_get_u8(handle, "tempo_rng", &value) == ESP_OK &&
+            (value == 6 || value == 10 || value == 16)) next.tempo_range_pct = value;
         load_ota_config(handle, ota_ssid, ota_pass, ota_url);
 
         uint8_t stored_schema = 0u;
@@ -188,11 +198,14 @@ esp_err_t app_settings_init(void)
     memcpy(s_ota_url, ota_url, sizeof(s_ota_url));
     portEXIT_CRITICAL(&s_cfg_mux);
 
-    ESP_LOGI(TAG, "loaded: audio_out=%s backlight=%u time_remain=%u cue_mode=%u master_trim=%u wifi_remote=%s",
+    ESP_LOGI(TAG, "loaded: audio_out=%s backlight=%u time_remain=%u cue_mode=%u master_trim=%u wifi_remote=%s dj_link=%s jog=%s tempo=+/-%u%%",
              next.audio_out == APP_SETTINGS_AUDIO_OUT_RCA ? "rca" : "speaker",
              next.backlight_pct, next.time_remain,
              next.cue_mode, next.master_trim_preset,
-             next.wifi_remote ? "on" : "off");
+             next.wifi_remote ? "on" : "off",
+             next.dj_link_enable ? "on" : "off",
+             next.jog_cdj_mode ? "cdj" : "vinyl",
+             next.tempo_range_pct);
 
     return app_settings_start_backlight_worker();
 }
@@ -229,6 +242,10 @@ DEFINE_U8_SETTER(app_settings_set_master_trim_preset, master_trim_preset, "maste
 DEFINE_U8_SETTER(app_settings_set_wifi_remote, wifi_remote, "wifi_rem", value = value ? 1 : 0)
 DEFINE_U8_SETTER(app_settings_set_main_out_usb, main_out_usb, "main_usb", value = value ? 1 : 0)
 DEFINE_U8_SETTER(app_settings_set_ui_blackout_play, ui_blackout_play, "ui_blk", value = value ? 1 : 0)
+DEFINE_U8_SETTER(app_settings_set_dj_link_enable, dj_link_enable, "djlink_en", value = value ? 1 : 0)
+DEFINE_U8_SETTER(app_settings_set_jog_cdj_mode, jog_cdj_mode, "jog_cdj", value = value ? 1 : 0)
+DEFINE_U8_SETTER(app_settings_set_tempo_range_pct, tempo_range_pct, "tempo_rng",
+                 if (value != 6 && value != 16) value = 10)
 
 /* ── Backlight: live now, persisted once the slider settles ──────────────── *
  *

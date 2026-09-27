@@ -82,6 +82,9 @@ typedef struct {
     ctrl_beat_fx_target_t target;
     uint8_t depth;
     bool enabled;
+    /* Echo/Delay time or Flanger period at the target deck's BPM, 0 for
+     * Filter. Filled in the published snapshot only (v264, touch FX panel). */
+    uint16_t time_ms;
 } deck_core_beat_fx_state_t;
 
 static inline float deck_core_pitch_percent(const deck_state_t *state)
@@ -101,6 +104,9 @@ deck_state_t deck_core_get_state(void);
 
 // Thread-safe snapshot of one deck state.
 deck_state_t deck_core_get_deck_state(uint8_t deck);
+/* v285: LVGL task only. Same snapshot, but the engine position never waits
+ * for the audio engine mutex (audio_engine_deck_position_ms_nowait). */
+deck_state_t deck_core_get_deck_state_nowait(uint8_t deck);
 void deck_core_toggle_master_tempo(uint8_t deck);
 
 // Snapshot of the global Beat FX state. Beat FX DSP is not applied yet; this is
@@ -109,6 +115,17 @@ deck_core_beat_fx_state_t deck_core_get_beat_fx_state(void);
 
 // FLX4 Beat Jump sizes are global, matching the controller's Mixxx mapping.
 deck_core_beat_jump_page_t deck_core_get_beat_jump_page(void);
+
+// Jog mode (docs/JOG_MODES_VINYL_VS_CDJ.md), global like the Settings toggle:
+// false = VINYL (touch scratch, default), true = CDJ (touch inert, whole-wheel
+// bend, fine paused nudge). Any task may set it; the deck task reads it.
+void deck_core_set_jog_cdj_mode(bool on);
+bool deck_core_get_jog_cdj_mode(void);
+/* v275: tempo fader range (6/10/16 %, anything else -> 10) shared by both
+ * decks; the faders are rescaled on the deck task. Shift+TEMPO RANGE cycles
+ * it too, and the UI task persists whatever the getter returns. */
+void deck_core_set_tempo_range_percent(uint16_t pct);
+uint16_t deck_core_get_tempo_range_percent(void);
 
 // Loop region for waveform display. `active` = a full loop (in+out) is set;
 // `armed` = loop-in pressed and waiting for loop-out (highlight from start_ms to

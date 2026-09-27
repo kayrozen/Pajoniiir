@@ -1,0 +1,16 @@
+menu "Pajoniiir UI"
+
+config UI_DJUI_DIRECT_STRIPS
+    bool "Blit the dj_ui zoom strips straight to the framebuffer (PPA)"
+    default y
+    help
+        v287. The two zoom waveform strips leave LVGL's draw path: after each
+        LVGL refresh the bridge burns the playhead, cue triangle and armed-loop
+        trail into its ring strip and the PPA copies the view into the
+        framebuffer. Off: LVGL draws them as images, as in v286.
+
+        dj_ui is the only presentation layer since v293 (UI migration
+        phase 6, docs/UI_MIGRATION_PLAN_DJUI.md); the former
+        UI_PRESENTATION_DJUI switch and the legacy widgets are gone.
+
+endmenu

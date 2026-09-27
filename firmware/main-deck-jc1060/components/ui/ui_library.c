@@ -7,6 +7,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifndef WIN32
+#include "sdkconfig.h"
+#endif
+
 static void ui_library_copy_str(char *dest, size_t dest_size, const char *src)
 {
     if (!dest || dest_size == 0) {
@@ -166,31 +170,37 @@ int ui_library_page_selection_after_delta(int total_tracks,
 #include "freertos/task.h"
 #include "freertos/idf_additions.h"
 #include "media_catalog.h"
+#include "media_io_gate.h"
+#include "dj_link.h"
+#include "dj_link_session.h"
+#include "ui_artwork.h"
+#include "ui_djui_bridge.h"
+#include "ui_djui_text.h"
+
+/* v292: EXT_RAM_BSS_ATTR moves a static to PSRAM when
+ * CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY is set; empty on host builds. */
+#ifdef ESP_PLATFORM
+#include "esp_attr.h"
+#endif
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
+#endif
 
 #define UI_TRACK_LOAD_STACK (16 * 1024)
+#define UI_DJ_LINK_COUNT_MS 500u
 #endif
 
 static const char *TAG = "ui_library";
 
+/* v257: the dj_ui build logs every LOAD step at WARN (the default level), so
+ * a serial trace shows where a tap stopped. Legacy keeps its INFO logs. */
+#define UI_LIB_TRACE(...) ESP_LOGW(TAG, __VA_ARGS__)
+
 static ui_library_config_t s_library_config;
-static lv_obj_t *s_library_screen = NULL;
-static lv_obj_t *s_library_table = NULL;
-static lv_obj_t *s_label_library_source = NULL;
-static lv_obj_t *s_btn_library_page_prev = NULL;
-static lv_obj_t *s_btn_library_page_next = NULL;
-static lv_obj_t *s_btn_library_load = NULL;
-static lv_obj_t *s_btn_library_load_deck2 = NULL;
-static lv_obj_t *s_active_deck_indicator = NULL;
-static lv_obj_t *s_label_indicator_deck = NULL;
-static lv_obj_t *s_label_indicator_status = NULL;
 static int s_active_tab = 0;
 static int s_selected_track_idx = 0;
 static ui_event_counter_t s_library_refresh_events;
 static uint32_t s_library_refresh_applied;
-static bool s_sort_artist_desc = false;
-static bool s_sort_name_desc = false;
-static bool s_sort_bpm_desc = false;
-static bool s_sort_key_desc = false;
 static ui_load_gate_t s_track_load_gate;
 static uint8_t s_library_load_request_deck = CTRL_DECK_1;
 
@@ -219,11 +229,41 @@ static const anlz_metadata_t *ui_library_clone_loaded_anlz(anlz_metadata_t *snap
 
 #ifndef WIN32
 static portMUX_TYPE s_track_load_lock = portMUX_INITIALIZER_UNLOCKED;
-static media_loaded_track_t s_loaded_media[DECK_CORE_DECK_COUNT];
+EXT_RAM_BSS_ATTR static media_loaded_track_t s_loaded_media[DECK_CORE_DECK_COUNT];
 static bool s_loaded_media_valid[DECK_CORE_DECK_COUNT];
 static QueueHandle_t s_track_load_result_q = NULL;
 static ui_event_counter_t s_usb_removed_events;
 static uint32_t s_usb_removed_applied;
+/* v247: gate id of a load started by a DJ Link 0x19, and who sent it. */
+static uint32_t s_remote_load_ui_id;
+static uint8_t s_remote_load_from;
+static uint32_t s_dj_link_count_ms;
+/* v248: Library source. 0 = our USB (media_catalog); otherwise the player
+ * whose USB dj_link browses over its dbserver. Peer rows are read from the
+ * dj_link cache, never over the network from here. */
+static uint8_t s_library_peer;
+static int s_local_selected_idx;
+static dj_link_browse_status_t s_peer_status;  /* last polled copy */
+static uint32_t s_peer_select_generation;      /* status generation at select */
+static uint32_t s_peer_want_generation;
+static int s_peer_want_first = -1;
+static uint32_t s_peer_repaint_ms;
+#define UI_PEER_REPAINT_MS 150u
+/* v249: LOAD on a peer row downloads the track into the SD cache (dj_link
+ * task, NFS), then loads that local file through the usual worker. One
+ * download at a time; SOURCE turns into CANCEL meanwhile. */
+typedef struct {
+    uint32_t id;                  /* dj_link fetch id, 0 = none */
+    uint8_t  deck;
+    uint8_t  peer;
+    uint32_t rekordbox_id;
+    dj_link_fetch_state_t state;
+    uint8_t  percent;
+    media_catalog_track_t item;   /* title / artist / bpm / duration for the deck */
+} ui_peer_fetch_t;
+static ui_peer_fetch_t s_peer_fetch;
+static uint32_t s_peer_load_ui_id;  /* gate id of the load that follows it */
+#define UI_PEER_CACHE_PREFIX "/sd/djlcache/"
 
 typedef struct {
     int index;
@@ -236,6 +276,7 @@ typedef struct {
     media_catalog_track_t item;
     media_loaded_track_t loaded;
     esp_err_t rc;
+    bool peer;
     char status[40];
 } ui_track_load_result_t;
 
@@ -248,6 +289,9 @@ typedef struct {
     uint32_t generation;
     uint32_t track_key;
     uint32_t load_id;
+    bool peer;                        /* v249: a DJ Link download in the SD cache */
+    media_catalog_track_t peer_item;
+    char peer_path[DJ_LINK_FETCH_PATH_MAX];
 } ui_track_load_request_t;
 
 #endif
@@ -343,11 +387,24 @@ static void ui_library_invalidate_track_load(void)
 #endif
 }
 
-#define s_style_screen_bg (*s_library_config.styles.screen_bg)
-#define s_style_btn_primary (*s_library_config.styles.btn_primary)
-#define s_style_btn_secondary (*s_library_config.styles.btn_secondary)
-#define s_style_btn_disabled (*s_library_config.styles.btn_disabled)
-#define s_style_pressed (*s_library_config.styles.pressed)
+/* JC1060 playlists: the local source browses every track, the playlist list
+ * (export.pdb, see library_playlist_*), or one playlist's tracks in rekordbox
+ * order. A peer source is always ALL. Playlist rows hold catalog track keys,
+ * which survive a sort; a catalog rebuild or USB removal returns to ALL. */
+typedef enum {
+    UI_LIB_MODE_ALL = 0,
+    UI_LIB_MODE_PLAYLISTS,
+    UI_LIB_MODE_PLAYLIST_TRACKS,
+} ui_library_mode_t;
+
+#define UI_LIBRARY_PLAYLIST_MAX_TRACKS 2048
+
+static ui_library_mode_t s_lib_mode = UI_LIB_MODE_ALL;
+static uint32_t *s_pl_keys;             /* PSRAM, allocated on the first open */
+static int s_pl_key_count;
+static char s_pl_name[LIBRARY_PLAYLIST_TEXT_MAX];
+static int s_all_selected_idx;          /* ALL row kept while in playlists */
+static int s_pl_list_selected_idx;      /* list row kept while inside one */
 
 static uint8_t ui_library_deck_index(uint8_t deck)
 {
@@ -363,6 +420,62 @@ static int ui_library_media_count(void)
 #endif
 }
 
+#ifndef WIN32
+/* The polled status describes the current peer selection (not a previous
+ * one still in flight to the dj_link task). */
+static bool ui_library_peer_status_current(void)
+{
+    return s_library_peer != 0u && s_peer_status.peer == s_library_peer &&
+           s_peer_status.generation != s_peer_select_generation;
+}
+#endif
+
+static bool ui_library_peer_view(void)
+{
+#ifndef WIN32
+    return s_library_peer != 0u;
+#else
+    return false;
+#endif
+}
+
+/* Rows in the table's current source. */
+static int ui_library_view_count(void)
+{
+#ifndef WIN32
+    if (ui_library_peer_view()) {
+        return ui_library_peer_status_current() ? (int)s_peer_status.count : 0;
+    }
+#endif
+    if (s_lib_mode == UI_LIB_MODE_PLAYLISTS) {
+        return library_playlist_count();
+    }
+    if (s_lib_mode == UI_LIB_MODE_PLAYLIST_TRACKS) {
+        return s_pl_key_count;
+    }
+    return ui_library_media_count();
+}
+
+/* Catalog row behind a local view index, or -1 (playlist list rows, or a
+ * playlist entry the catalog no longer holds). */
+static int ui_library_catalog_row(int view_idx)
+{
+    if (s_lib_mode == UI_LIB_MODE_PLAYLISTS) {
+        return -1;
+    }
+    if (s_lib_mode == UI_LIB_MODE_PLAYLIST_TRACKS) {
+        if (!s_pl_keys || view_idx < 0 || view_idx >= s_pl_key_count) {
+            return -1;
+        }
+#ifndef WIN32
+        return media_catalog_find_index_by_key(s_pl_keys[view_idx]);
+#else
+        return library_find_row_by_key(s_pl_keys[view_idx]);
+#endif
+    }
+    return view_idx;
+}
+
 static void ui_library_status_hold(const char *text, lv_color_t color, uint32_t hold_ms)
 {
     if (s_library_config.actions.status_hold) {
@@ -370,61 +483,9 @@ static void ui_library_status_hold(const char *text, lv_color_t color, uint32_t 
     }
 }
 
-static lv_color_t ui_library_status_color_for_text(const char *text)
-{
-    if (s_library_config.actions.status_color_for_text) {
-        return s_library_config.actions.status_color_for_text(text);
-    }
-    return COL_TEXT_DIM;
-}
-
-static void ui_library_cache_invalidate(void)
-{
-    if (s_library_config.actions.cache_invalidate) {
-        s_library_config.actions.cache_invalidate();
-    }
-}
-
-static void ui_library_set_header_track(const char *title, const char *artist, uint16_t bpm)
-{
-    if (s_library_config.actions.set_header_track) {
-        s_library_config.actions.set_header_track(title, artist, bpm);
-    }
-}
-
-static void ui_library_set_load_busy(bool busy, const char *hint)
-{
-    lv_obj_t *buttons[] = {s_btn_library_load, s_btn_library_load_deck2};
-    for (size_t i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++) {
-        lv_obj_t *btn = buttons[i];
-        if (!btn) continue;
-        if (busy) {
-            lv_obj_add_state(btn, LV_STATE_DISABLED);
-            lv_obj_add_style(btn, &s_style_btn_disabled, LV_PART_MAIN);
-        } else {
-            lv_obj_clear_state(btn, LV_STATE_DISABLED);
-            lv_obj_remove_style(btn, &s_style_btn_disabled, LV_PART_MAIN);
-        }
-    }
-
-    (void)hint;
-}
-
-static void ui_library_set_page_button_enabled(lv_obj_t *button, bool enabled)
-{
-    if (!button) {
-        return;
-    }
-    if (enabled) {
-        lv_obj_clear_state(button, LV_STATE_DISABLED);
-    } else {
-        lv_obj_add_state(button, LV_STATE_DISABLED);
-    }
-}
-
 static ui_library_page_t ui_library_current_page(void)
 {
-    return ui_library_page_for_selection(ui_library_media_count(),
+    return ui_library_page_for_selection(ui_library_view_count(),
                                          s_selected_track_idx);
 }
 
@@ -436,6 +497,9 @@ static ui_library_page_t ui_library_current_page(void)
  * refresh this. */
 static ui_library_page_t s_library_page_cache;
 static bool s_library_page_cache_valid;
+/* v256: dj_ui has no table; ui_library_populate_rows() marks the page for
+ * ui_library_djui_publish() instead. */
+static bool s_djui_rows_dirty = true;
 
 static ui_library_page_t ui_library_refresh_page_cache(void)
 {
@@ -457,95 +521,146 @@ static void ui_library_invalidate_page_cache(void)
     s_library_page_cache_valid = false;
 }
 
-static void ui_library_update_source_label(void)
+#ifndef WIN32
+static bool ui_library_peer_fetch_active(void)
 {
-    int count = ui_library_media_count();
-    ui_library_page_t page = ui_library_page_for_selection(count,
-                                                            s_selected_track_idx);
-    if (s_label_library_source) {
-        if (page.page_count > 0) {
-            lv_label_set_text_fmt(s_label_library_source,
-                                  "LOCAL USB  %d TRACKS   PAGE %d/%d",
-                                  count, page.page_index + 1, page.page_count);
-        } else {
-            lv_label_set_text(s_label_library_source, "LOCAL USB  0 TRACKS");
-        }
-    }
-    ui_library_set_page_button_enabled(s_btn_library_page_prev,
-                                       page.page_index > 0);
-    ui_library_set_page_button_enabled(s_btn_library_page_next,
-                                       page.page_count > 0 &&
-                                       page.page_index + 1 < page.page_count);
+    return s_peer_fetch.id != 0u;
 }
 
-static void ui_library_fill_visible_row(int visible_row, int track_index)
-{
-    const char *title = NULL;
-    const char *artist = NULL;
-    const char *key = NULL;
-    uint16_t bpm = 0;
-    uint32_t duration_ms = 0;
-
-#ifndef WIN32
-    media_catalog_row_t row;
-    if (media_catalog_get_row(track_index, &row) != ESP_OK) {
-        return;
-    }
-    title = row.title;
-    artist = row.artist;
-    bpm = row.bpm;
-    duration_ms = row.duration_ms;
-    key = row.key;
-#else
-    const library_track_t *track = library_get_ptr(track_index);
-    if (!track) {
-        return;
-    }
-    title = track->title;
-    artist = track->artist;
-    bpm = track->bpm;
-    duration_ms = track->duration_ms;
-    key = track->key;
 #endif
 
-    ui_library_row_text_t text;
-    ui_library_format_row_text(&text, title, artist, key, bpm, duration_ms);
-    lv_table_set_cell_value(s_library_table, visible_row, 0, text.title);
-    lv_table_set_cell_value(s_library_table, visible_row, 1, text.artist);
-    lv_table_set_cell_value(s_library_table, visible_row, 2, text.key);
-    lv_table_set_cell_value(s_library_table, visible_row, 3, text.bpm);
-    lv_table_set_cell_value(s_library_table, visible_row, 4, text.duration);
+#ifndef WIN32
+/* Peer row: KEY carries a badge instead (the dbserver list has no key):
+ * NET = loadable over NFS, META = metadata only, DB / NN% = this row is
+ * downloading. BPM / TIME show "..." until the metadata request for the
+ * visible page has come back. */
+static void ui_library_peer_badge(const dj_link_peer_track_t *t, char *badge, size_t len)
+{
+    if (ui_library_peer_fetch_active() && s_peer_fetch.peer == s_library_peer &&
+        s_peer_fetch.rekordbox_id == t->rekordbox_id) {
+        if (s_peer_fetch.state == DJ_LINK_FETCH_AUDIO) {
+            snprintf(badge, len, "%u%%", (unsigned)s_peer_fetch.percent);
+        } else {
+            snprintf(badge, len, "DB");
+        }
+    } else {
+        snprintf(badge, len, "%s", t->audio == DJ_LINK_PEER_AUDIO_NFS ? "NET" : "META");
+    }
 }
+
+#endif
 
 static void ui_library_select_visible_cell(void)
 {
-    ui_library_page_t page = ui_library_refresh_page_cache();
-    if (s_library_table && page.row_count > 0) {
-        lv_table_set_selected_cell(s_library_table,
-                                   (uint32_t)page.selected_row, 0);
-    }
+    (void)ui_library_refresh_page_cache();
+    s_djui_rows_dirty = true;
 }
 
 static void ui_library_populate_rows(void)
 {
-    if (!s_library_table) {
+    ui_library_refresh_page_cache();
+    s_djui_rows_dirty = true;
+}
+
+static void ui_library_playlist_rows_changed(void)
+{
+    ui_library_invalidate_page_cache();
+    ui_library_populate_rows();
+}
+
+/* LVGL lock held. Opens playlist `index` of the list view. */
+static void ui_library_open_playlist(int index)
+{
+    library_playlist_info_t info;
+    if (library_playlist_get(index, &info) != ESP_OK) {
         return;
     }
-
-    ui_library_page_t page = ui_library_refresh_page_cache();
-    lv_table_set_row_count(s_library_table, (uint32_t)page.row_count);
-    for (int visible_row = 0; visible_row < page.row_count; ++visible_row) {
-        int track_index = ui_library_page_absolute_index(&page, visible_row);
-        ui_library_fill_visible_row(visible_row, track_index);
+    if (!s_pl_keys) {
+#ifndef WIN32
+        s_pl_keys = heap_caps_malloc(UI_LIBRARY_PLAYLIST_MAX_TRACKS * sizeof(uint32_t),
+                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#else
+        s_pl_keys = malloc(UI_LIBRARY_PLAYLIST_MAX_TRACKS * sizeof(uint32_t));
+#endif
+        if (!s_pl_keys) {
+            ui_library_status_hold("NO MEM", COL_RED, 2000);
+            return;
+        }
     }
-    ui_library_select_visible_cell();
-    ui_library_update_source_label();
-    lv_obj_invalidate(s_library_table);
+    int n = library_playlist_track_keys(index, s_pl_keys, UI_LIBRARY_PLAYLIST_MAX_TRACKS);
+    s_pl_key_count = n > 0 ? n : 0;
+    ui_library_copy_str(s_pl_name, sizeof(s_pl_name), info.name);
+    s_pl_list_selected_idx = index;
+    s_lib_mode = UI_LIB_MODE_PLAYLIST_TRACKS;
+    s_selected_track_idx = 0;
+    ui_library_playlist_rows_changed();
+    UI_LIB_TRACE("playlist %d '%.20s': %d tracks, %u not on USB", index, info.name,
+                 s_pl_key_count, (unsigned)info.missing);
+    if ((int)info.track_count > s_pl_key_count && s_pl_key_count > 0) {
+        ui_library_status_hold("FIRST 2048 TRACKS", COL_AMBER, 1500);
+    } else if (info.missing > 0u) {
+        char status[48];
+        snprintf(status, sizeof(status), "%u NOT ON USB", (unsigned)info.missing);
+        ui_library_status_hold(status, COL_AMBER, 1500);
+    } else if (s_pl_key_count == 0) {
+        ui_library_status_hold("EMPTY PLAYLIST", COL_AMBER, 1200);
+    }
+}
+
+/* Back to all local tracks (catalog rebuilt, USB removed, peer source).
+ * Returns whether a playlist view was left. LVGL lock held. */
+static bool ui_library_leave_playlists(void)
+{
+    if (s_lib_mode == UI_LIB_MODE_ALL) {
+        return false;
+    }
+    s_lib_mode = UI_LIB_MODE_ALL;
+    s_pl_key_count = 0;
+    s_pl_name[0] = '\0';
+    int n = ui_library_media_count();
+    s_selected_track_idx = s_all_selected_idx < n ? s_all_selected_idx : 0;
+    return true;
+}
+
+/* PLAYLISTS button: ALL -> playlist list -> ALL; inside a playlist it is
+ * BACK to the list. LVGL lock held. */
+static void ui_library_playlists_button(void)
+{
+    if (ui_library_peer_view()) {
+        ui_library_status_hold("PLAYLISTS: LOCAL ONLY", COL_AMBER, 1200);
+        return;
+    }
+    switch (s_lib_mode) {
+    case UI_LIB_MODE_ALL:
+        if (library_playlist_count() <= 0) {
+            ui_library_status_hold("NO PLAYLISTS", COL_AMBER, 1200);
+            return;
+        }
+        s_all_selected_idx = s_selected_track_idx;
+        s_lib_mode = UI_LIB_MODE_PLAYLISTS;
+        s_selected_track_idx = s_pl_list_selected_idx < library_playlist_count()
+            ? s_pl_list_selected_idx : 0;
+        break;
+    case UI_LIB_MODE_PLAYLISTS:
+        (void)ui_library_leave_playlists();
+        break;
+    case UI_LIB_MODE_PLAYLIST_TRACKS:
+    default:
+        s_lib_mode = UI_LIB_MODE_PLAYLISTS;
+        s_pl_key_count = 0;
+        s_pl_name[0] = '\0';
+        s_selected_track_idx = s_pl_list_selected_idx < library_playlist_count()
+            ? s_pl_list_selected_idx : 0;
+        break;
+    }
+    UI_LIB_TRACE("library mode %d, index %d", (int)s_lib_mode, s_selected_track_idx);
+    ui_library_playlist_rows_changed();
 }
 
 static void ui_library_apply_loaded_track(uint8_t deck,
                                           const char *title,
                                           const char *artist,
+                                          const char *key,
                                           uint16_t bpm,
                                           uint32_t duration_ms,
                                           const uint8_t waveform_low[400],
@@ -562,25 +677,10 @@ static void ui_library_apply_loaded_track(uint8_t deck,
     }
 #endif
     if (s_library_config.actions.set_deck_track_info) {
-        s_library_config.actions.set_deck_track_info(deck, title, artist, bpm, duration_ms);
+        s_library_config.actions.set_deck_track_info(deck, title, artist, key, bpm, duration_ms);
     }
     if (s_library_config.actions.set_deck_anlz) {
         s_library_config.actions.set_deck_anlz(deck, meta);
-    }
-    if (s_library_config.actions.load_waveform_data) {
-        s_library_config.actions.load_waveform_data(deck, duration_ms, waveform_low, has_waveform, meta);
-    }
-    if (s_library_config.actions.set_loop_shadow) {
-        s_library_config.actions.set_loop_shadow(deck, false, 0, 0, 0);
-    }
-    if (deck == CTRL_DECK_1) {
-        ui_library_cache_invalidate();
-        ui_library_set_header_track(title, artist, bpm);
-    }
-    if (s_library_config.actions.is_performance_target_active &&
-        s_library_config.actions.is_performance_target_active(deck) &&
-        s_library_config.actions.update_hot_cues) {
-        s_library_config.actions.update_hot_cues();
     }
 }
 
@@ -601,22 +701,6 @@ static void ui_library_apply_empty_track(uint8_t deck)
     }
     if (s_library_config.actions.set_deck_anlz) {
         s_library_config.actions.set_deck_anlz(deck, NULL);
-    }
-    if (s_library_config.actions.load_waveform_data) {
-        s_library_config.actions.load_waveform_data(deck, 0u, NULL, false, NULL);
-    }
-    if (s_library_config.actions.set_loop_shadow) {
-        s_library_config.actions.set_loop_shadow(deck, false, 0u, 0u, 0);
-    }
-    if (deck == CTRL_DECK_1) {
-        ui_library_cache_invalidate();
-        ui_library_set_header_track("No Track", "", 0u);
-    }
-    if (s_library_config.actions.update_hot_cues) {
-        s_library_config.actions.update_hot_cues();
-    }
-    if (s_library_table) {
-        lv_obj_invalidate(s_library_table);
     }
 }
 
@@ -663,10 +747,23 @@ static void ui_track_load_worker(void *arg)
     result->generation = req.generation;
     result->track_key = req.track_key;
     result->load_id = req.load_id;
-    result->rc = media_catalog_load_by_identity(req.track_key,
-                                                 req.generation,
-                                                 &result->item,
-                                                 &result->loaded);
+    result->peer = req.peer;
+    if (req.peer) {
+        /* v249: the file is complete in the SD cache. There is no catalog row,
+         * ANLZ, waveform or PVBR for it; the engine sizes it itself. */
+        result->item = req.peer_item;
+        result->loaded.track_key = req.track_key;
+        result->loaded.bpm = req.peer_item.bpm;
+        result->loaded.duration_ms = req.peer_item.duration_ms;
+        snprintf(result->loaded.audio_path, sizeof(result->loaded.audio_path), "%s",
+                 req.peer_path);
+        result->rc = ESP_OK;
+    } else {
+        result->rc = media_catalog_load_by_identity(req.track_key,
+                                                     req.generation,
+                                                     &result->item,
+                                                     &result->loaded);
+    }
     if (result->rc == ESP_ERR_INVALID_STATE) {
         ui_track_load_set_status(result, "LIBRARY CHANGED", "LIBRARY CHANGED");
     } else if (result->rc != ESP_OK) {
@@ -733,18 +830,33 @@ static void ui_track_load_worker(void *arg)
     vTaskDeleteWithCaps(NULL);
 }
 
-static esp_err_t ui_submit_track_load(int index, uint32_t track_key, uint32_t generation, uint8_t deck)
+/* v257: 8 results of ~3 KiB each. xQueueCreate takes the ~25 KiB from
+ * internal RAM, where the dj_ui build has no such block left: every LOAD
+ * ended in "NO QUEUE". The queue is only used from task context (load worker,
+ * LVGL task), so PSRAM is safe there. Legacy keeps its internal queue. */
+static QueueHandle_t ui_library_create_result_queue(void)
 {
-    ESP_LOGI(TAG, "load start: deck=%d index=%d key=0x%08x (internal free=%u, largest=%u)",
-             (int)deck, (int)index, (unsigned)track_key,
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    return xQueueCreateWithCaps(8, sizeof(ui_track_load_result_t),
+                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+
+/* peer_item / peer_path: a v249 DJ Link download (index is then -1). */
+static esp_err_t ui_submit_track_load(int index, uint32_t track_key, uint32_t generation, uint8_t deck,
+                                      const media_catalog_track_t *peer_item,
+                                      const char *peer_path)
+{
+    UI_LIB_TRACE("load start: deck=%d index=%d key=0x%08x (internal free=%u, largest=%u)",
+                 (int)deck, (int)index, (unsigned)track_key,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     if (!s_track_load_result_q) {
-        s_track_load_result_q = xQueueCreate(8, sizeof(ui_track_load_result_t));
+        s_track_load_result_q = ui_library_create_result_queue();
     }
     if (!s_track_load_result_q) {
+        ESP_LOGE(TAG, "load start: result queue (8 x %u B) not created (internal largest=%u)",
+                 (unsigned)sizeof(ui_track_load_result_t),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         ui_library_status_hold("NO QUEUE", COL_RED, 2500);
-        ui_library_set_load_busy(false, "NO QUEUE");
         ui_library_finish_track_load();
         return ESP_ERR_NO_MEM;
     }
@@ -758,7 +870,6 @@ static esp_err_t ui_submit_track_load(int index, uint32_t track_key, uint32_t ge
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
         ui_library_status_hold("NO MEM", COL_RED, 2500);
-        ui_library_set_load_busy(false, "NO MEM");
         ui_library_finish_track_load();
         return ESP_ERR_NO_MEM;
     }
@@ -767,6 +878,11 @@ static esp_err_t ui_submit_track_load(int index, uint32_t track_key, uint32_t ge
     req->generation = generation;
     req->track_key = track_key;
     req->load_id = ui_library_active_track_load_id();
+    req->peer = peer_item && peer_path;
+    if (req->peer) {
+        req->peer_item = *peer_item;
+        snprintf(req->peer_path, sizeof(req->peer_path), "%s", peer_path);
+    }
 
     /* v207: the stack lives in PSRAM like ae_decode's. The per-frame mix moved
      * to IRAM (v206) and left no 16 KiB internal block. Safe here: with
@@ -781,7 +897,6 @@ static esp_err_t ui_submit_track_load(int index, uint32_t track_key, uint32_t ge
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         free(req);
         ui_library_status_hold("NO TASK", COL_RED, 2500);
-        ui_library_set_load_busy(false, "NO TASK");
         ui_library_finish_track_load();
         return ESP_ERR_NO_MEM;
     }
@@ -794,6 +909,9 @@ static void ui_apply_usb_removed(void)
      * must publish/retire its exact audio session before a reconnect can start
      * another LOAD, preventing two workers from reordering deck-core writes. */
     ui_library_invalidate_track_load();
+    if (ui_library_leave_playlists()) {
+        ui_library_playlist_rows_changed();
+    }
     ui_library_invalidate_page_cache();
     bool removed_loaded = false;
     for (uint8_t deck = 0; deck < DECK_CORE_DECK_COUNT; deck++) {
@@ -807,27 +925,12 @@ static void ui_apply_usb_removed(void)
             if (s_library_config.actions.set_deck_anlz) {
                 s_library_config.actions.set_deck_anlz(deck, NULL);
             }
-            if (s_library_config.actions.set_loop_shadow) {
-                s_library_config.actions.set_loop_shadow(deck, false, 0, 0, 0);
-            }
-            if (s_library_config.actions.load_waveform_data) {
-                s_library_config.actions.load_waveform_data(deck, 0, NULL, false, NULL);
-            }
             removed_loaded = true;
         }
     }
     if (removed_loaded) {
-        ui_library_cache_invalidate();
-        ui_library_set_header_track("No Track", "", 0);
-        if (s_library_config.actions.update_hot_cues) {
-            s_library_config.actions.update_hot_cues();
-        }
-        if (s_library_table) {
-            lv_obj_invalidate(s_library_table);
-        }
         ui_library_status_hold("USB REMOVED", COL_AMBER, 2500);
     }
-    ui_library_set_load_busy(false, "USB REMOVED");
 }
 
 static void ui_poll_track_load_result(void)
@@ -863,7 +966,6 @@ static void ui_poll_track_load_result(void)
                 ui_library_apply_empty_track(result.deck);
             }
             ui_library_status_hold("LIBRARY CHANGED", COL_AMBER, 2500);
-            ui_library_set_load_busy(false, "LIBRARY CHANGED");
             ui_library_finish_track_load_id(result.load_id);
             continue;
         }
@@ -876,17 +978,21 @@ static void ui_poll_track_load_result(void)
                 ui_library_release_deck_audio(result.deck);
                 ui_library_apply_empty_track(result.deck);
             }
-            ui_library_status_hold(display, ui_library_status_color_for_text(display), 3500);
-            ui_library_set_load_busy(false, display);
+            ui_library_status_hold(display, COL_TEXT_DIM, 3500);
             ui_library_finish_track_load_id(result.load_id);
             continue;
         }
 
-        library_set_selected_track_index(result.index);
+        if (!result.peer) {
+            library_set_selected_track_index(result.index);
+        }
         uint8_t deck = ui_library_deck_index(result.deck);
         const uint16_t bpm = result.loaded.bpm ? result.loaded.bpm : result.item.bpm;
         anlz_metadata_t meta_snapshot;
-        const anlz_metadata_t *meta = ui_library_clone_loaded_anlz(&meta_snapshot);
+        memset(&meta_snapshot, 0, sizeof(meta_snapshot));
+        /* The catalog's loaded ANLZ belongs to a local track, never a peer's. */
+        const anlz_metadata_t *meta =
+            result.peer ? NULL : ui_library_clone_loaded_anlz(&meta_snapshot);
         esp_err_t publish_rc = deck_core_publish_loaded_track(
             deck,
             result.generation,
@@ -899,7 +1005,6 @@ static void ui_poll_track_load_result(void)
             ui_library_release_deck_audio(deck);
             ui_library_apply_empty_track(deck);
             ui_library_status_hold("LIBRARY CHANGED", COL_AMBER, 2500);
-            ui_library_set_load_busy(false, "LIBRARY CHANGED");
             ui_library_finish_track_load_id(result.load_id);
             continue;
         }
@@ -915,12 +1020,10 @@ static void ui_poll_track_load_result(void)
                      (unsigned)result.loaded.track_key,
                      (unsigned)result.generation);
         }
-        if (s_library_table) {
-            lv_obj_invalidate(s_library_table);
-        }
         ui_library_apply_loaded_track(deck,
                                       result.item.title,
                                       result.item.artist,
+                                      result.item.key,
                                       bpm,
                                       result.loaded.duration_ms,
                                       result.loaded.waveform_low,
@@ -930,9 +1033,20 @@ static void ui_poll_track_load_result(void)
 
         ESP_LOGI(TAG, "Audio: loaded deck %u: %s (autoplay off)",
                  (unsigned)result.deck + 1u, result.loaded.audio_path);
+        char remote_text[32];
         const char *loaded_text = result.deck == CTRL_DECK_1 ? "D1 LOADED" : "D2 LOADED";
+        if (s_remote_load_ui_id != 0u && result.load_id == s_remote_load_ui_id) {
+            snprintf(remote_text, sizeof(remote_text), "D%u LOADED FROM #%u",
+                     (unsigned)result.deck + 1u, (unsigned)s_remote_load_from);
+            loaded_text = remote_text;
+            s_remote_load_ui_id = 0u;
+        } else if (s_peer_load_ui_id != 0u && result.load_id == s_peer_load_ui_id) {
+            snprintf(remote_text, sizeof(remote_text), "D%u LOADED (DJ LINK)",
+                     (unsigned)result.deck + 1u);
+            loaded_text = remote_text;
+            s_peer_load_ui_id = 0u;
+        }
         ui_library_status_hold(loaded_text, COL_GREEN, 2000);
-        ui_library_set_load_busy(false, loaded_text);
         ui_library_finish_track_load_id(result.load_id);
     }
 }
@@ -963,41 +1077,120 @@ static esp_err_t ui_library_publish_simulated_track(
 }
 #endif
 
+#ifndef WIN32
+/* v249: LOAD on a peer row starts the NFS download into the SD cache; the
+ * deck is loaded only once the file is complete (ui_library_poll_peer_fetch).
+ * Refusals happen before the load gate, so no deck or audio state is
+ * touched. The engine reads a track's file only while the local USB is
+ * mounted (media_io_gate), so a cached peer file needs it too. */
+static void ui_library_peer_load(uint8_t deck)
+{
+    dj_link_peer_track_t t;
+    bool have = ui_library_peer_status_current() &&
+                dj_link_browse_get_track(s_peer_status.generation,
+                                         (uint32_t)s_selected_track_idx, &t);
+    char reason[96];
+    dj_link_peer_load_t verdict = dj_link_peer_load_check(have ? &t : NULL, reason,
+                                                          sizeof(reason));
+    const char *refusal = NULL;
+    if (verdict != DJ_LINK_PEER_LOAD_OK) {
+        refusal = verdict == DJ_LINK_PEER_LOAD_NO_TRACK ? "NO TRACK" : "METADATA ONLY - NO AUDIO";
+    } else if (ui_library_peer_fetch_active()) {
+        refusal = "DOWNLOAD BUSY";
+    } else if (!media_io_gate_is_available()) {
+        refusal = "LOCAL USB NEEDED";
+    } else if (ui_library_track_load_busy() || media_catalog_load_in_progress()) {
+        refusal = "LOAD BUSY";
+    }
+    if (refusal) {
+        ESP_LOGW(TAG, "peer load refused: deck %u <- player #%u rekordbox id %u \"%s\": %s",
+                 (unsigned)deck + 1u, (unsigned)s_library_peer,
+                 have ? (unsigned)t.rekordbox_id : 0u, have ? t.title : "",
+                 verdict != DJ_LINK_PEER_LOAD_OK ? reason : refusal);
+        ui_library_status_hold(refusal, COL_AMBER, 2500);
+        return;
+    }
+    /* Cached peer files the decks hold must survive the cache pruning. */
+    uint32_t keep[DECK_CORE_DECK_COUNT] = {0};
+    for (uint8_t d = 0; d < DECK_CORE_DECK_COUNT; d++) {
+        if (s_loaded_media_valid[d] &&
+            strncmp(s_loaded_media[d].audio_path, UI_PEER_CACHE_PREFIX,
+                    sizeof(UI_PEER_CACHE_PREFIX) - 1u) == 0) {
+            keep[d] = s_loaded_media[d].track_key;
+        }
+    }
+    uint32_t id = dj_link_fetch_start(s_library_peer, t.rekordbox_id, keep);
+    if (id == 0u) {
+        ui_library_status_hold("DJ LINK BUSY", COL_AMBER, 2000);
+        return;
+    }
+    memset(&s_peer_fetch, 0, sizeof(s_peer_fetch));
+    s_peer_fetch.id = id;
+    s_peer_fetch.deck = deck;
+    s_peer_fetch.peer = s_library_peer;
+    s_peer_fetch.rekordbox_id = t.rekordbox_id;
+    s_peer_fetch.state = DJ_LINK_FETCH_PDB;
+    snprintf(s_peer_fetch.item.title, sizeof(s_peer_fetch.item.title), "%s",
+             t.title[0] ? t.title : "Unknown Title");
+    snprintf(s_peer_fetch.item.artist, sizeof(s_peer_fetch.item.artist), "%s", t.artist);
+    s_peer_fetch.item.rekordbox_track_id = t.rekordbox_id;
+    s_peer_fetch.item.bpm = (uint16_t)((t.bpm100 + 50u) / 100u);
+    s_peer_fetch.item.duration_ms = (uint32_t)t.duration_s * 1000u;
+    ESP_LOGW(TAG, "peer load: deck %u <- player #%u rekordbox id %u \"%s\" - downloading",
+             (unsigned)deck + 1u, (unsigned)s_library_peer, (unsigned)t.rekordbox_id,
+             s_peer_fetch.item.title);
+    ui_library_status_hold("DOWNLOADING", COL_ACCENT, 1500);
+    ui_library_populate_rows();
+}
+#endif
+
 static void ui_library_load_selected_deck(uint8_t deck)
 {
+#ifndef WIN32
+    if (ui_library_peer_view()) {
+        ui_library_peer_load(deck);
+        return;
+    }
+#endif
+    if (s_lib_mode == UI_LIB_MODE_PLAYLISTS) {
+        /* LOAD on a playlist row opens it; nothing reaches a deck. */
+        ui_library_open_playlist(s_selected_track_idx);
+        return;
+    }
+    const int catalog_idx = ui_library_catalog_row(s_selected_track_idx);
+    if (catalog_idx < 0) {
+        ui_library_status_hold("NOT ON USB", COL_AMBER, 1200);
+        return;
+    }
     if (!ui_library_try_begin_track_load()) {
+        UI_LIB_TRACE("load D%u: refused, load gate busy", (unsigned)deck + 1u);
         ui_library_status_hold("LOAD BUSY", COL_AMBER, 1200);
         return;
     }
-    ui_library_set_load_busy(true, "LOAD BUSY");
 
 #ifdef WIN32
-    library_track_t *track = library_get_ptr(s_selected_track_idx);
+    library_track_t *track = library_get_ptr(catalog_idx);
     if (!track) {
-        ui_library_set_load_busy(false, NULL);
         ui_library_finish_track_load();
         return;
     }
 
-    library_set_selected_track_index(s_selected_track_idx);
+    library_set_selected_track_index(catalog_idx);
     library_load_anlz(track);
     anlz_metadata_t meta_snapshot;
     const anlz_metadata_t *meta = ui_library_clone_loaded_anlz(&meta_snapshot);
     if (ui_library_publish_simulated_track(deck, track, meta) != ESP_OK) {
         anlz_free(&meta_snapshot);
         ui_library_apply_empty_track(deck);
-        ui_library_set_load_busy(false, "LOAD ERR");
         ui_library_finish_track_load();
         return;
     }
     s_deck_loaded_track_key[deck] = track->track_id;
     s_deck_loaded_track_valid[deck] = true;
-    if (s_library_table) {
-        lv_obj_invalidate(s_library_table);
-    }
     ui_library_apply_loaded_track(deck,
                                   track->title,
                                   track->artist,
+                                  track->key,
                                   track->bpm,
                                   track->duration_ms,
                                   track->waveform_low,
@@ -1010,20 +1203,19 @@ static void ui_library_load_selected_deck(uint8_t deck)
 #else
     const uint32_t generation = media_catalog_generation();
     media_catalog_track_t item;
-    if (media_catalog_get(s_selected_track_idx, &item) != ESP_OK ||
+    if (media_catalog_get(catalog_idx, &item) != ESP_OK ||
         media_catalog_generation() != generation) {
-        ESP_LOGW(TAG, "Catalog changed while resolving index %d", s_selected_track_idx);
-        ui_library_set_load_busy(false, "LIBRARY CHANGED");
+        ESP_LOGW(TAG, "Catalog changed while resolving index %d", catalog_idx);
         ui_library_finish_track_load();
         return;
     }
 
     ui_library_status_hold("LOADING", COL_ACCENT, 1500);
-    (void)ui_submit_track_load(s_selected_track_idx, item.track_key, generation, deck);
+    (void)ui_submit_track_load(catalog_idx, item.track_key, generation, deck,
+                               NULL, NULL);
     return;
 #endif
     ui_library_status_hold("TRACK LOADED", COL_GREEN, 2000);
-    ui_library_set_load_busy(false, "TRACK LOADED");
     ui_library_finish_track_load();
 }
 
@@ -1068,99 +1260,24 @@ static uint32_t ui_library_selected_key(void)
 #endif
 }
 
-static void library_sort_artist_event_cb(lv_event_t *e)
+/* Peer lists come in the player's order; sorting is local only. */
+static bool ui_library_sort_refused(void)
 {
-    (void)e;
-    if (!s_library_table) return;
-#ifndef WIN32
-    if (ui_library_track_load_busy() || media_catalog_load_in_progress()) {
-        ui_library_status_hold("LOAD BUSY", COL_AMBER, 1200);
-        return;
+    if (!ui_library_peer_view() && s_lib_mode != UI_LIB_MODE_ALL) {
+        /* Playlists keep the rekordbox order. */
+        ui_library_status_hold("SORT: ALL TRACKS ONLY", COL_AMBER, 1200);
+        return true;
     }
-#endif
-    uint32_t target_key = ui_library_selected_key();
-    s_sort_artist_desc = !s_sort_artist_desc;
-#ifndef WIN32
-    media_catalog_sort(0, s_sort_artist_desc);
-#else
-    library_sort(0, s_sort_artist_desc);
-#endif
-    ui_refresh_library();
-    ui_library_preserve_selection_by_key(target_key);
-    ui_library_populate_rows();
+    if (!ui_library_peer_view()) {
+        return false;
+    }
+    ui_library_status_hold("SORT: LOCAL ONLY", COL_AMBER, 1200);
+    return true;
 }
 
-static void library_sort_name_event_cb(lv_event_t *e)
+static void ui_library_page_delta(int page_delta)
 {
-    (void)e;
-    if (!s_library_table) return;
-#ifndef WIN32
-    if (ui_library_track_load_busy() || media_catalog_load_in_progress()) {
-        ui_library_status_hold("LOAD BUSY", COL_AMBER, 1200);
-        return;
-    }
-#endif
-    uint32_t target_key = ui_library_selected_key();
-    s_sort_name_desc = !s_sort_name_desc;
-#ifndef WIN32
-    media_catalog_sort(1, s_sort_name_desc);
-#else
-    library_sort(1, s_sort_name_desc);
-#endif
-    ui_refresh_library();
-    ui_library_preserve_selection_by_key(target_key);
-    ui_library_populate_rows();
-}
-
-static void library_sort_bpm_event_cb(lv_event_t *e)
-{
-    (void)e;
-    if (!s_library_table) return;
-#ifndef WIN32
-    if (ui_library_track_load_busy() || media_catalog_load_in_progress()) {
-        ui_library_status_hold("LOAD BUSY", COL_AMBER, 1200);
-        return;
-    }
-#endif
-    uint32_t target_key = ui_library_selected_key();
-    s_sort_bpm_desc = !s_sort_bpm_desc;
-#ifndef WIN32
-    media_catalog_sort(2, s_sort_bpm_desc);
-#else
-    library_sort(2, s_sort_bpm_desc);
-#endif
-    ui_refresh_library();
-    ui_library_preserve_selection_by_key(target_key);
-    ui_library_populate_rows();
-}
-
-static void library_sort_key_event_cb(lv_event_t *e)
-{
-    (void)e;
-    if (!s_library_table) return;
-#ifndef WIN32
-    if (ui_library_track_load_busy() || media_catalog_load_in_progress()) {
-        ui_library_status_hold("LOAD BUSY", COL_AMBER, 1200);
-        return;
-    }
-#endif
-    uint32_t target_key = ui_library_selected_key();
-    s_sort_key_desc = !s_sort_key_desc;
-#ifndef WIN32
-    media_catalog_sort(3, s_sort_key_desc);
-#else
-    library_sort(3, s_sort_key_desc);
-#endif
-    ui_refresh_library();
-    ui_library_preserve_selection_by_key(target_key);
-    ui_library_populate_rows();
-}
-
-static void library_page_event_cb(lv_event_t *e)
-{
-    lv_obj_t *button = lv_event_get_target(e);
-    int page_delta = (int)(intptr_t)lv_obj_get_user_data(button);
-    int count = ui_library_media_count();
+    int count = ui_library_view_count();
     int new_idx = ui_library_page_selection_after_delta(count,
                                                          s_selected_track_idx,
                                                          page_delta);
@@ -1170,118 +1287,182 @@ static void library_page_event_cb(lv_event_t *e)
     }
 }
 
-static void library_table_event_cb(lv_event_t *e)
-{
-    lv_obj_t *table = lv_event_get_target(e);
-    uint32_t row;
-    uint32_t col;
-    lv_table_get_selected_cell(table, &row, &col);
-
-    ui_library_page_t page = ui_library_current_page();
-    int new_idx = ui_library_page_absolute_index(&page, (int)row);
-    if (new_idx >= 0 && new_idx < ui_library_media_count() &&
-        new_idx != s_selected_track_idx) {
-        s_selected_track_idx = new_idx;
-        ui_library_select_visible_cell();
-        lv_obj_invalidate(table);
-        ESP_LOGD(TAG, "Library selected track index: %d", s_selected_track_idx);
-    }
-}
-
-static void library_table_draw_part_begin_cb(lv_event_t *e)
-{
-    lv_draw_task_t * draw_task = lv_event_get_draw_task(e);
-    if (!draw_task) return;
-
-    lv_draw_dsc_base_t * base_dsc = (lv_draw_dsc_base_t *)lv_draw_task_get_draw_dsc(draw_task);
-    if (!base_dsc) return;
-
-    if (base_dsc->part == LV_PART_ITEMS) {
-        uint32_t row = base_dsc->id1;
-        /* This callback runs per draw task, so up to ~120 times per frame while
-         * the Library tab is visible (8 rows x 5 columns x fill/border/label).
-         * Recomputing the page and re-reading the catalog per call is why it must
-         * stay identity-only; ui_library_page_cached() reuses the page computed
-         * once per populate/selection change. */
-        ui_library_page_t page = ui_library_page_cached();
-        int track_index = ui_library_page_absolute_index(&page, (int)row);
-
-        uint32_t track_key = 0;
-        bool has_track = false;
-
 #ifndef WIN32
-        if (track_index >= 0 &&
-            media_catalog_row_key(track_index, &track_key) == ESP_OK) {
-            has_track = true;
-        }
-#else
-        const library_track_t *track = track_index >= 0
-                                       ? library_get_ptr(track_index)
-                                       : NULL;
-        if (track) {
-            track_key = track->track_id;
-            has_track = true;
-        }
-#endif
+/* Switch the table between our USB (0) and a DJ Link player's USB. Local
+ * selection is kept across the round trip. */
+static void ui_library_set_source(uint8_t peer)
+{
+    if (peer == s_library_peer) {
+        return;
+    }
+    if (s_library_peer == 0u) {
+        (void)ui_library_leave_playlists();
+        s_local_selected_idx = s_selected_track_idx;
+    }
+    dj_link_browse_get_status(&s_peer_status);
+    s_peer_select_generation = s_peer_status.generation;
+    s_peer_want_first = -1;
+    s_library_peer = peer;
+    dj_link_browse_select(peer);
+    if (peer != 0u) {
+        s_selected_track_idx = 0;
+    } else {
+        int n = ui_library_media_count();
+        s_selected_track_idx = s_local_selected_idx < n ? s_local_selected_idx : 0;
+    }
+    ui_library_invalidate_page_cache();
+    ui_library_populate_rows();
+}
 
-        if (has_track && track_key != 0) {
-            bool loaded_d1 = s_deck_loaded_track_valid[CTRL_DECK_1] && (s_deck_loaded_track_key[CTRL_DECK_1] == track_key);
-            bool loaded_d2 = s_deck_loaded_track_valid[CTRL_DECK_2] && (s_deck_loaded_track_key[CTRL_DECK_2] == track_key);
-
-            lv_obj_t *obj = lv_event_get_target(e);
-            uint32_t sel_row = LV_TABLE_CELL_NONE;
-            uint32_t sel_col = LV_TABLE_CELL_NONE;
-            lv_table_get_selected_cell(obj, &sel_row, &sel_col);
-
-            lv_draw_task_type_t task_type = lv_draw_task_get_type(draw_task);
-
-            lv_color_t bg_color;
-            bool is_loaded = false;
-            if (loaded_d1 || loaded_d2) {
-                is_loaded = true;
-                if (loaded_d1 && loaded_d2) {
-                    bg_color = lv_color_hex(0x4DB37A); // Mješavina plave i zelene
-                } else if (loaded_d1) {
-                    bg_color = COL_ACCENT; // Plava
-                } else {
-                    bg_color = COL_GREEN; // Zelena
-                }
-            }
-
-            if (is_loaded) {
-                // Učitana pjesma (bilo selektirana ili ne): puni highlight u boji decka i crna slova
-                if (task_type == LV_DRAW_TASK_TYPE_FILL) {
-                    lv_draw_fill_dsc_t * fill_dsc = (lv_draw_fill_dsc_t *)base_dsc;
-                    fill_dsc->color = bg_color;
-                    fill_dsc->opa = LV_OPA_80;
-                }
-                else if (task_type == LV_DRAW_TASK_TYPE_BORDER) {
-                    lv_draw_border_dsc_t * border_dsc = (lv_draw_border_dsc_t *)base_dsc;
-                    border_dsc->color = bg_color;
-                }
-                else if (task_type == LV_DRAW_TASK_TYPE_LABEL) {
-                    lv_draw_label_dsc_t * label_dsc = (lv_draw_label_dsc_t *)base_dsc;
-                    label_dsc->color = COL_ON_ACCENT;
-                }
-            } else if (sel_row == row) {
-                // Neučitana selektirana pjesma: bijeli highlight i crna slova
-                if (task_type == LV_DRAW_TASK_TYPE_FILL) {
-                    lv_draw_fill_dsc_t * fill_dsc = (lv_draw_fill_dsc_t *)base_dsc;
-                    fill_dsc->color = COL_TABLE_ALT;
-                    fill_dsc->opa = LV_OPA_80;
-                }
-                else if (task_type == LV_DRAW_TASK_TYPE_BORDER) {
-                    lv_draw_border_dsc_t * border_dsc = (lv_draw_border_dsc_t *)base_dsc;
-                    border_dsc->color = COL_ACCENT;
-                }
-                else if (task_type == LV_DRAW_TASK_TYPE_LABEL) {
-                    lv_draw_label_dsc_t * label_dsc = (lv_draw_label_dsc_t *)base_dsc;
-                    label_dsc->color = COL_ON_ACCENT;
-                }
+/* SOURCE: LOCAL -> each DJ Link player, by number -> LOCAL. */
+static void library_source_event_cb(lv_event_t *e)
+{
+    (void)e;
+    if (ui_library_peer_fetch_active()) {
+        /* v249: SOURCE reads CANCEL while a peer track downloads. */
+        dj_link_fetch_cancel(s_peer_fetch.id);
+        ui_library_status_hold("CANCELLING", COL_AMBER, 1200);
+        return;
+    }
+    dj_link_summary_t summary;
+    dj_link_get_summary(&summary);
+    const dj_link_player_t *next = NULL;
+    if (summary.state != DJ_LINK_STATE_OFF) {
+        for (uint8_t i = 0; i < summary.player_count; i++) {
+            if (summary.players[i].number > s_library_peer) {
+                next = &summary.players[i];
+                break;
             }
         }
     }
+    if (!next && s_library_peer == 0u) {
+        ui_library_status_hold(summary.state == DJ_LINK_STATE_OFF ? "DJ LINK OFF"
+                                                                  : "NO DJ LINK PLAYERS",
+                               COL_AMBER, 1500);
+        return;
+    }
+    ui_library_set_source(next ? next->number : 0u);
+    char status[40];
+    if (next) {
+        snprintf(status, sizeof(status), "USB %s #%u", next->name, (unsigned)next->number);
+        ESP_LOGW(TAG, "Library source: USB of player #%u %s (LOAD downloads over NFS)",
+                 (unsigned)next->number, next->name);
+    } else {
+        snprintf(status, sizeof(status), "LOCAL USB");
+        ESP_LOGW(TAG, "Library source: local USB");
+    }
+    ui_library_status_hold(status, COL_ACCENT, 1200);
 }
+
+static void ui_library_peer_fetch_clear(void)
+{
+    memset(&s_peer_fetch, 0, sizeof(s_peer_fetch));
+    ui_library_populate_rows();
+}
+
+/* The download is complete: load the cached file like a local track. */
+static void ui_library_load_peer_file(const dj_link_fetch_status_t *st)
+{
+    uint8_t deck = s_peer_fetch.deck;
+    const char *refusal = NULL;
+    if (!media_io_gate_is_available()) {
+        refusal = "LOCAL USB NEEDED";
+    } else if (media_catalog_load_in_progress() || !ui_library_try_begin_track_load()) {
+        refusal = "LOAD BUSY";
+    }
+    if (refusal) {
+        /* The file stays cached: LOAD again finds it without downloading. */
+        ESP_LOGW(TAG, "peer load: %s ready but %s", st->path, refusal);
+        ui_library_status_hold(refusal, COL_AMBER, 2500);
+        return;
+    }
+    media_catalog_track_t item = s_peer_fetch.item;
+    item.track_key = st->track_key;
+    ESP_LOGW(TAG, "peer load: deck %u <- %s%s", (unsigned)deck + 1u, st->path,
+             st->cache_hit ? " (cached)" : "");
+    if (ui_submit_track_load(-1, st->track_key, media_catalog_generation(), deck,
+                             &item, st->path) == ESP_OK) {
+        s_peer_load_ui_id = ui_library_active_track_load_id();
+        ui_library_status_hold("LOADING", COL_ACCENT, 1500);
+    }
+}
+
+/* ui_update(): follow the download started by a peer LOAD. */
+static void ui_library_poll_peer_fetch(void)
+{
+    if (!ui_library_peer_fetch_active()) {
+        return;
+    }
+    dj_link_fetch_status_t st;
+    dj_link_fetch_get_status(&st);
+    if (st.id != s_peer_fetch.id) {
+        ui_library_peer_fetch_clear();
+        return;
+    }
+    if (st.state == DJ_LINK_FETCH_PDB || st.state == DJ_LINK_FETCH_AUDIO) {
+        uint32_t now_ms = lv_tick_get();
+        if ((st.state != s_peer_fetch.state || st.percent != s_peer_fetch.percent) &&
+            (uint32_t)(now_ms - s_peer_repaint_ms) >= UI_PEER_REPAINT_MS) {
+            s_peer_fetch.state = st.state;
+            s_peer_fetch.percent = st.percent;
+            s_peer_repaint_ms = now_ms;
+            ui_library_populate_rows();
+        }
+        return;
+    }
+    if (st.state == DJ_LINK_FETCH_DONE) {
+        ui_library_load_peer_file(&st);
+    } else if (st.state == DJ_LINK_FETCH_CANCELLED) {
+        ui_library_status_hold("DOWNLOAD CANCELLED", COL_AMBER, 2000);
+    } else {
+        char text[48];
+        snprintf(text, sizeof(text), "%s", st.error[0] ? st.error : "DOWNLOAD FAILED");
+        ESP_LOGW(TAG, "peer load: download failed: %s", text);
+        ui_library_status_hold(text, COL_RED, 3500);
+    }
+    ui_library_peer_fetch_clear();
+}
+
+/* ui_update(): follow the dj_link cache. Rows are re-read only when the
+ * list, its metadata or the selection generation moved. */
+static void ui_library_poll_peer_browse(void)
+{
+    if (s_library_peer == 0u) {
+        return;
+    }
+    dj_link_browse_status_t st;
+    dj_link_browse_get_status(&st);
+    bool changed = st.generation != s_peer_status.generation ||
+                   st.state != s_peer_status.state || st.count != s_peer_status.count ||
+                   st.total != s_peer_status.total ||
+                   st.peer != s_peer_status.peer ||
+                   strcmp(st.error, s_peer_status.error) != 0;
+    /* Metadata replies trickle in row by row: batch their repaint. */
+    uint32_t now_ms = lv_tick_get();
+    if (!changed && st.detail_seq != s_peer_status.detail_seq &&
+        (uint32_t)(now_ms - s_peer_repaint_ms) >= UI_PEER_REPAINT_MS) {
+        changed = true;
+    }
+    if (!changed) {
+        st.detail_seq = s_peer_status.detail_seq;
+    }
+    s_peer_status = st;
+    if (changed) {
+        s_peer_repaint_ms = now_ms;
+        ui_library_populate_rows();
+    }
+    if (ui_library_peer_status_current() && st.state == DJ_LINK_BROWSE_LISTED) {
+        ui_library_page_t page = ui_library_page_cached();
+        if (page.first_index != s_peer_want_first ||
+            st.generation != s_peer_want_generation) {
+            s_peer_want_first = page.first_index;
+            s_peer_want_generation = st.generation;
+            dj_link_browse_want_details(st.generation, (uint32_t)page.first_index,
+                                        (uint32_t)page.row_count);
+        }
+    }
+}
+#endif
 
 void ui_library_init(const ui_library_config_t *config)
 {
@@ -1296,258 +1477,13 @@ void ui_library_init(const ui_library_config_t *config)
     if (config) {
         s_library_config = *config;
     }
-}
-
-lv_obj_t *ui_library_create(lv_obj_t *parent)
-{
-    s_library_screen = lv_obj_create(parent);
-    lv_obj_remove_style_all(s_library_screen);
-    lv_obj_add_style(s_library_screen, &s_style_screen_bg, LV_PART_MAIN);
-    lv_obj_set_size(s_library_screen, s_library_config.hor_res, s_library_config.content_h);
-    lv_obj_set_pos(s_library_screen, 0, s_library_config.content_y);
-
-    // Fixed header table to prevent it from scrolling away
-    lv_obj_t *s_library_header_table = lv_table_create(s_library_screen);
-    lv_obj_remove_style_all(s_library_header_table);
-    /* 800x480 reference layout; wider panels (JC1060 1024) stretch the track
-     * table and slide the load/sort rail to the right edge. */
-    const bool lib_wide = s_library_config.hor_res >= 1000;
-    const int lib_sidebar_x = lib_wide ? 880 : 660;
-    const int lib_page_y = lib_wide ? 484 : 384;
-    lv_obj_set_size(s_library_header_table, lib_wide ? 850 : 630, 36);
-    lv_obj_set_pos(s_library_header_table, 10, 10);
-    lv_obj_clear_flag(s_library_header_table, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_clear_flag(s_library_header_table, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_set_style_min_height(s_library_header_table, 36, LV_PART_ITEMS);
-    lv_obj_set_style_max_height(s_library_header_table, 36, LV_PART_ITEMS);
-    lv_obj_set_style_pad_left(s_library_header_table, 6, LV_PART_ITEMS);
-    lv_obj_set_style_pad_right(s_library_header_table, 6, LV_PART_ITEMS);
-    lv_obj_set_style_pad_top(s_library_header_table, 8, LV_PART_ITEMS);
-    lv_obj_set_style_pad_bottom(s_library_header_table, 8, LV_PART_ITEMS);
-    lv_obj_set_style_border_color(s_library_header_table, COL_BORDER, LV_PART_ITEMS);
-    lv_obj_set_style_border_width(s_library_header_table, 1, LV_PART_ITEMS);
-    lv_obj_set_style_border_side(s_library_header_table, LV_BORDER_SIDE_BOTTOM, LV_PART_ITEMS);
-    lv_obj_set_style_bg_color(s_library_header_table, COL_PANEL_DK, LV_PART_ITEMS);
-    lv_obj_set_style_bg_opa(s_library_header_table, LV_OPA_COVER, LV_PART_ITEMS);
-    lv_obj_set_style_text_color(s_library_header_table, COL_ACCENT, LV_PART_ITEMS);
-    lv_obj_set_style_text_font(s_library_header_table, &lv_font_montserrat_14, LV_PART_ITEMS);
-
-    const int col_title_w = lib_wide ? 430 : 280;
-    const int col_artist_w = lib_wide ? 230 : 160;
-    lv_table_set_column_width(s_library_header_table, 0, col_title_w);
-    lv_table_set_column_width(s_library_header_table, 1, col_artist_w);
-    lv_table_set_column_width(s_library_header_table, 2, 70);
-    lv_table_set_column_width(s_library_header_table, 3, 55);
-    lv_table_set_column_width(s_library_header_table, 4, 65);
-    lv_table_set_column_count(s_library_header_table, 5);
-    lv_table_set_row_count(s_library_header_table, 1);
-    lv_table_set_cell_value(s_library_header_table, 0, 0, "TITLE");
-    lv_table_set_cell_value(s_library_header_table, 0, 1, "ARTIST");
-    lv_table_set_cell_value(s_library_header_table, 0, 2, "KEY");
-    lv_table_set_cell_value(s_library_header_table, 0, 3, "BPM");
-    lv_table_set_cell_value(s_library_header_table, 0, 4, "TIME");
-
-    // Main scrollable tracks table (height stretched to the bottom of the screen)
-    s_library_table = lv_table_create(s_library_screen);
-    lv_obj_set_size(s_library_table, lib_wide ? 850 : 630, lib_wide ? 430 : 330);
-    lv_obj_set_pos(s_library_table, 10, 46);
-    lv_obj_clear_flag(s_library_table, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_bg_color(s_library_table, COL_TABLE_ROW, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(s_library_table, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_add_event_cb(s_library_table, library_table_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
-    lv_obj_add_event_cb(s_library_table, library_table_draw_part_begin_cb, LV_EVENT_DRAW_TASK_ADDED, NULL);
-    lv_obj_add_flag(s_library_table, LV_OBJ_FLAG_SEND_DRAW_TASK_EVENTS);
-
-    lv_obj_set_style_min_height(s_library_table, 40, LV_PART_ITEMS);
-    lv_obj_set_style_max_height(s_library_table, 40, LV_PART_ITEMS);
-    lv_obj_set_style_pad_left(s_library_table, 6, LV_PART_ITEMS);
-    lv_obj_set_style_pad_right(s_library_table, 6, LV_PART_ITEMS);
-    lv_obj_set_style_pad_top(s_library_table, 8, LV_PART_ITEMS);
-    lv_obj_set_style_pad_bottom(s_library_table, 8, LV_PART_ITEMS);
-    lv_obj_set_style_border_color(s_library_table, COL_BORDER, LV_PART_ITEMS);
-    lv_obj_set_style_border_width(s_library_table, 1, LV_PART_ITEMS);
-    lv_obj_set_style_border_side(s_library_table, LV_BORDER_SIDE_BOTTOM, LV_PART_ITEMS);
-    lv_obj_set_style_bg_color(s_library_table, COL_TABLE_ROW, LV_PART_ITEMS);
-    lv_obj_set_style_bg_opa(s_library_table, LV_OPA_COVER, LV_PART_ITEMS);
-    lv_obj_set_style_text_color(s_library_table, COL_TEXT_MUTED, LV_PART_ITEMS);
-    lv_obj_set_style_text_font(s_library_table, &lv_font_montserrat_18, LV_PART_ITEMS);
-    lv_obj_set_style_border_color(s_library_table, COL_ACCENT, LV_PART_ITEMS | LV_STATE_FOCUSED);
-    lv_obj_set_style_border_width(s_library_table, 3, LV_PART_ITEMS | LV_STATE_FOCUSED);
-    lv_obj_set_style_border_side(s_library_table, LV_BORDER_SIDE_BOTTOM, LV_PART_ITEMS | LV_STATE_FOCUSED);
-    lv_obj_set_style_border_opa(s_library_table, LV_OPA_COVER, LV_PART_ITEMS | LV_STATE_FOCUSED);
-    lv_obj_set_style_text_color(s_library_table, COL_ON_ACCENT, LV_PART_ITEMS | LV_STATE_FOCUSED);
-    lv_table_set_column_width(s_library_table, 0, col_title_w);
-    lv_table_set_column_width(s_library_table, 1, col_artist_w);
-    lv_table_set_column_width(s_library_table, 2, 70);
-    lv_table_set_column_width(s_library_table, 3, 55);
-    lv_table_set_column_width(s_library_table, 4, 65);
-    lv_table_set_column_count(s_library_table, 5);
-
-    s_btn_library_page_prev = lv_button_create(s_library_screen);
-    lv_obj_remove_style_all(s_btn_library_page_prev);
-    lv_obj_add_style(s_btn_library_page_prev, &s_style_btn_secondary, LV_PART_MAIN);
-    lv_obj_add_style(s_btn_library_page_prev, &s_style_pressed, LV_STATE_PRESSED);
-    lv_obj_add_style(s_btn_library_page_prev, &s_style_btn_disabled,
-                     LV_PART_MAIN | LV_STATE_DISABLED);
-    lv_obj_set_size(s_btn_library_page_prev, 90, 36);
-    lv_obj_set_pos(s_btn_library_page_prev, 10, lib_page_y);
-    lv_obj_set_user_data(s_btn_library_page_prev, (void *)(intptr_t)-1);
-    lv_obj_add_event_cb(s_btn_library_page_prev, library_page_event_cb,
-                        LV_EVENT_CLICKED, NULL);
-    lv_obj_remove_flag(s_btn_library_page_prev, LV_OBJ_FLAG_CLICK_FOCUSABLE);
-    lv_obj_t *lbl_page_prev = lv_label_create(s_btn_library_page_prev);
-    lv_label_set_text(lbl_page_prev, "PREV");
-    lv_obj_set_style_text_font(lbl_page_prev, &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(lbl_page_prev, COL_TEXT_MUTED, LV_PART_MAIN);
-    lv_obj_align(lbl_page_prev, LV_ALIGN_CENTER, 0, 0);
-
-    s_label_library_source = lv_label_create(s_library_screen);
-    lv_obj_set_width(s_label_library_source, lib_wide ? 550 : 430);
-    lv_obj_set_pos(s_label_library_source, 110, lib_page_y + 10);
-    lv_obj_set_style_text_align(s_label_library_source, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_set_style_text_font(s_label_library_source, &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(s_label_library_source, COL_TEXT_DIM, LV_PART_MAIN);
-
-    s_btn_library_page_next = lv_button_create(s_library_screen);
-    lv_obj_remove_style_all(s_btn_library_page_next);
-    lv_obj_add_style(s_btn_library_page_next, &s_style_btn_secondary, LV_PART_MAIN);
-    lv_obj_add_style(s_btn_library_page_next, &s_style_pressed, LV_STATE_PRESSED);
-    lv_obj_add_style(s_btn_library_page_next, &s_style_btn_disabled,
-                     LV_PART_MAIN | LV_STATE_DISABLED);
-    lv_obj_set_size(s_btn_library_page_next, 90, 36);
-    lv_obj_set_pos(s_btn_library_page_next, lib_wide ? 770 : 550, lib_page_y);
-    lv_obj_set_user_data(s_btn_library_page_next, (void *)(intptr_t)1);
-    lv_obj_add_event_cb(s_btn_library_page_next, library_page_event_cb,
-                        LV_EVENT_CLICKED, NULL);
-    lv_obj_remove_flag(s_btn_library_page_next, LV_OBJ_FLAG_CLICK_FOCUSABLE);
-    lv_obj_t *lbl_page_next = lv_label_create(s_btn_library_page_next);
-    lv_label_set_text(lbl_page_next, "NEXT");
-    lv_obj_set_style_text_font(lbl_page_next, &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(lbl_page_next, COL_TEXT_MUTED, LV_PART_MAIN);
-    lv_obj_align(lbl_page_next, LV_ALIGN_CENTER, 0, 0);
-
-    ui_library_populate_rows();
-
-    // Active Deck Indicator (130x90, reduced height and width)
-    s_active_deck_indicator = lv_obj_create(s_library_screen);
-    lv_obj_remove_style_all(s_active_deck_indicator);
-    lv_obj_set_size(s_active_deck_indicator, 130, 90);
-    lv_obj_set_pos(s_active_deck_indicator, lib_sidebar_x, 10);
-    lv_obj_set_style_bg_opa(s_active_deck_indicator, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_radius(s_active_deck_indicator, 10, LV_PART_MAIN);
-    lv_obj_set_style_border_width(s_active_deck_indicator, 1, LV_PART_MAIN);
-    lv_obj_set_style_border_color(s_active_deck_indicator, COL_BORDER, LV_PART_MAIN);
-
-    s_label_indicator_deck = lv_label_create(s_active_deck_indicator);
-    lv_label_set_text(s_label_indicator_deck, "DECK 1");
-    lv_obj_set_style_text_font(s_label_indicator_deck, &lv_font_montserrat_28, LV_PART_MAIN);
-    lv_obj_set_style_text_color(s_label_indicator_deck, COL_ON_ACCENT, LV_PART_MAIN);
-    lv_obj_align(s_label_indicator_deck, LV_ALIGN_CENTER, 0, -12);
-
-    s_label_indicator_status = lv_label_create(s_active_deck_indicator);
-    lv_label_set_text(s_label_indicator_status, "ACTIVE");
-    lv_obj_set_style_text_font(s_label_indicator_status, &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(s_label_indicator_status, COL_ON_ACCENT, LV_PART_MAIN);
-    lv_obj_align(s_label_indicator_status, LV_ALIGN_CENTER, 0, 18);
-
-    // Stacks LOAD D1/D2 vertically with specific accent coloring, pushed down
-    s_btn_library_load = lv_button_create(s_library_screen);
-    lv_obj_remove_style_all(s_btn_library_load);
-    lv_obj_add_style(s_btn_library_load, &s_style_btn_primary, LV_PART_MAIN);
-    lv_obj_add_style(s_btn_library_load, &s_style_pressed, LV_STATE_PRESSED);
-    lv_obj_set_size(s_btn_library_load, 130, 45);
-    lv_obj_set_pos(s_btn_library_load, lib_sidebar_x, 110);
-    lv_obj_set_user_data(s_btn_library_load, (void *)(uintptr_t)CTRL_DECK_1);
-    lv_obj_add_event_cb(s_btn_library_load, library_load_event_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_remove_flag(s_btn_library_load, LV_OBJ_FLAG_CLICK_FOCUSABLE);
-    lv_obj_set_style_bg_color(s_btn_library_load, COL_ACCENT, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(s_btn_library_load, LV_OPA_COVER, LV_PART_MAIN);
-
-    lv_obj_t *lbl_load = lv_label_create(s_btn_library_load);
-    lv_label_set_text(lbl_load, "LOAD DECK 1");
-    lv_obj_set_style_text_font(lbl_load, &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(lbl_load, COL_ON_ACCENT, LV_PART_MAIN);
-    lv_obj_align(lbl_load, LV_ALIGN_CENTER, 0, 0);
-
-    s_btn_library_load_deck2 = lv_button_create(s_library_screen);
-    lv_obj_remove_style_all(s_btn_library_load_deck2);
-    lv_obj_add_style(s_btn_library_load_deck2, &s_style_btn_primary, LV_PART_MAIN);
-    lv_obj_add_style(s_btn_library_load_deck2, &s_style_pressed, LV_STATE_PRESSED);
-    lv_obj_set_size(s_btn_library_load_deck2, 130, 45);
-    lv_obj_set_pos(s_btn_library_load_deck2, lib_sidebar_x, 160);
-    lv_obj_set_user_data(s_btn_library_load_deck2, (void *)(uintptr_t)CTRL_DECK_2);
-    lv_obj_add_event_cb(s_btn_library_load_deck2, library_load_event_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_remove_flag(s_btn_library_load_deck2, LV_OBJ_FLAG_CLICK_FOCUSABLE);
-    lv_obj_set_style_bg_color(s_btn_library_load_deck2, COL_GREEN, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(s_btn_library_load_deck2, LV_OPA_COVER, LV_PART_MAIN);
-
-    lv_obj_t *lbl_load_deck2 = lv_label_create(s_btn_library_load_deck2);
-    lv_label_set_text(lbl_load_deck2, "LOAD DECK 2");
-    lv_obj_set_style_text_font(lbl_load_deck2, &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(lbl_load_deck2, COL_ON_ACCENT, LV_PART_MAIN);
-    lv_obj_align(lbl_load_deck2, LV_ALIGN_CENTER, 0, 0);
-
-    lv_obj_t *btn_sort_artist = lv_button_create(s_library_screen);
-    lv_obj_remove_style_all(btn_sort_artist);
-    lv_obj_add_style(btn_sort_artist, &s_style_btn_secondary, LV_PART_MAIN);
-    lv_obj_set_size(btn_sort_artist, 130, 40);
-    lv_obj_set_pos(btn_sort_artist, lib_sidebar_x, lib_wide ? 230 : 215);
-    lv_obj_add_event_cb(btn_sort_artist, library_sort_artist_event_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_remove_flag(btn_sort_artist, LV_OBJ_FLAG_CLICK_FOCUSABLE);
-
-    lv_obj_t *lbl_sort_artist = lv_label_create(btn_sort_artist);
-    lv_label_set_text(lbl_sort_artist, "SORT ARTIST");
-    lv_obj_set_style_text_font(lbl_sort_artist, &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(lbl_sort_artist, COL_TEXT_MUTED, LV_PART_MAIN);
-    lv_obj_align(lbl_sort_artist, LV_ALIGN_CENTER, 0, 0);
-
-    lv_obj_t *btn_sort_name = lv_button_create(s_library_screen);
-    lv_obj_remove_style_all(btn_sort_name);
-    lv_obj_add_style(btn_sort_name, &s_style_btn_secondary, LV_PART_MAIN);
-    lv_obj_set_size(btn_sort_name, 130, 40);
-    lv_obj_set_pos(btn_sort_name, lib_sidebar_x, lib_wide ? 280 : 260);
-    lv_obj_add_event_cb(btn_sort_name, library_sort_name_event_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_remove_flag(btn_sort_name, LV_OBJ_FLAG_CLICK_FOCUSABLE);
-
-    lv_obj_t *lbl_sort_name = lv_label_create(btn_sort_name);
-    lv_label_set_text(lbl_sort_name, "SORT NAME");
-    lv_obj_set_style_text_font(lbl_sort_name, &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(lbl_sort_name, COL_TEXT_MUTED, LV_PART_MAIN);
-    lv_obj_align(lbl_sort_name, LV_ALIGN_CENTER, 0, 0);
-
-    lv_obj_t *btn_sort_bpm = lv_button_create(s_library_screen);
-    lv_obj_remove_style_all(btn_sort_bpm);
-    lv_obj_add_style(btn_sort_bpm, &s_style_btn_secondary, LV_PART_MAIN);
-    lv_obj_set_size(btn_sort_bpm, 130, 40);
-    lv_obj_set_pos(btn_sort_bpm, lib_sidebar_x, lib_wide ? 330 : 305);
-    lv_obj_add_event_cb(btn_sort_bpm, library_sort_bpm_event_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_remove_flag(btn_sort_bpm, LV_OBJ_FLAG_CLICK_FOCUSABLE);
-
-    lv_obj_t *lbl_sort_bpm = lv_label_create(btn_sort_bpm);
-    lv_label_set_text(lbl_sort_bpm, "SORT BPM");
-    lv_obj_set_style_text_font(lbl_sort_bpm, &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(lbl_sort_bpm, COL_TEXT_MUTED, LV_PART_MAIN);
-    lv_obj_align(lbl_sort_bpm, LV_ALIGN_CENTER, 0, 0);
-
-    lv_obj_t *btn_sort_key = lv_button_create(s_library_screen);
-    lv_obj_remove_style_all(btn_sort_key);
-    lv_obj_add_style(btn_sort_key, &s_style_btn_secondary, LV_PART_MAIN);
-    lv_obj_set_size(btn_sort_key, 130, 40);
-    lv_obj_set_pos(btn_sort_key, lib_sidebar_x, lib_wide ? 380 : 350);
-    lv_obj_add_event_cb(btn_sort_key, library_sort_key_event_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_remove_flag(btn_sort_key, LV_OBJ_FLAG_CLICK_FOCUSABLE);
-
-    lv_obj_t *lbl_sort_key = lv_label_create(btn_sort_key);
-    lv_label_set_text(lbl_sort_key, "SORT KEY");
-    lv_obj_set_style_text_font(lbl_sort_key, &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(lbl_sort_key, COL_TEXT_MUTED, LV_PART_MAIN);
-    lv_obj_align(lbl_sort_key, LV_ALIGN_CENTER, 0, 0);
-
-    // s_label_library_hint has been removed
-    ui_library_set_load_busy(false, NULL);
-
-    return s_library_screen;
+    if (!s_track_load_result_q) {
+        s_track_load_result_q = ui_library_create_result_queue();
+        if (!s_track_load_result_q) {
+            ESP_LOGE(TAG, "track-load result queue (8 x %u B) not created",
+                     (unsigned)sizeof(ui_track_load_result_t));
+        }
+    }
 }
 
 void ui_library_load_initial_track(void)
@@ -1566,6 +1502,7 @@ void ui_library_load_initial_track(void)
             ui_library_apply_loaded_track(CTRL_DECK_1,
                                           track0->title,
                                           track0->artist,
+                                          track0->key,
                                           track0->bpm,
                                           track0->duration_ms,
                                           track0->waveform_low,
@@ -1588,6 +1525,7 @@ void ui_library_load_initial_track(void)
             ui_library_apply_loaded_track(CTRL_DECK_2,
                                           track1->title,
                                           track1->artist,
+                                          track1->key,
                                           track1->bpm,
                                           track1->duration_ms,
                                           track1->waveform_low,
@@ -1602,9 +1540,6 @@ void ui_library_load_initial_track(void)
     ui_library_apply_empty_track(CTRL_DECK_1);
     ui_library_apply_empty_track(CTRL_DECK_2);
 #endif
-    if (s_library_table) {
-        lv_obj_invalidate(s_library_table);
-    }
 }
 
 void ui_trigger_library_refresh(void)
@@ -1621,9 +1556,6 @@ void ui_notify_usb_removed(void)
 
 void ui_refresh_library(void)
 {
-    if (!s_library_table) {
-        return;
-    }
     int n = ui_library_media_count();
 
 #ifndef WIN32
@@ -1635,23 +1567,17 @@ void ui_refresh_library(void)
 #endif
 
     ui_lvgl_lock();
-    ui_library_cache_invalidate();
-    s_selected_track_idx = 0;
-    ui_library_populate_rows();
-
-#ifdef WIN32
-    const library_track_t *track = library_get_ptr(0);
-    if (track) {
-        ui_library_set_header_track(track->title, track->artist, track->bpm);
+    /* The playlist set was rebuilt with the catalog. */
+    (void)ui_library_leave_playlists();
+    s_all_selected_idx = 0;
+    s_pl_list_selected_idx = 0;
+    if (ui_library_peer_view()) {
+        /* Our catalog changed under a peer view: the peer rows stay. */
+        s_local_selected_idx = 0;
+    } else {
+        s_selected_track_idx = 0;
+        ui_library_populate_rows();
     }
-#else
-    media_catalog_row_t row;
-    if (media_catalog_get_row(0, &row) == ESP_OK) {
-        ui_library_set_header_track(row.title[0] ? row.title : "Unknown Title",
-                                    row.artist[0] ? row.artist : "Unknown Artist",
-                                    row.bpm);
-    }
-#endif
     ui_lvgl_unlock();
 
 #ifndef WIN32
@@ -1667,7 +1593,7 @@ void ui_refresh_library(void)
 
 bool ui_is_library_active(void)
 {
-    return s_active_tab == 1 && s_library_table != NULL;
+    return s_active_tab == 1;
 }
 
 esp_err_t ui_library_select_delta(int delta)
@@ -1675,12 +1601,8 @@ esp_err_t ui_library_select_delta(int delta)
     if (delta == 0) {
         return ESP_OK;
     }
-    if (!s_library_table) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
     ui_lvgl_lock();
-    int n = ui_library_media_count();
+    int n = ui_library_view_count();
     if (n <= 0) {
         ui_lvgl_unlock();
         return ESP_ERR_NOT_FOUND;
@@ -1702,7 +1624,6 @@ esp_err_t ui_library_select_delta(int delta)
         ui_library_populate_rows();
     } else {
         ui_library_select_visible_cell();
-        lv_obj_invalidate(s_library_table);
     }
     ui_lvgl_unlock();
     return ESP_OK;
@@ -1715,13 +1636,17 @@ esp_err_t ui_library_load_selected(void)
 
 esp_err_t ui_library_load_selected_for_deck(uint8_t deck)
 {
-    if (!s_library_table) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (ui_library_media_count() <= 0) {
+    /* dj_ui presentation (migration phase 1) builds no library table; the
+     * load pipeline below is widget-independent, so controller LOAD still
+     * loads the selected catalog row there. */
+    int count = ui_library_view_count();
+    UI_LIB_TRACE("load selected D%u: index %d of %d%s%s", (unsigned)deck + 1u,
+                 s_selected_track_idx, count, ui_library_peer_view() ? " (peer)" : "",
+                 ui_library_track_load_busy() ? ", load busy" : "");
+    if (count <= 0) {
         return ESP_ERR_NOT_FOUND;
     }
-    if (ui_library_track_load_busy()) {
+    if (s_lib_mode != UI_LIB_MODE_PLAYLISTS && ui_library_track_load_busy()) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -1734,8 +1659,432 @@ esp_err_t ui_library_load_selected_for_deck(uint8_t deck)
     return ESP_OK;
 }
 
+#ifndef WIN32
+/* v247: a DJ Link player asked us to load one of our own USB tracks (0x19,
+ * validated by dj_link). Runs in ui_update(), through the same single-flight
+ * load path as the LOAD buttons; never touches a playing deck. */
+static void ui_library_poll_dj_link(const ui_frame_context_t *ctx)
+{
+    uint32_t now_ms = lv_tick_get();
+    if ((uint32_t)(now_ms - s_dj_link_count_ms) >= UI_DJ_LINK_COUNT_MS) {
+        s_dj_link_count_ms = now_ms;
+        int count = ui_library_media_count();
+        dj_link_set_local_track_count(count > 0 ? (uint32_t)count : 0u);
+        if (s_library_peer != 0u) {
+            dj_link_summary_t summary;
+            dj_link_get_summary(&summary);
+            bool present = false;
+            for (uint8_t i = 0; summary.state != DJ_LINK_STATE_OFF &&
+                                i < summary.player_count; i++) {
+                present = present || summary.players[i].number == s_library_peer;
+            }
+            if (!present) {
+                ESP_LOGW(TAG, "%s - Library back to the local USB",
+                         summary.state == DJ_LINK_STATE_OFF ? "DJ Link off"
+                                                            : "player left DJ Link");
+                ui_library_set_source(0u);
+                ui_library_status_hold("LOCAL USB", COL_AMBER, 1500);
+            }
+        }
+    }
+    ui_library_poll_peer_browse();
+    ui_library_poll_peer_fetch();
+
+    dj_link_load_request_t req;
+    if (!ctx || !dj_link_take_load_request(&req)) {
+        return;
+    }
+    const char *refusal = NULL;
+    esp_err_t rc = ESP_FAIL;
+    int deck = dj_link_pick_target_deck(ctx->deck_state[CTRL_DECK_1].playing,
+                                        ctx->deck_state[CTRL_DECK_2].playing,
+                                        s_deck_loaded_track_valid[CTRL_DECK_1],
+                                        s_deck_loaded_track_valid[CTRL_DECK_2]);
+    if (deck < 0) {
+        refusal = "both decks playing";
+    } else if (ui_library_track_load_busy() || media_catalog_load_in_progress()) {
+        refusal = "load busy";
+    } else {
+        /* library_track_key() is the rekordbox id when the PDB has one;
+         * re-check the id so a path-hash key can never alias it. */
+        const uint32_t generation = media_catalog_generation();
+        int index = media_catalog_find_index_by_key(req.rekordbox_id);
+        media_catalog_track_t item;
+        if (index < 0 || media_catalog_get(index, &item) != ESP_OK ||
+            item.rekordbox_track_id != req.rekordbox_id ||
+            media_catalog_generation() != generation) {
+            refusal = "track not in our library";
+        } else {
+            rc = ui_library_load_track_identity_for_deck(item.track_key, generation,
+                                                         (uint8_t)deck);
+            if (rc != ESP_OK) {
+                refusal = esp_err_to_name(rc);
+            }
+        }
+    }
+    dj_link_finish_load_request(req.id, rc == ESP_OK);
+
+    char status[32];
+    if (rc == ESP_OK) {
+        s_remote_load_ui_id = ui_library_active_track_load_id();
+        s_remote_load_from = req.from_number;
+        ESP_LOGW(TAG, "DJ Link load from #%u: rekordbox id %u -> deck %d",
+                 (unsigned)req.from_number, (unsigned)req.rekordbox_id, deck + 1);
+        snprintf(status, sizeof(status), "LOADING FROM #%u", (unsigned)req.from_number);
+        ui_library_status_hold(status, COL_ACCENT, 1500);
+    } else {
+        ESP_LOGW(TAG, "DJ Link load from #%u: rekordbox id %u refused: %s",
+                 (unsigned)req.from_number, (unsigned)req.rekordbox_id, refusal);
+        snprintf(status, sizeof(status), "REFUSED LOAD #%u", (unsigned)req.from_number);
+        ui_library_status_hold(status, COL_AMBER, 2000);
+    }
+}
+#endif
+
+/* v256: this model drives the dj_ui Library page.
+ * The page text is rebuilt only when ui_library_populate_rows() marked it,
+ * i.e. exactly when the legacy table would have been refilled; everything
+ * else is plain state read per frame. Buffers live in PSRAM, allocated once. */
+typedef struct {
+    ui_library_row_text_t text[UI_LIBRARY_PAGE_ROWS];
+    char badge[UI_LIBRARY_PAGE_ROWS][8];
+    uint32_t key[UI_LIBRARY_PAGE_ROWS];      /* catalog key, 0 = peer row */
+    dj_track_t rows[UI_LIBRARY_PAGE_ROWS];
+    const uint16_t *art[UI_LIBRARY_PAGE_ROWS]; /* thumbnail pushed per row, NULL = none yet */
+    int count;                               /* rows pushed at the last rebuild */
+    int total;                               /* view count at the last rebuild */
+} ui_library_djui_page_t;
+
+static ui_library_djui_page_t *s_djui_page;
+/* Catalog order the dj_ui page shows. A catalog reload restarts in load
+ * order, so the sort only holds for the generation it was applied to. */
+static int s_djui_sort_field = -1;           /* media_catalog_sort field, -1 = load order */
+static bool s_djui_sort_desc;
+static uint32_t s_djui_sort_generation;
+
+static void ui_library_djui_fill_row(int visible_row, int track_index)
+{
+    ui_library_djui_page_t *p = s_djui_page;
+    ui_library_row_text_t *text = &p->text[visible_row];
+    dj_track_t *row = &p->rows[visible_row];
+    memset(row, 0, sizeof(*row));
+    p->key[visible_row] = 0;
+    p->badge[visible_row][0] = '\0';
+    ui_library_format_row_text(text, "", "", "", 0, 0);
+
+    /* Title and artist go in whole (dj_ui ellipsizes to the column width),
+     * fitted to what its fonts can draw. */
+    if (ui_library_peer_view()) {
+        dj_link_peer_track_t t;
+        if (ui_library_peer_status_current() &&
+            dj_link_browse_get_track(s_peer_status.generation, (uint32_t)track_index, &t)) {
+            ui_library_peer_badge(&t, p->badge[visible_row], sizeof(p->badge[visible_row]));
+            if (ui_library_peer_fetch_active() && s_peer_fetch.peer == s_library_peer &&
+                s_peer_fetch.rekordbox_id == t.rekordbox_id) {
+                row->badge_tone = DJ_TONE_OK;
+            } else if (t.audio != DJ_LINK_PEER_AUDIO_NFS) {
+                row->badge_tone = DJ_TONE_MUTED;
+            }
+            ui_djui_text_fit(text->title, sizeof(text->title), t.title[0] ? t.title : "Unknown Title");
+            ui_djui_text_fit(text->artist, sizeof(text->artist), t.artist);
+            /* Same placeholders as the legacy peer table. */
+            if (!t.has_detail) {
+                snprintf(text->bpm, sizeof(text->bpm), "...");
+                snprintf(text->duration, sizeof(text->duration), "...");
+            } else {
+                row->bpm = (float)t.bpm100 / 100.0f;
+                row->len_ms = (uint32_t)t.duration_s * 1000u;
+                if (t.bpm100 == 0u) snprintf(text->bpm, sizeof(text->bpm), "--");
+                if (t.duration_s == 0u) snprintf(text->duration, sizeof(text->duration), "--");
+            }
+            row->bpm_text = t.has_detail && t.bpm100 != 0u ? NULL : text->bpm;
+            row->time_text = t.has_detail && t.duration_s != 0u ? NULL : text->duration;
+        }
+    } else if (s_lib_mode == UI_LIB_MODE_PLAYLISTS) {
+        /* Playlist list: name, its folder, track count in the TIME column. */
+        library_playlist_info_t info;
+        if (library_playlist_get(track_index, &info) == ESP_OK) {
+            ui_djui_text_fit(text->title, sizeof(text->title), info.name);
+            ui_djui_text_fit(text->artist, sizeof(text->artist), info.folder);
+            text->key[0] = '\0';
+            text->bpm[0] = '\0';
+            snprintf(text->duration, sizeof(text->duration), "%u TR",
+                     (unsigned)info.track_count);
+            row->bpm_text = text->bpm;
+            row->time_text = text->duration;
+        }
+    } else {
+        media_catalog_row_t r;
+        track_index = ui_library_catalog_row(track_index);
+        if (track_index >= 0 && media_catalog_get_row(track_index, &r) == ESP_OK) {
+            ui_library_format_row_text(text, "", "", r.key, r.bpm, r.duration_ms);
+            ui_djui_text_fit(text->title, sizeof(text->title), r.title);
+            ui_djui_text_fit(text->artist, sizeof(text->artist), r.artist);
+            ui_djui_text_fit(text->key, sizeof(text->key), text->key);
+            row->bpm = (float)r.bpm;
+            row->len_ms = r.duration_ms;
+            p->key[visible_row] = r.track_key;
+        }
+    }
+    row->title = text->title;
+    row->artist = text->artist;
+    row->key = text->key;
+    row->badge = p->badge[visible_row][0] ? p->badge[visible_row] : NULL;
+}
+
+static void ui_library_djui_source_text(char *out, size_t len)
+{
+    if (!ui_library_peer_view()) {
+        if (s_lib_mode == UI_LIB_MODE_PLAYLISTS) {
+            snprintf(out, len, "PLAYLISTS");
+        } else if (s_lib_mode == UI_LIB_MODE_PLAYLIST_TRACKS) {
+            char name[21];
+            ui_djui_text_fit(name, sizeof(name), s_pl_name);
+            snprintf(out, len, "PLAYLIST %s", name);
+        } else {
+            snprintf(out, len, "LOCAL USB");
+        }
+        return;
+    }
+    const dj_link_browse_status_t *st = &s_peer_status;
+    /* Fitted before the cut, so a player name never ends mid-sequence. */
+    char name[21];
+    ui_djui_text_fit(name, sizeof(name), st->peer_name[0] ? st->peer_name : "PLAYER");
+    if (!ui_library_peer_status_current()) {
+        snprintf(out, len, "USB #%u  CONNECTING...", (unsigned)s_library_peer);
+        return;
+    }
+    switch (st->state) {
+    case DJ_LINK_BROWSE_WAITING:
+        snprintf(out, len, "USB %s #%u  WAITING FOR DJ LINK", name, (unsigned)st->peer);
+        break;
+    case DJ_LINK_BROWSE_LOADING:
+        snprintf(out, len, "USB %s #%u  LOADING %u/%u", name, (unsigned)st->peer,
+                 (unsigned)st->count, (unsigned)st->total);
+        break;
+    case DJ_LINK_BROWSE_LISTED:
+        if (!ui_library_peer_fetch_active()) {
+            snprintf(out, len, "USB %s #%u  LOAD = DOWNLOAD", name, (unsigned)st->peer);
+        } else {
+            snprintf(out, len, "USB %s #%u  %s %u%%", name, (unsigned)st->peer,
+                     s_peer_fetch.state == DJ_LINK_FETCH_AUDIO ? "DOWNLOAD" : "READING DB",
+                     (unsigned)s_peer_fetch.percent);
+        }
+        break;
+    case DJ_LINK_BROWSE_FAILED:
+        snprintf(out, len, "USB %s #%u  ERROR: %.16s", name, (unsigned)st->peer, st->error);
+        break;
+    default:
+        snprintf(out, len, "USB #%u", (unsigned)st->peer);
+        break;
+    }
+}
+
+/* ui_library_update(), LVGL task. */
+static void ui_library_djui_publish(const ui_frame_context_t *ctx)
+{
+    if (!s_djui_page) {
+        s_djui_page = heap_caps_calloc(1, sizeof(*s_djui_page),
+                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_djui_page) {
+            ESP_LOGE(TAG, "dj_ui library page: no PSRAM");
+            return;
+        }
+    }
+    ui_djui_library_view_t v = {
+        .selected = -1,
+        .loaded = {-1, -1},
+        .progress = -1,
+    };
+    /* Thumbnails: USB reads wait while a track load owns the stick. */
+    ui_artwork_set_paused(ui_library_track_load_busy());
+    bool art_changed = ui_artwork_poll();
+    ui_library_page_t page;
+    if (s_djui_rows_dirty) {
+        s_djui_rows_dirty = false;
+        page = ui_library_refresh_page_cache();
+        s_djui_page->total = ui_library_view_count();
+        int count = page.row_count < UI_LIBRARY_PAGE_ROWS ? page.row_count : UI_LIBRARY_PAGE_ROWS;
+        ui_artwork_begin_page();
+        for (int r = 0; r < count; r++) {
+            ui_library_djui_fill_row(r, ui_library_page_absolute_index(&page, r));
+            uint32_t key = s_djui_page->key[r];
+            s_djui_page->art[r] = key ? ui_artwork_get(key, UI_ARTWORK_ROW) : NULL;
+            s_djui_page->rows[r].art = s_djui_page->art[r];
+        }
+        s_djui_page->count = count;
+        ui_djui_bridge_library_set_rows(s_djui_page->rows, (uint8_t)count);
+    } else {
+        page = ui_library_page_cached();
+        /* Lazy load: rows pushed before their thumbnail was decoded. */
+        for (int r = 0; art_changed && r < s_djui_page->count; r++) {
+            uint32_t key = s_djui_page->key[r];
+            const uint16_t *art = key ? ui_artwork_get(key, UI_ARTWORK_ROW) : NULL;
+            if (art == s_djui_page->art[r]) continue;
+            s_djui_page->art[r] = art;
+            ui_djui_bridge_library_set_row_art((uint8_t)r, art);
+        }
+    }
+
+    char source[UI_DJUI_LIB_TEXT_LEN];
+    ui_library_djui_source_text(source, sizeof(source));
+    v.source = source;
+    v.total = (uint16_t)(s_djui_page->total > 0 ? s_djui_page->total : 0);
+    v.unit = s_lib_mode == UI_LIB_MODE_PLAYLISTS ? "PLAYLISTS" : "TRACKS";
+    v.pages = (uint16_t)page.page_count;
+    v.page = page.page_count > 0 ? (uint16_t)(page.page_index + 1) : 0u;
+    if (page.row_count > 0) {
+        v.selected = (int8_t)page.selected_row;
+    }
+    /* Peer ids are another player's and never match what our decks loaded. */
+    for (uint8_t d = 0; d < DJ_DECKS && d < DECK_CORE_DECK_COUNT && !ui_library_peer_view(); d++) {
+        if (!s_deck_loaded_track_valid[d] || s_deck_loaded_track_key[d] == 0u) continue;
+        for (int r = 0; r < page.row_count && r < UI_LIBRARY_PAGE_ROWS; r++) {
+            if (s_djui_page->key[r] == s_deck_loaded_track_key[d]) {
+                v.loaded[d] = (int8_t)r;
+                break;
+            }
+        }
+    }
+
+    /* Same rule as the legacy ACTIVE / READY indicator. */
+    bool d1 = ctx && ctx->deck_state[CTRL_DECK_1].playing;
+    bool d2 = ctx && ctx->deck_state[CTRL_DECK_2].playing;
+    if (d1 && d2) {
+        v.status_deck = DJ_DECKS;
+        v.deck_status = "ACTIVE";
+    } else if (d1 || d2) {
+        v.status_deck = d1 ? CTRL_DECK_1 : CTRL_DECK_2;
+        v.deck_status = "ACTIVE";
+    } else {
+        v.status_deck = ctx && ctx->active_deck == CTRL_DECK_2 ? CTRL_DECK_2 : CTRL_DECK_1;
+        v.deck_status = "READY";
+    }
+
+    /* Peer lists keep the player's order: no column is lit there. */
+    if (s_djui_sort_field >= 0 && s_djui_sort_generation != media_catalog_generation()) {
+        UI_LIB_TRACE("dj_ui sort cleared: catalog reloaded in load order");
+        s_djui_sort_field = -1;
+    }
+    if (!ui_library_peer_view() && s_lib_mode == UI_LIB_MODE_ALL && s_djui_sort_field >= 0) {
+        v.sort = (dj_sort_t)(s_djui_sort_field + 1);
+        v.sort_desc = s_djui_sort_desc;
+    }
+
+    v.load_enabled = !ui_library_track_load_busy();
+    static int8_t s_traced_enabled = -1;
+    static int8_t s_traced_loaded[DJ_DECKS] = {-2, -2};
+    if (s_traced_enabled != (int8_t)v.load_enabled) {
+        s_traced_enabled = (int8_t)v.load_enabled;
+        UI_LIB_TRACE("dj_ui LOAD buttons %s", v.load_enabled ? "enabled" : "disabled (load busy)");
+    }
+    for (uint8_t d = 0; d < DJ_DECKS; d++) {
+        if (s_traced_loaded[d] == v.loaded[d]) continue;
+        s_traced_loaded[d] = v.loaded[d];
+        UI_LIB_TRACE("dj_ui D%u loaded row %d (key 0x%08x%s)", (unsigned)d + 1u, (int)v.loaded[d],
+                     (unsigned)s_deck_loaded_track_key[d],
+                     s_deck_loaded_track_valid[d] ? "" : ", none");
+    }
+    if (ui_library_peer_fetch_active()) {
+        v.progress = (int16_t)s_peer_fetch.percent;
+        v.source_label = "CANCEL";
+    } else {
+        v.source_label = "SOURCE";
+    }
+    v.playlists_label = s_lib_mode == UI_LIB_MODE_PLAYLIST_TRACKS ? "BACK"
+                      : s_lib_mode == UI_LIB_MODE_PLAYLISTS       ? "ALL TRACKS"
+                                                                  : "PLAYLISTS";
+    ui_djui_bridge_library_update(&v);
+}
+
+static void ui_library_djui_select_row(uint8_t row)
+{
+    ui_library_page_t page = ui_library_page_cached();
+    if ((int)row >= page.row_count) {
+        return;
+    }
+    s_selected_track_idx = ui_library_page_absolute_index(&page, (int)row);
+    ui_library_select_visible_cell();
+    UI_LIB_TRACE("dj_ui select row %u -> index %d", (unsigned)row, s_selected_track_idx);
+}
+
+/* A tap on a playlist row opens it (LOAD D1/D2 on it does the same, through
+ * ui_library_load_selected_for_deck). */
+void ui_library_djui_on_select(uint8_t row)
+{
+    ui_library_djui_select_row(row);
+    if (s_lib_mode == UI_LIB_MODE_PLAYLISTS && !ui_library_peer_view()) {
+        ui_library_open_playlist(s_selected_track_idx);
+    }
+}
+
+/* LOAD D1 / D2 on the page: the controller LOAD button's own path
+ * (BTN_LOAD -> DECK_UI_CMD_LOAD_SELECTED -> ui_library_load_selected_for_deck)
+ * with the tapped row selected first. */
+void ui_library_djui_on_load(uint8_t deck, uint8_t row)
+{
+    ui_library_djui_select_row(row);
+    ctrl_event_t ev = {
+        .type  = CTRL_EV_BUTTON,
+        .id    = deck == CTRL_DECK_2 ? CTRL_ID_LOAD_DECK2 : CTRL_ID_LOAD_DECK1,
+        .deck  = deck == CTRL_DECK_2 ? CTRL_DECK_2 : CTRL_DECK_1,
+        .value = 1,
+        .seq   = 0
+    };
+    esp_err_t rc = deck_core_queue_event(&ev);
+    UI_LIB_TRACE("dj_ui LOAD D%u row %u -> index %d, LOAD button event %s",
+                 (unsigned)ev.deck + 1u, (unsigned)row, s_selected_track_idx,
+                 esp_err_to_name(rc));
+}
+
+/* dj_ui sort ids ARTIST..KEY are media_catalog fields 0..3. A new column
+ * starts ascending, a second tap on the lit column reverses it. dj_ui lights
+ * the column only from the published state, so a refusal (peer list, load
+ * busy) leaves the buttons as they were. Same guards and selection keeping
+ * as the legacy sort buttons, whose per-column toggles stay untouched. */
+void ui_library_djui_on_sort(uint8_t sort)
+{
+    if (sort < DJ_SORT_ARTIST || sort > DJ_SORT_KEY || ui_library_sort_refused()) {
+        return;
+    }
+    if (ui_library_track_load_busy() || media_catalog_load_in_progress()) {
+        ui_library_status_hold("LOAD BUSY", COL_AMBER, 1200);
+        return;
+    }
+    int field = (int)sort - 1;
+    bool desc = field == s_djui_sort_field ? !s_djui_sort_desc : false;
+    uint32_t target_key = ui_library_selected_key();
+    media_catalog_sort(field, desc);
+    s_djui_sort_field = field;
+    s_djui_sort_desc = desc;
+    s_djui_sort_generation = media_catalog_generation();
+    ui_refresh_library();
+    ui_library_preserve_selection_by_key(target_key);
+    ui_library_populate_rows();
+    UI_LIB_TRACE("dj_ui sort field %d %s, selection index %d", field, desc ? "desc" : "asc",
+                 s_selected_track_idx);
+}
+
+void ui_library_djui_on_page(int8_t dir)
+{
+    ui_library_page_delta(dir);
+}
+
+void ui_library_djui_on_source(void)
+{
+    library_source_event_cb(NULL);
+}
+
+void ui_library_djui_on_playlists(void)
+{
+    ui_library_playlists_button();
+}
+
 void ui_library_update(const ui_frame_context_t *ctx)
 {
+#ifndef WIN32
+    ui_library_poll_dj_link(ctx);
+#endif
     int active_tab = ctx ? ctx->active_tab : 0;
     s_active_tab = active_tab;
     const uint32_t refresh_requested =
@@ -1772,67 +2121,19 @@ void ui_library_update(const ui_frame_context_t *ctx)
         s_library_refresh_applied = refresh_requested;
     }
 
-    if (plan.focus_library_table && s_library_table) {
-        lv_group_t *g = lv_group_get_default();
-        if (g && lv_group_get_focused(g) != s_library_table) {
-            lv_group_focus_obj(s_library_table);
-        }
+    ui_library_djui_publish(ctx);
+}
 
-        uint32_t sel_row = LV_TABLE_CELL_NONE;
-        uint32_t sel_col = LV_TABLE_CELL_NONE;
-        lv_table_get_selected_cell(s_library_table, &sel_row, &sel_col);
-        if (sel_row == LV_TABLE_CELL_NONE) {
-            ui_library_select_visible_cell();
-        }
+uint32_t ui_library_deck_artwork_key(uint8_t deck)
+{
+    uint8_t idx = ui_library_deck_index(deck);
+    if (!s_deck_loaded_track_valid[idx] || !s_loaded_media_valid[idx]) return 0u;
+    /* A DJ Link download is another player's track: no local artwork. */
+    if (strncmp(s_loaded_media[idx].audio_path, UI_PEER_CACHE_PREFIX,
+                sizeof(UI_PEER_CACHE_PREFIX) - 1u) == 0) {
+        return 0u;
     }
-
-    if (ctx && s_active_deck_indicator && s_label_indicator_deck && s_label_indicator_status) {
-        bool d1_playing = ctx->deck_state[CTRL_DECK_1].playing;
-        bool d2_playing = ctx->deck_state[CTRL_DECK_2].playing;
-
-        if (d1_playing && d2_playing) {
-            lv_obj_set_style_bg_color(s_active_deck_indicator, COL_RED, LV_PART_MAIN);
-            lv_obj_set_style_border_color(s_active_deck_indicator, COL_BORDER, LV_PART_MAIN);
-            lv_obj_set_style_border_width(s_active_deck_indicator, 1, LV_PART_MAIN);
-            lv_label_set_text(s_label_indicator_deck, "DECK 1+2");
-            lv_label_set_text(s_label_indicator_status, "ACTIVE");
-            lv_obj_set_style_text_color(s_label_indicator_deck, COL_ON_ACCENT, LV_PART_MAIN);
-            lv_obj_set_style_text_color(s_label_indicator_status, COL_ON_ACCENT, LV_PART_MAIN);
-        } else if (d1_playing) {
-            lv_obj_set_style_bg_color(s_active_deck_indicator, COL_ACCENT, LV_PART_MAIN);
-            lv_obj_set_style_border_color(s_active_deck_indicator, COL_BORDER, LV_PART_MAIN);
-            lv_obj_set_style_border_width(s_active_deck_indicator, 1, LV_PART_MAIN);
-            lv_label_set_text(s_label_indicator_deck, "DECK 1");
-            lv_label_set_text(s_label_indicator_status, "ACTIVE");
-            lv_obj_set_style_text_color(s_label_indicator_deck, COL_ON_ACCENT, LV_PART_MAIN);
-            lv_obj_set_style_text_color(s_label_indicator_status, COL_ON_ACCENT, LV_PART_MAIN);
-        } else if (d2_playing) {
-            lv_obj_set_style_bg_color(s_active_deck_indicator, COL_GREEN, LV_PART_MAIN);
-            lv_obj_set_style_border_color(s_active_deck_indicator, COL_BORDER, LV_PART_MAIN);
-            lv_obj_set_style_border_width(s_active_deck_indicator, 1, LV_PART_MAIN);
-            lv_label_set_text(s_label_indicator_deck, "DECK 2");
-            lv_label_set_text(s_label_indicator_status, "ACTIVE");
-            lv_obj_set_style_text_color(s_label_indicator_deck, COL_ON_ACCENT, LV_PART_MAIN);
-            lv_obj_set_style_text_color(s_label_indicator_status, COL_ON_ACCENT, LV_PART_MAIN);
-        } else {
-            // Nijedan ne svira: prikazujemo target deck u neaktivnom/ready stanju
-            uint8_t target = ctx->active_deck;
-            lv_color_t target_color = (target == CTRL_DECK_1) ? COL_ACCENT : COL_GREEN;
-            
-            lv_obj_set_style_bg_color(s_active_deck_indicator, COL_PANEL_DK, LV_PART_MAIN);
-            lv_obj_set_style_border_color(s_active_deck_indicator, target_color, LV_PART_MAIN);
-            lv_obj_set_style_border_width(s_active_deck_indicator, 2, LV_PART_MAIN);
-            
-            if (target == CTRL_DECK_1) {
-                lv_label_set_text(s_label_indicator_deck, "DECK 1");
-            } else {
-                lv_label_set_text(s_label_indicator_deck, "DECK 2");
-            }
-            lv_label_set_text(s_label_indicator_status, "READY");
-            lv_obj_set_style_text_color(s_label_indicator_deck, COL_TEXT, LV_PART_MAIN);
-            lv_obj_set_style_text_color(s_label_indicator_status, COL_TEXT_MUTED, LV_PART_MAIN);
-        }
-    }
+    return s_deck_loaded_track_key[idx];
 }
 
 uint32_t ui_library_deck_duration_ms(uint8_t deck, uint32_t fallback_duration_ms)
@@ -1917,7 +2218,8 @@ esp_err_t ui_library_load_track_identity_for_deck(uint32_t track_key,
     }
 
     ui_lvgl_lock();
-    esp_err_t rc = ui_submit_track_load(resolved_index, track_key, generation, deck);
+    esp_err_t rc = ui_submit_track_load(resolved_index, track_key, generation, deck,
+                                        NULL, NULL);
     ui_lvgl_unlock();
     return rc;
 #else
@@ -1927,58 +2229,6 @@ esp_err_t ui_library_load_track_identity_for_deck(uint32_t track_key,
         return ESP_ERR_NOT_FOUND;
     }
     return ui_library_load_track_index_for_deck(index, deck);
-#endif
-}
-
-esp_err_t ui_library_load_track_index_for_deck(int index, uint8_t deck)
-{
-#ifndef WIN32
-    if (index < 0 || index >= media_catalog_count()) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    const uint32_t generation = media_catalog_generation();
-    media_catalog_track_t item;
-    if (media_catalog_get(index, &item) != ESP_OK ||
-        media_catalog_generation() != generation) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    return ui_library_load_track_identity_for_deck(item.track_key, generation, deck);
-#else
-    if (index < 0 || index >= library_count()) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (!ui_library_try_begin_track_load()) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    library_set_selected_track_index(index);
-    library_track_t *track = library_get_ptr(index);
-    if (track) {
-        library_load_anlz(track);
-        anlz_metadata_t meta_snapshot;
-        const anlz_metadata_t *meta = ui_library_clone_loaded_anlz(&meta_snapshot);
-        if (ui_library_publish_simulated_track(deck, track, meta) != ESP_OK) {
-            anlz_free(&meta_snapshot);
-            ui_library_apply_empty_track(deck);
-            ui_library_finish_track_load();
-            return ESP_FAIL;
-        }
-        s_deck_loaded_track_key[deck] = track->track_id;
-        s_deck_loaded_track_valid[deck] = true;
-        if (s_library_table) {
-            lv_obj_invalidate(s_library_table);
-        }
-        ui_library_apply_loaded_track(deck,
-                                      track->title,
-                                      track->artist,
-                                      track->bpm,
-                                      track->duration_ms,
-                                      track->waveform_low,
-                                      track->has_waveform != 0,
-                                      meta);
-        anlz_free(&meta_snapshot);
-    }
-    ui_library_finish_track_load();
-    return ESP_OK;
 #endif
 }
 

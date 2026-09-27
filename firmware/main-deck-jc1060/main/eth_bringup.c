@@ -33,6 +33,11 @@ esp_netif_ip_info_t eth_bringup_ip_info(void)
     return s_ip_info;
 }
 
+esp_netif_t* eth_bringup_netif(void)
+{
+    return s_eth_netif;
+}
+
 static void ip_event_cb(void* arg, esp_event_base_t event_base,
                         int32_t event_id, void* event_data)
 {

@@ -17,12 +17,15 @@ typedef enum {
     UI_OVERVIEW_WAVE_CACHE_SCROLL,
     UI_OVERVIEW_WAVE_CACHE_OFFSET,
     UI_OVERVIEW_WAVE_CACHE_EDGE,
+    UI_OVERVIEW_WAVE_CACHE_FILL,        /* v286: progressive rebuild, margins */
     UI_OVERVIEW_WAVE_CACHE_KIND_COUNT,
 } ui_overview_wave_cache_update_kind_t;
 
 #define UI_OVERVIEW_WAVE_CACHE_MAX_BLITS 2
 #define UI_OVERVIEW_WAVE_CACHE_MARGIN_PX 128
 #define UI_OVERVIEW_WAVE_CACHE_EDGE_BATCH_PX 32
+/* v286: margin columns a progressive rebuild renders per update */
+#define UI_OVERVIEW_WAVE_CACHE_FILL_BATCH_PX 64
 
 typedef struct {
     uint16_t src_x_px;
@@ -48,6 +51,12 @@ typedef struct {
     int margin_px;
     int ring_head_px;
     int view_origin_px;
+    /* v286: progressive rebuilds (opt-in). A rebuild renders the view only;
+     * later updates fill the margins. [filled_lo_px, filled_hi_px) are the
+     * logical strip columns holding pixels; the whole strip when complete. */
+    bool progressive;
+    int filled_lo_px;
+    int filled_hi_px;
     int64_t strip_start_ms_q16;
     int64_t ms_per_px_q16;
     uint32_t source_generation;
@@ -131,6 +140,24 @@ bool ui_overview_wave_cache_update(ui_overview_wave_cache_t *cache,
                                    uint32_t center_ms,
                                    uint32_t window_ms,
                                    ui_overview_wave_cache_report_t *out_report);
+
+/* v285: true when ui_overview_wave_cache_update with these arguments would
+ * rebuild the whole strip. Lets a caller keep to one rebuild per frame. */
+bool ui_overview_wave_cache_needs_full(const ui_overview_wave_cache_t *cache,
+                                       const ui_waveform_source_t *source,
+                                       uint32_t duration_ms,
+                                       const anlz_metadata_t *meta,
+                                       uint32_t center_ms,
+                                       uint32_t window_ms);
+
+/* v286: a strip rebuild renders the visible columns only, then each update
+ * renders up to UI_OVERVIEW_WAVE_CACHE_FILL_BATCH_PX margin columns (right
+ * side first, playback runs that way) before scrolling by offset/edge again.
+ * The view is pixel-identical to a whole-strip rebuild. Survives reset. */
+void ui_overview_wave_cache_set_progressive(ui_overview_wave_cache_t *cache, bool enabled);
+/* v286: a progressive rebuild still has margin columns to render, so
+ * ui_overview_wave_cache_update has work even when the centre did not move. */
+bool ui_overview_wave_cache_filling(const ui_overview_wave_cache_t *cache);
 
 #ifdef UI_OVERVIEW_WAVE_CACHE_TESTING
 void ui_overview_wave_cache_test_force_view_origin(ui_overview_wave_cache_t *cache, int origin_px);

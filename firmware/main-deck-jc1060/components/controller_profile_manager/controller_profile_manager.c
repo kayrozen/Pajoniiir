@@ -645,13 +645,22 @@ void controller_profile_registry_mark_transfer_failed(controller_profile_registr
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
+/* v292: EXT_RAM_BSS_ATTR moves a static to PSRAM when
+ * CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY is set; empty on host builds. */
+#ifdef ESP_PLATFORM
+#include "esp_attr.h"
+#endif
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
+#endif
+
 #ifndef CONFIG_CONTROLLER_PROFILE_SD_PATH
 #define CONFIG_CONTROLLER_PROFILE_SD_PATH "/sd/controllers"
 #endif
 
 static const char *TAG = "ctrl_profile";
 
-static controller_profile_registry_t s_registry;
+EXT_RAM_BSS_ATTR static controller_profile_registry_t s_registry;
 static SemaphoreHandle_t s_manager_mutex;
 static uint16_t s_log_vid = 0xFFFFu;
 static uint16_t s_log_pid = 0xFFFFu;

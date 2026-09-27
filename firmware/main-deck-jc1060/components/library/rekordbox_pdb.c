@@ -86,6 +86,9 @@ static void pdb_copy_str(char *dst, size_t dst_len, const char *src)
 #define TABLE_TYPE_ARTISTS  0x02u
 #define TABLE_TYPE_ALBUMS   0x03u
 #define TABLE_TYPE_KEYS     0x05u
+#define TABLE_TYPE_PLAYLIST_TREE    0x07u
+#define TABLE_TYPE_PLAYLIST_ENTRIES 0x08u
+#define TABLE_TYPE_ARTWORK  0x0Du
 
 /* Page layout */
 #define PAGE_HEAP_OFFSET    0x28u   /* heap start relative to page base       */
@@ -93,6 +96,7 @@ static void pdb_copy_str(char *dst, size_t dst_len, const char *src)
 #define PAGE_NEXT_OFF       0x0Cu   /* uint32: next page number               */
 
 /* Track row field offsets (relative to row start) */
+#define TRACK_OFF_ARTWORK_ID 0x1Cu  /* uint32: id in the Artwork table, 0 = none */
 #define TRACK_OFF_KEY_ID    0x20u   /* uint32: id in the Keys table           */
 #define TRACK_OFF_TEMPO     0x38u   /* uint32: BPM × 100                      */
 #define TRACK_OFF_ALBUM_ID  0x40u   /* uint32                                 */
@@ -109,7 +113,9 @@ static void pdb_copy_str(char *dst, size_t dst_len, const char *src)
 
 /* String-offset table indices */
 #define STR_IDX_ANLZ_PATH   14u     /* /PIONEER/USBANLZ/.../ANLZ0000.DAT      */
-#define STR_IDX_TITLE       18u
+/* v275: crate-digger track_row: 17 = title, 18 = an unknown string rekordbox
+ * leaves empty, so 18 always fell back to the file name (upstream too). */
+#define STR_IDX_TITLE       17u
 #define STR_IDX_FILENAME    19u
 #define STR_IDX_FILE_PATH   20u
 
@@ -123,9 +129,36 @@ static void pdb_copy_str(char *dst, size_t dst_len, const char *src)
 #define KEY_ROW_STR_OFF     8u
 #define KEY_ROW_MIN_SIZE    9u
 
+/* PlaylistTree row (crate-digger playlist_tree_row): parent_id, unknown,
+ * sort_order, id, raw_is_folder (non-zero = folder), DeviceSQL name. */
+#define PL_TREE_OFF_PARENT  0x00u
+#define PL_TREE_OFF_SORT    0x08u
+#define PL_TREE_OFF_ID      0x0Cu
+#define PL_TREE_OFF_FOLDER  0x10u
+#define PL_TREE_OFF_NAME    0x14u
+#define PL_TREE_MIN_SIZE    (PL_TREE_OFF_NAME + 1u)
+
+/* Artwork row (crate-digger artwork_row): uint32 id, DeviceSQL path of the
+ * JPEG on the stick, e.g. "/PIONEER/Artwork/00001/a3.jpg" (80x80; rekordbox
+ * writes the 240x240 copy next to it as a3_m.jpg). */
+#define ART_ROW_OFF_ID      0x00u
+#define ART_ROW_OFF_PATH    0x04u
+#define ART_ROW_MIN_SIZE    (ART_ROW_OFF_PATH + 1u)
+
+/* PlaylistEntries row (crate-digger playlist_entry_row). */
+#define PL_ENTRY_OFF_INDEX  0x00u
+#define PL_ENTRY_OFF_TRACK  0x04u
+#define PL_ENTRY_OFF_LIST   0x08u
+#define PL_ENTRY_ROW_SIZE   12u
+
 /* Limits — embedded memory budget */
 #define PDB_MAX_TRACKS      1024u
 #define PDB_MAX_NAMES        512u
+/* Playlists live in PSRAM: 256 × 80 B + 8192 × 12 B ≈ 116 KiB while open. */
+#define PDB_MAX_PLAYLISTS          256u
+#define PDB_MAX_PLAYLIST_ENTRIES  8192u
+/* Artwork paths, PSRAM: 1024 × 68 B = 68 KiB at most while open. */
+#define PDB_MAX_ARTWORKS          1024u
 
 /* ── Little-endian read helpers ─────────────────────────────────────────── */
 
@@ -284,6 +317,12 @@ typedef struct {
     char     name[PDB_STR_NAME_MAX];
 } name_entry_t;
 
+typedef struct {
+    uint32_t playlist_id;
+    uint32_t entry_index;
+    uint32_t track_id;
+} pdb_playlist_entry_t;
+
 /* ── Internal PDB handle ─────────────────────────────────────────────────── */
 
 struct pdb_s {
@@ -312,6 +351,16 @@ struct pdb_s {
     int           album_count;
     name_entry_t *keys;
     int           key_count;
+
+    /* Playlist tree + entries (kept until pdb_close) */
+    pdb_playlist_t       *playlists;
+    int                   playlist_count;
+    pdb_playlist_entry_t *entries;         /* sorted by (playlist_id, entry_index) */
+    int                   entry_count;
+
+    /* Artwork rows (kept until pdb_close), sorted by id */
+    pdb_artwork_t        *artworks;
+    int                   artwork_count;
 };
 
 /* ── Page helpers ────────────────────────────────────────────────────────── */
@@ -519,6 +568,7 @@ static bool track_cb(const struct pdb_s *p, uint32_t page_num,
     memset(t, 0, sizeof(*t));
 
     t->track_id  = rd_le32(p->data + row + TRACK_OFF_TRACK_ID);
+    t->artwork_id = rd_le32(p->data + row + TRACK_OFF_ARTWORK_ID);
     uint32_t bpm100 = rd_le32(p->data + row + TRACK_OFF_TEMPO);
     /* Round to nearest, matching the ANLZ beat-grid path (rekordbox_anlz.c),
      * so a track's coarse (PDB) and precise (ANLZ) BPM agree on the integer. */
@@ -569,6 +619,155 @@ static bool track_cb(const struct pdb_s *p, uint32_t page_num,
 
     ctx->count++;
     return true;
+}
+
+/* ── Playlist parser (JC1060) ────────────────────────────────────────────── */
+
+static void *pdb_alloc_psram(size_t bytes)
+{
+#ifndef REKORDBOX_PDB_STANDALONE_TEST
+    void *mem = heap_caps_calloc(1u, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return mem ? mem : calloc(1u, bytes);
+#else
+    return calloc(1u, bytes);
+#endif
+}
+
+static bool playlist_tree_cb(const struct pdb_s *p, uint32_t page_num,
+                             uint32_t heap_off, void *user)
+{
+    struct pdb_s *owner = (struct pdb_s *)user;
+    size_t row = page_base_off(p, page_num) + PAGE_HEAP_OFFSET + (size_t)heap_off;
+    if (row + PL_TREE_MIN_SIZE > p->data_len) return true;
+
+    uint32_t id = rd_le32(p->data + row + PL_TREE_OFF_ID);
+    if (id == 0u) return true;
+    if (owner->playlist_count >= (int)PDB_MAX_PLAYLISTS) {
+        owner->stats.playlists_truncated = true;
+        return false;
+    }
+
+    pdb_playlist_t *pl = &owner->playlists[owner->playlist_count];
+    memset(pl, 0, sizeof(*pl));
+    pl->id         = id;
+    pl->parent_id  = rd_le32(p->data + row + PL_TREE_OFF_PARENT);
+    pl->sort_order = rd_le32(p->data + row + PL_TREE_OFF_SORT);
+    pl->is_folder  = rd_le32(p->data + row + PL_TREE_OFF_FOLDER) != 0u;
+    decode_devicesql(p->data, p->data_len, row + PL_TREE_OFF_NAME,
+                     pl->name, sizeof(pl->name));
+    owner->playlist_count++;
+    return true;
+}
+
+static bool playlist_entry_cb(const struct pdb_s *p, uint32_t page_num,
+                              uint32_t heap_off, void *user)
+{
+    struct pdb_s *owner = (struct pdb_s *)user;
+    size_t row = page_base_off(p, page_num) + PAGE_HEAP_OFFSET + (size_t)heap_off;
+    if (row + PL_ENTRY_ROW_SIZE > p->data_len) return true;
+
+    uint32_t list  = rd_le32(p->data + row + PL_ENTRY_OFF_LIST);
+    uint32_t track = rd_le32(p->data + row + PL_ENTRY_OFF_TRACK);
+    if (list == 0u || track == 0u) return true;
+    if (owner->entry_count >= (int)PDB_MAX_PLAYLIST_ENTRIES) {
+        owner->stats.playlists_truncated = true;
+        return false;
+    }
+
+    pdb_playlist_entry_t *e = &owner->entries[owner->entry_count++];
+    e->playlist_id = list;
+    e->entry_index = rd_le32(p->data + row + PL_ENTRY_OFF_INDEX);
+    e->track_id    = track;
+    return true;
+}
+
+static int compare_playlist_entries(const void *a, const void *b)
+{
+    const pdb_playlist_entry_t *ea = (const pdb_playlist_entry_t *)a;
+    const pdb_playlist_entry_t *eb = (const pdb_playlist_entry_t *)b;
+    if (ea->playlist_id != eb->playlist_id)
+        return ea->playlist_id < eb->playlist_id ? -1 : 1;
+    if (ea->entry_index != eb->entry_index)
+        return ea->entry_index < eb->entry_index ? -1 : 1;
+    return 0;
+}
+
+/* Missing tables are not an error: a stick without playlists has none. Only
+ * an allocation failure or a media read failure is reported. */
+static esp_err_t parse_playlists(struct pdb_s *p)
+{
+    p->playlists = (pdb_playlist_t *)pdb_alloc_psram(
+        PDB_MAX_PLAYLISTS * sizeof(pdb_playlist_t));
+    p->entries = (pdb_playlist_entry_t *)pdb_alloc_psram(
+        PDB_MAX_PLAYLIST_ENTRIES * sizeof(pdb_playlist_entry_t));
+    if (!p->playlists || !p->entries) return ESP_ERR_NO_MEM;
+
+    walk_table(p, TABLE_TYPE_PLAYLIST_TREE, playlist_tree_cb, p);
+    if (p->playlist_count > 0) {
+        walk_table(p, TABLE_TYPE_PLAYLIST_ENTRIES, playlist_entry_cb, p);
+    }
+    if (p->read_failed) return ESP_FAIL;
+
+    qsort(p->entries, (size_t)p->entry_count, sizeof(pdb_playlist_entry_t),
+          compare_playlist_entries);
+    if (p->stats.playlists_truncated) {
+        PDB_LOGW(TAG, "Playlists truncated at %u nodes / %u entries",
+                 PDB_MAX_PLAYLISTS, PDB_MAX_PLAYLIST_ENTRIES);
+    }
+    return ESP_OK;
+}
+
+/* ── Artwork parser (JC1060) ─────────────────────────────────────────────── */
+
+static bool artwork_cb(const struct pdb_s *p, uint32_t page_num,
+                       uint32_t heap_off, void *user)
+{
+    struct pdb_s *owner = (struct pdb_s *)user;
+    size_t row = page_base_off(p, page_num) + PAGE_HEAP_OFFSET + (size_t)heap_off;
+    if (row + ART_ROW_MIN_SIZE > p->data_len) return true;
+
+    uint32_t id = rd_le32(p->data + row + ART_ROW_OFF_ID);
+    if (id == 0u) return true;
+    if (owner->artwork_count >= (int)PDB_MAX_ARTWORKS) {
+        owner->stats.artwork_truncated = true;
+        return false;
+    }
+
+    pdb_artwork_t *a = &owner->artworks[owner->artwork_count];
+    memset(a, 0, sizeof(*a));
+    a->id = id;
+    decode_devicesql(p->data, p->data_len, row + ART_ROW_OFF_PATH,
+                     a->path, sizeof(a->path));
+    /* Only absolute paths are usable; a path cut by the buffer would open
+     * the wrong file, so it is dropped rather than truncated. */
+    size_t len = strlen(a->path);
+    if (a->path[0] == '/' && len + 1u < sizeof(a->path)) owner->artwork_count++;
+    return true;
+}
+
+static int compare_artworks(const void *a, const void *b)
+{
+    uint32_t ia = ((const pdb_artwork_t *)a)->id;
+    uint32_t ib = ((const pdb_artwork_t *)b)->id;
+    return ia < ib ? -1 : ia > ib ? 1 : 0;
+}
+
+/* Like playlists: no Artwork table means no artwork, not an error. */
+static esp_err_t parse_artworks(struct pdb_s *p)
+{
+    p->artworks = (pdb_artwork_t *)pdb_alloc_psram(
+        PDB_MAX_ARTWORKS * sizeof(pdb_artwork_t));
+    if (!p->artworks) return ESP_ERR_NO_MEM;
+
+    walk_table(p, TABLE_TYPE_ARTWORK, artwork_cb, p);
+    if (p->read_failed) return ESP_FAIL;
+
+    qsort(p->artworks, (size_t)p->artwork_count, sizeof(pdb_artwork_t),
+          compare_artworks);
+    if (p->stats.artwork_truncated) {
+        PDB_LOGW(TAG, "Artwork truncated at %u rows", PDB_MAX_ARTWORKS);
+    }
+    return ESP_OK;
 }
 
 /* ── Public API ──────────────────────────────────────────────────────────── */
@@ -685,8 +884,17 @@ esp_err_t pdb_open(const char *pdb_path, pdb_t **out)
         PDB_LOGW(TAG, "Track index truncated at %u entries", PDB_MAX_TRACKS);
     }
 
-    PDB_LOGI(TAG, "Loaded: %d tracks, %d artists, %d albums, %d keys",
-             p->track_count, p->artist_count, p->album_count, p->key_count);
+    esp_err_t pl_rc = parse_playlists(p);
+    if (pl_rc == ESP_OK) pl_rc = parse_artworks(p);
+    if (pl_rc != ESP_OK) {
+        pdb_close(p);
+        return pl_rc;
+    }
+
+    PDB_LOGI(TAG, "Loaded: %d tracks, %d artists, %d albums, %d keys, "
+             "%d playlist nodes, %d playlist entries, %d artworks",
+             p->track_count, p->artist_count, p->album_count, p->key_count,
+             p->playlist_count, p->entry_count, p->artwork_count);
 
     /* Free intermediary data — no longer needed after index is built */
     pdb_close_file(p->source); p->source = NULL;
@@ -708,6 +916,9 @@ void pdb_close(pdb_t *pdb)
     free(pdb->artists);
     free(pdb->albums);
     free(pdb->keys);
+    free(pdb->playlists);
+    free(pdb->entries);
+    free(pdb->artworks);
     free(pdb);
 }
 
@@ -727,4 +938,67 @@ esp_err_t pdb_get_track(const pdb_t *pdb, int index, pdb_track_t *out)
         return ESP_ERR_INVALID_ARG;
     *out = pdb->tracks[index];
     return ESP_OK;
+}
+
+int pdb_playlist_count(const pdb_t *pdb)
+{
+    return pdb ? pdb->playlist_count : 0;
+}
+
+esp_err_t pdb_get_playlist(const pdb_t *pdb, int index, pdb_playlist_t *out)
+{
+    if (!pdb || !out || index < 0 || index >= pdb->playlist_count)
+        return ESP_ERR_INVALID_ARG;
+    *out = pdb->playlists[index];
+    return ESP_OK;
+}
+
+int pdb_playlist_track_ids(const pdb_t *pdb, uint32_t playlist_id,
+                           uint32_t *out_ids, int max)
+{
+    if (!pdb || !pdb->entries || playlist_id == 0u) return 0;
+
+    /* Lower bound of playlist_id in the sorted entry array. */
+    int lo = 0, hi = pdb->entry_count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (pdb->entries[mid].playlist_id < playlist_id) lo = mid + 1;
+        else hi = mid;
+    }
+    int n = 0;
+    for (int i = lo; i < pdb->entry_count &&
+                     pdb->entries[i].playlist_id == playlist_id; i++) {
+        if (out_ids && max > 0) {
+            if (n >= max) break;
+            out_ids[n] = pdb->entries[i].track_id;
+        }
+        n++;
+    }
+    return n;
+}
+
+int pdb_artwork_count(const pdb_t *pdb)
+{
+    return pdb ? pdb->artwork_count : 0;
+}
+
+esp_err_t pdb_get_artwork(const pdb_t *pdb, int index, pdb_artwork_t *out)
+{
+    if (!pdb || !out || index < 0 || index >= pdb->artwork_count)
+        return ESP_ERR_INVALID_ARG;
+    *out = pdb->artworks[index];
+    return ESP_OK;
+}
+
+const char *pdb_artwork_path(const pdb_t *pdb, uint32_t artwork_id)
+{
+    if (!pdb || !pdb->artworks || artwork_id == 0u) return NULL;
+    int lo = 0, hi = pdb->artwork_count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (pdb->artworks[mid].id < artwork_id) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < pdb->artwork_count && pdb->artworks[lo].id == artwork_id
+         ? pdb->artworks[lo].path : NULL;
 }

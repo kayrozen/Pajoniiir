@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "rekordbox_pdb.c" "library.c"
+    SRCS "rekordbox_pdb.c" "library.c" "library_playlists.c"
          "rekordbox_anlz.c"
          "anlz_snapshot.c"
          "library_load_trace.c"

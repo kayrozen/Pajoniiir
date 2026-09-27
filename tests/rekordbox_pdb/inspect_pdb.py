@@ -33,8 +33,8 @@ TABLE_TYPES = {
 
 # Track row string indices (0-based)
 STR_ANALYZE_PATH = 14   # path to ANLZ file on USB  e.g. /PIONEER/USBANLZ/P000/00000001/ANLZ0000.DAT
-STR_COMMENT      = 17
-STR_TITLE        = 18   # often empty for non-ID3-tagged files
+STR_COMMENT      = 16
+STR_TITLE        = 17   # 18 is an unknown string, always empty
 STR_FILENAME     = 19   # mp3/flac filename without directory
 STR_FILE_PATH    = 20   # full audio path on USB
 

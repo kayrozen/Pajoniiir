@@ -8,6 +8,21 @@
 
 #define Q16_ONE 65536LL
 
+/* v285: strip columns are rendered into this internal-RAM tile and copied to
+ * the PSRAM strip one row at a time. The renderer draws column by column
+ * (bars, grid lines, cue lines) and over several passes; straight into PSRAM
+ * that was ~14k cache-line misses per full rebuild, ~40 ms on the P4 with the
+ * panel scanning the same PSRAM. Taller strips render in place, as before.
+ * LVGL task only (the bridge), like the strips. */
+#define WAVE_TILE_W 32
+#define WAVE_TILE_MAX_H 128
+static uint16_t s_tile[WAVE_TILE_W * WAVE_TILE_MAX_H];
+
+static int min_int(int a, int b)
+{
+    return a < b ? a : b;
+}
+
 static int wrap_px(const ui_overview_wave_cache_t *cache, int x)
 {
     int width = cache ? cache->strip_width_px : 0;
@@ -103,6 +118,7 @@ void ui_overview_wave_cache_reset(ui_overview_wave_cache_t *cache)
     const uint16_t *palette = cache->palette;
     size_t palette_count = cache->palette_count;
     bool regular_beat_cap_bottom = cache->regular_beat_cap_bottom;
+    bool progressive = cache->progressive;
 
     memset(cache, 0, sizeof(*cache));
     cache->pixels = pixels;
@@ -115,6 +131,7 @@ void ui_overview_wave_cache_reset(ui_overview_wave_cache_t *cache)
     cache->palette = palette;
     cache->palette_count = palette_count;
     cache->regular_beat_cap_bottom = regular_beat_cap_bottom;
+    cache->progressive = progressive;
 }
 
 void ui_overview_wave_cache_reset_stats(ui_overview_wave_cache_t *cache)
@@ -292,26 +309,6 @@ static void cache_store_key(ui_overview_wave_cache_t *cache,
     cache->valid = true;
 }
 
-static void clear_column_span(ui_overview_wave_cache_t *cache,
-                              int dest_x,
-                              int column_count)
-{
-    if (!cache || !cache->pixels || dest_x < 0 || column_count <= 0 ||
-        dest_x >= cache->strip_width_px) {
-        return;
-    }
-    if (dest_x + column_count > cache->strip_width_px) {
-        column_count = cache->strip_width_px - dest_x;
-    }
-    uint16_t background = cache->palette ? cache->palette[0] : 0;
-    for (int y = 0; y < cache->height_px; y++) {
-        uint16_t *row = &cache->pixels[y * cache->stride_px + dest_x];
-        for (int x = 0; x < column_count; x++) {
-            row[x] = background;
-        }
-    }
-}
-
 static uint32_t strip_window_ms(const ui_overview_wave_cache_t *cache)
 {
     return q16_to_ms_round((int64_t)cache->strip_width_px *
@@ -324,6 +321,43 @@ static uint32_t strip_center_ms(const ui_overview_wave_cache_t *cache)
                          (((int64_t)cache->strip_width_px *
                            cache->ms_per_px_q16) / 2);
     return q16_to_ms_round(center_q16);
+}
+
+static void draw_columns(ui_overview_wave_cache_t *cache,
+                         const ui_waveform_source_t *source,
+                         uint32_t duration_ms,
+                         const anlz_metadata_t *meta,
+                         uint16_t *pixels,
+                         int stride_px,
+                         int dest_x,
+                         int logical_x,
+                         int column_count)
+{
+    const anlz_cue_t *cues = cache->cues_set ? cache->cues
+                                             : (meta ? meta->cues : NULL);
+    uint8_t cue_count = cache->cues_set ? cache->cue_count
+                                        : (meta ? meta->cue_count : 0u);
+    /* clears the columns itself */
+    ui_overview_renderer_draw_main_rgb565_column_span_cues(pixels,
+                                                           stride_px,
+                                                           cache->height_px,
+                                                           dest_x,
+                                                           logical_x,
+                                                           column_count,
+                                                           cache->strip_width_px,
+                                                           source,
+                                                           duration_ms,
+                                                           meta,
+                                                           strip_center_ms(cache),
+                                                           strip_window_ms(cache),
+                                                           cache->palette,
+                                                           cache->palette_count,
+                                                           cache->regular_beat_cap_bottom,
+                                                           cache->loop_active,
+                                                           cache->loop_start_ms,
+                                                           cache->loop_end_ms,
+                                                           cues,
+                                                           cue_count);
 }
 
 static void render_physical_span(ui_overview_wave_cache_t *cache,
@@ -341,31 +375,23 @@ static void render_physical_span(ui_overview_wave_cache_t *cache,
             chunk = cache->strip_width_px - dest_x;
         }
 
-        clear_column_span(cache, dest_x, chunk);
-        const anlz_cue_t *cues = cache->cues_set ? cache->cues
-                                                 : (meta ? meta->cues : NULL);
-        uint8_t cue_count = cache->cues_set ? cache->cue_count
-                                            : (meta ? meta->cue_count : 0u);
-        ui_overview_renderer_draw_main_rgb565_column_span_cues(cache->pixels,
-                                                               cache->stride_px,
-                                                               cache->height_px,
-                                                               dest_x,
-                                                               logical_x,
-                                                               chunk,
-                                                               cache->strip_width_px,
-                                                               source,
-                                                               duration_ms,
-                                                               meta,
-                                                               strip_center_ms(cache),
-                                                               strip_window_ms(cache),
-                                                               cache->palette,
-                                                               cache->palette_count,
-                                                               cache->regular_beat_cap_bottom,
-                                                               cache->loop_active,
-                                                               cache->loop_start_ms,
-                                                               cache->loop_end_ms,
-                                                               cues,
-                                                               cue_count);
+        if (cache->height_px > WAVE_TILE_MAX_H) {
+            draw_columns(cache, source, duration_ms, meta, cache->pixels,
+                         cache->stride_px, dest_x, logical_x, chunk);
+        } else {
+            for (int done = 0; done < chunk; done += WAVE_TILE_W) {
+                int w = chunk - done;
+                if (w > WAVE_TILE_W) {
+                    w = WAVE_TILE_W;
+                }
+                draw_columns(cache, source, duration_ms, meta, s_tile,
+                             WAVE_TILE_W, 0, logical_x + done, w);
+                for (int y = 0; y < cache->height_px; y++) {
+                    memcpy(&cache->pixels[y * cache->stride_px + dest_x + done],
+                           &s_tile[y * WAVE_TILE_W], (size_t)w * sizeof(uint16_t));
+                }
+            }
+        }
         physical_x += chunk;
         logical_x += chunk;
         column_count -= chunk;
@@ -389,13 +415,91 @@ static void rebuild_full(ui_overview_wave_cache_t *cache,
                                            (cache->view_width_px / 2)) *
                                  cache->ms_per_px_q16);
 
+    /* v286: progressive: the view now, the margins over the next updates */
+    if (cache->progressive && cache->margin_px > 0) {
+        cache->filled_lo_px = cache->view_origin_px;
+        cache->filled_hi_px = cache->view_origin_px + cache->view_width_px;
+    } else {
+        cache->filled_lo_px = 0;
+        cache->filled_hi_px = cache->strip_width_px;
+    }
     render_physical_span(cache, source, duration_ms, meta,
-                         0, 0, cache->strip_width_px);
+                         cache->filled_lo_px, cache->filled_lo_px,
+                         cache->filled_hi_px - cache->filled_lo_px);
 
     report->kind = UI_OVERVIEW_WAVE_CACHE_FULL;
     report->scroll_dx_px = 0;
-    report->columns_rendered = (uint16_t)cache->strip_width_px;
+    report->columns_rendered = (uint16_t)(cache->filled_hi_px - cache->filled_lo_px);
     build_blit_segments(cache, report);
+}
+
+static bool strip_complete(const ui_overview_wave_cache_t *cache)
+{
+    return cache->filled_lo_px <= 0 && cache->filled_hi_px >= cache->strip_width_px;
+}
+
+/* Logical columns [logical_x, logical_x + count) of the unscrolled strip. */
+static void render_logical_span(ui_overview_wave_cache_t *cache,
+                                const ui_waveform_source_t *source,
+                                uint32_t duration_ms,
+                                const anlz_metadata_t *meta,
+                                int logical_x,
+                                int count)
+{
+    if (count > 0) {
+        render_physical_span(cache, source, duration_ms, meta,
+                             cache->ring_head_px + logical_x, logical_x, count);
+    }
+}
+
+/* v286: one step of a progressive rebuild. The strip geometry is the
+ * rebuild's; the view moves to desired_origin (inside the strip) with its
+ * missing columns rendered first, then up to FILL_BATCH margin columns,
+ * right side first. The filled span stays contiguous. */
+static void fill_step(ui_overview_wave_cache_t *cache,
+                      const ui_waveform_source_t *source,
+                      uint32_t duration_ms,
+                      const anlz_metadata_t *meta,
+                      int desired_origin,
+                      ui_overview_wave_cache_report_t *report)
+{
+    int dx = desired_origin - cache->view_origin_px;
+    int view_end = desired_origin + cache->view_width_px;
+    int rendered = 0;
+
+    if (desired_origin < cache->filled_lo_px) {
+        rendered = cache->filled_lo_px - desired_origin;
+        render_logical_span(cache, source, duration_ms, meta, desired_origin, rendered);
+        cache->filled_lo_px = desired_origin;
+    } else if (view_end > cache->filled_hi_px) {
+        rendered = view_end - cache->filled_hi_px;
+        render_logical_span(cache, source, duration_ms, meta, cache->filled_hi_px, rendered);
+        cache->filled_hi_px = view_end;
+    }
+
+    int budget = UI_OVERVIEW_WAVE_CACHE_FILL_BATCH_PX - rendered;
+    if (budget > 0 && cache->filled_hi_px < cache->strip_width_px) {
+        int n = min_int(budget, cache->strip_width_px - cache->filled_hi_px);
+        render_logical_span(cache, source, duration_ms, meta, cache->filled_hi_px, n);
+        cache->filled_hi_px += n;
+        rendered += n;
+        budget -= n;
+    }
+    if (budget > 0 && cache->filled_lo_px > 0) {
+        int n = min_int(budget, cache->filled_lo_px);
+        cache->filled_lo_px -= n;
+        render_logical_span(cache, source, duration_ms, meta, cache->filled_lo_px, n);
+        rendered += n;
+    }
+
+    cache->view_origin_px = desired_origin;
+    report->kind = UI_OVERVIEW_WAVE_CACHE_FILL;
+    report->scroll_dx_px = dx;
+    report->columns_rendered = (uint16_t)rendered;
+    /* margins only: the visible pixels did not change, nothing to redraw */
+    if (dx != 0) {
+        build_blit_segments(cache, report);
+    }
 }
 
 static int desired_view_origin_px(const ui_overview_wave_cache_t *cache,
@@ -516,6 +620,101 @@ static void advance_left_edge(ui_overview_wave_cache_t *cache,
     build_blit_segments(cache, report);
 }
 
+static bool update_args_valid(const ui_overview_wave_cache_t *cache,
+                              const ui_waveform_source_t *source,
+                              uint32_t duration_ms,
+                              uint32_t window_ms)
+{
+    return cache && cache->pixels && cache->stride_px >= cache->strip_width_px &&
+           cache->strip_width_px > 0 && cache->view_width_px > 0 &&
+           cache->view_width_px <= cache->strip_width_px &&
+           cache->height_px > 0 && cache->palette && cache->palette_count > 0 &&
+           source && source->samples && source->sample_count > 0 &&
+           source->kind != UI_WAVEFORM_SOURCE_NONE &&
+           duration_ms > 0 && window_ms > 0;
+}
+
+typedef enum {
+    PLAN_NONE,
+    PLAN_FULL,
+    PLAN_OFFSET,
+    PLAN_RIGHT_EDGE,
+    PLAN_LEFT_EDGE,
+    PLAN_FILL,
+} update_plan_t;
+
+/* What ui_overview_wave_cache_update will do; valid arguments only. */
+static update_plan_t update_plan(const ui_overview_wave_cache_t *cache,
+                                 const ui_waveform_source_t *source,
+                                 uint32_t duration_ms,
+                                 const anlz_metadata_t *meta,
+                                 uint32_t center_ms,
+                                 uint32_t window_ms,
+                                 int *out_desired_origin,
+                                 int *out_required_to_fit)
+{
+    bool full = !source_matches(cache, source, duration_ms, meta, window_ms);
+    if (full || cache->margin_px <= 0) {
+        return (!full && cache->center_ms == center_ms) ? PLAN_NONE : PLAN_FULL;
+    }
+
+    int desired_origin = desired_view_origin_px(cache, center_ms);
+    int dx = desired_origin - cache->view_origin_px;
+    *out_desired_origin = desired_origin;
+    *out_required_to_fit = 0;
+    /* v286: a progressive rebuild in progress keeps its geometry while the
+     * view stays inside the strip; scrolling needs the complete ring. */
+    if (!strip_complete(cache)) {
+        return desired_origin >= 0 &&
+               desired_origin + cache->view_width_px <= cache->strip_width_px
+                   ? PLAN_FILL : PLAN_FULL;
+    }
+    if (dx == 0) {
+        return PLAN_NONE;
+    }
+    /* v285: a short step back (jog, scratch, snapped centre jitter) that
+     * stays inside the safe margin has its pixels in the strip already; only
+     * real backward jumps (loop wrap, cue, seek) rebuild. */
+    if (abs(dx) <= UI_OVERVIEW_WAVE_CACHE_EDGE_BATCH_PX &&
+        origin_inside_safe_margin(cache, desired_origin)) {
+        return PLAN_OFFSET;
+    }
+    if (abs(dx) >= cache->strip_width_px || (dx < 0 && abs(dx) > 4)) {
+        return PLAN_FULL;
+    }
+    int required_to_fit;
+    if (dx > 0) {
+        required_to_fit = desired_origin + cache->view_width_px -
+                          cache->strip_width_px;
+        if (required_to_fit < 0) {
+            required_to_fit = 0;
+        }
+    } else {
+        required_to_fit = desired_origin < 0 ? -desired_origin : 0;
+    }
+    if (required_to_fit > max_edge_batch_px(cache)) {
+        return PLAN_FULL;
+    }
+    *out_required_to_fit = required_to_fit;
+    return dx > 0 ? PLAN_RIGHT_EDGE : PLAN_LEFT_EDGE;
+}
+
+bool ui_overview_wave_cache_needs_full(const ui_overview_wave_cache_t *cache,
+                                       const ui_waveform_source_t *source,
+                                       uint32_t duration_ms,
+                                       const anlz_metadata_t *meta,
+                                       uint32_t center_ms,
+                                       uint32_t window_ms)
+{
+    if (!update_args_valid(cache, source, duration_ms, window_ms)) {
+        return false;
+    }
+    int desired_origin = 0;
+    int required_to_fit = 0;
+    return update_plan(cache, source, duration_ms, meta, center_ms, window_ms,
+                       &desired_origin, &required_to_fit) == PLAN_FULL;
+}
+
 bool ui_overview_wave_cache_update(ui_overview_wave_cache_t *cache,
                                    const ui_waveform_source_t *source,
                                    uint32_t duration_ms,
@@ -525,13 +724,7 @@ bool ui_overview_wave_cache_update(ui_overview_wave_cache_t *cache,
                                    ui_overview_wave_cache_report_t *out_report)
 {
     report_reset(out_report);
-    if (!cache || !cache->pixels || cache->stride_px < cache->strip_width_px ||
-        cache->strip_width_px <= 0 || cache->view_width_px <= 0 ||
-        cache->view_width_px > cache->strip_width_px ||
-        cache->height_px <= 0 || !cache->palette || cache->palette_count == 0 ||
-        !source || !source->samples || source->sample_count == 0 ||
-        source->kind == UI_WAVEFORM_SOURCE_NONE ||
-        duration_ms == 0 || window_ms == 0) {
+    if (!update_args_valid(cache, source, duration_ms, window_ms)) {
         if (cache) {
             ui_overview_wave_cache_report_t none_report;
             report_reset(&none_report);
@@ -540,30 +733,18 @@ bool ui_overview_wave_cache_update(ui_overview_wave_cache_t *cache,
         return false;
     }
 
-    bool full = !source_matches(cache, source, duration_ms, meta, window_ms);
     ui_overview_wave_cache_report_t report;
     report_reset(&report);
+    int desired_origin = 0;
+    int required_to_fit = 0;
+    update_plan_t plan = update_plan(cache, source, duration_ms, meta,
+                                     center_ms, window_ms,
+                                     &desired_origin, &required_to_fit);
 
-    if (full || cache->margin_px <= 0) {
-        if (!full && cache->center_ms == center_ms) {
-            record_stats(cache, &report);
-            return false;
-        }
-        rebuild_full(cache, source, duration_ms, meta,
-                     center_ms, window_ms, &report);
-        cache_store_key(cache, source, duration_ms, meta, center_ms, window_ms);
-        record_stats(cache, &report);
-        if (out_report) {
-            *out_report = report;
-        }
-        return true;
-    }
-
-    int desired_origin = desired_view_origin_px(cache, center_ms);
-    int dx = desired_origin - cache->view_origin_px;
-    if (dx == 0) {
+    switch (plan) {
+    case PLAN_NONE:
 #ifdef UI_OVERVIEW_WAVE_CACHE_TESTING
-        if (cache->source_generation != 0) {
+        if (cache->margin_px > 0 && cache->valid && cache->source_generation != 0) {
             cache->source_generation = 0;
             report.kind = UI_OVERVIEW_WAVE_CACHE_OFFSET;
             report.scroll_dx_px = 0;
@@ -577,41 +758,30 @@ bool ui_overview_wave_cache_update(ui_overview_wave_cache_t *cache,
 #endif
         record_stats(cache, &report);
         return false;
-    }
-
-    if (abs(dx) >= cache->strip_width_px ||
-        (dx < 0 && abs(dx) > 4)) {
+    case PLAN_FULL:
         rebuild_full(cache, source, duration_ms, meta,
                      center_ms, window_ms, &report);
-    } else if (dx >= 0 && origin_inside_safe_margin(cache, desired_origin) &&
-               dx <= UI_OVERVIEW_WAVE_CACHE_EDGE_BATCH_PX) {
+        break;
+    case PLAN_OFFSET: {
+        int dx = desired_origin - cache->view_origin_px;
         cache->view_origin_px = desired_origin;
         report.kind = UI_OVERVIEW_WAVE_CACHE_OFFSET;
         report.scroll_dx_px = dx;
         report.columns_rendered = 0;
         build_blit_segments(cache, &report);
-    } else if (dx > 0) {
-        int required_to_fit = desired_origin + cache->view_width_px -
-                              cache->strip_width_px;
-        if (required_to_fit < 0) {
-            required_to_fit = 0;
-        }
-        if (required_to_fit > max_edge_batch_px(cache)) {
-            rebuild_full(cache, source, duration_ms, meta,
-                         center_ms, window_ms, &report);
-        } else {
-            advance_right_edge(cache, source, duration_ms, meta,
-                               desired_origin, required_to_fit, &report);
-        }
-    } else {
-        int required_to_fit = desired_origin < 0 ? -desired_origin : 0;
-        if (required_to_fit > max_edge_batch_px(cache)) {
-            rebuild_full(cache, source, duration_ms, meta,
-                         center_ms, window_ms, &report);
-        } else {
-            advance_left_edge(cache, source, duration_ms, meta,
-                              desired_origin, required_to_fit, &report);
-        }
+        break;
+    }
+    case PLAN_RIGHT_EDGE:
+        advance_right_edge(cache, source, duration_ms, meta,
+                           desired_origin, required_to_fit, &report);
+        break;
+    case PLAN_LEFT_EDGE:
+        advance_left_edge(cache, source, duration_ms, meta,
+                          desired_origin, required_to_fit, &report);
+        break;
+    case PLAN_FILL:
+        fill_step(cache, source, duration_ms, meta, desired_origin, &report);
+        break;
     }
 
     cache_store_key(cache, source, duration_ms, meta, center_ms, window_ms);
@@ -620,6 +790,18 @@ bool ui_overview_wave_cache_update(ui_overview_wave_cache_t *cache,
         *out_report = report;
     }
     return true;
+}
+
+void ui_overview_wave_cache_set_progressive(ui_overview_wave_cache_t *cache, bool enabled)
+{
+    if (cache) {
+        cache->progressive = enabled;
+    }
+}
+
+bool ui_overview_wave_cache_filling(const ui_overview_wave_cache_t *cache)
+{
+    return cache && cache->valid && cache->margin_px > 0 && !strip_complete(cache);
 }
 
 #ifdef UI_OVERVIEW_WAVE_CACHE_TESTING

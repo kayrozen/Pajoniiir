@@ -15,6 +15,7 @@
 #include "media_io_gate.h"
 #include "eth_bringup.h"
 #include "wifi_link.h"
+#include "dj_link.h"
 #include "p4_ota_pull.h"
 #include "web_server.h"
 #include "service_log.h"
@@ -24,6 +25,9 @@
 #include "controller_profile_runtime.h"
 #endif
 #include "p4_local_controller.h"
+#include "controller_usb_host.h"
+#include "ui_diagnostics.h"
+#include "ui_lvgl_backend.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
@@ -294,6 +298,17 @@ static void on_controller_profile_change(void)
 }
 #endif
 
+// v246: Settings DJ LINK switch (LVGL task). ui_settings has already
+// persisted the choice; dj_link_set_enabled() only flags the task, so this
+// never blocks the UI.
+static void on_dj_link_toggle(bool enable)
+{
+    esp_err_t rc = dj_link_set_enabled(enable);
+    if (rc != ESP_OK) {
+        ESP_LOGW(TAG, "dj_link %s: %s", enable ? "start" : "stop", esp_err_to_name(rc));
+    }
+}
+
 // Called from the USB storage task when the Rekordbox drive mounts/unmounts.
 static void on_usb_storage_event(bool mounted)
 {
@@ -342,9 +357,66 @@ static void on_usb_storage_event(bool mounted)
     }
 }
 
+// v289 stall probe: controller_usb work during an LVGL stall (v288 showed the
+// controller task owning core 1 while LVGL was ready). Runs from the
+// lvgl_tick esp_timer callback: counter loads and snprintf only.
+static controller_usb_host_work_t s_stall_usb_base;
+
+static uint32_t stall_usb_us(uint32_t cycles, uint32_t ticks_per_us)
+{
+    return ticks_per_us != 0u ? cycles / ticks_per_us : 0u;
+}
+
+static size_t stall_usb_probe(bool begin, char *buf, size_t size)
+{
+    controller_usb_host_work_t now;
+    controller_usb_host_get_work(&now);
+    if (begin) {
+        s_stall_usb_base = now;
+        return 0u;
+    }
+    const controller_usb_host_work_t *b = &s_stall_usb_base;
+    const uint32_t t = now.cpu_ticks_per_us;
+    const int n = snprintf(buf, size,
+        "\nlvgl STALL usb: loops %u tail %u us | midi_in cb %u %u us max %u us"
+        " pkt %u | out submit %u wake %u | midi submit %u us"
+        " | isoc cb %u %u us (submit %u us) max %u us",
+        (unsigned)(now.loops - b->loops),
+        (unsigned)stall_usb_us(now.loop_cycles - b->loop_cycles, t),
+        (unsigned)(now.midi_in_callbacks - b->midi_in_callbacks),
+        (unsigned)stall_usb_us(now.midi_in_cycles - b->midi_in_cycles, t),
+        (unsigned)stall_usb_us(now.midi_in_max_cycles, t),
+        (unsigned)(now.midi_packets - b->midi_packets),
+        (unsigned)(now.midi_out_submits - b->midi_out_submits),
+        (unsigned)(now.midi_out_wakeups - b->midi_out_wakeups),
+        (unsigned)stall_usb_us(now.midi_submit_cycles - b->midi_submit_cycles, t),
+        (unsigned)(now.isoc_callbacks - b->isoc_callbacks),
+        (unsigned)stall_usb_us(now.isoc_cycles - b->isoc_cycles, t),
+        (unsigned)stall_usb_us(now.isoc_submit_cycles - b->isoc_submit_cycles, t),
+        (unsigned)stall_usb_us(now.isoc_max_cycles, t));
+    s_stall_usb_base = now;
+    if (n <= 0) {
+        return 0u;
+    }
+    return (size_t)n < size ? (size_t)n : size - 1u;
+}
+
+// v292: names the allocation behind a boot-time ESP_ERR_NO_MEM (v290/v291
+// usb_host_install boot loop). Any context, so ROM printf only.
+static void failed_alloc_cb(size_t size, uint32_t caps, const char *function_name)
+{
+    esp_rom_printf("[HEAP] alloc FAILED size=%u caps=0x%08x in %s: internal free=%u "
+                   "largest=%u\n",
+                   (unsigned)size, (unsigned)caps,
+                   function_name ? function_name : "?",
+                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+}
+
 void app_main(void)
 {
     p4_tcm_heap_guard_keep();
+    (void)heap_caps_register_failed_alloc_callback(failed_alloc_cb);
     /* v204 play-crash diagnosis: the build default level is WARN (the v190
      * CONFIG_LOG_DEFAULT_LEVEL=3 line in sdkconfig.defaults is ignored, the
      * WARN choice wins), which hid "shared codec open" and made open_codec look
@@ -481,13 +553,23 @@ void app_main(void)
     // Build the playback queue before constructing the UI and direct USB
     // controller producer.
     QueueHandle_t ctrl_queue;
+    /* v275: set before init so init_deck_state() starts both decks on it. */
+    deck_core_set_tempo_range_percent(settings.tempo_range_pct);
     ESP_ERROR_CHECK(deck_core_init(&ctrl_queue));
+    deck_core_set_jog_cdj_mode(settings.jog_cdj_mode != 0u);
 
     // ── UI ───────────────────────────────────────────────────────────────────
+    /* v293: the stall probe is a diagnostics-build tool (UI_DIAGNOSTICS_ENABLED). */
+    if (ui_diagnostics_enabled()) {
+        ui_lvgl_backend_set_stall_probe_callback(stall_usb_probe);
+    }
     ESP_ERROR_CHECK(ui_init());
 
     // ── External control producers ───────────────────────────────────────────
     // From this point onward direct USB controller events may update state.
+    /* Controller events take the deck_core choke point so they wake the
+     * screensaver like touch does (v269). */
+    control_link_set_event_sink(deck_core_queue_event);
     ESP_ERROR_CHECK(control_link_init(ctrl_queue));
 
     // Settings callbacks are published only after their downstream services
@@ -513,6 +595,26 @@ void app_main(void)
         esp_err_t web_rc = web_server_start();
         if (web_rc != ESP_OK) {
             ESP_LOGW(TAG, "web_server_start: %s", esp_err_to_name(web_rc));
+        }
+    }
+
+    // ── Pioneer DJ Link observer (v246, Ethernet only, default OFF) ──────────
+    // Observation only: a low-priority core-1 task that never transmits and
+    // never touches the audio path. It waits for the Ethernet lease itself.
+    {
+        const dj_link_config_t dj_cfg = {
+            .ip_ready = eth_bringup_got_ip,
+            .eth_netif = eth_bringup_netif,
+        };
+        esp_err_t dj_rc = dj_link_init(&dj_cfg);
+        if (dj_rc == ESP_OK) {
+            ui_settings_set_dj_link_toggle_cb(on_dj_link_toggle);
+            if (app_settings_get().dj_link_enable) {
+                ESP_LOGI(TAG, "DJ Link enabled in settings - starting observer");
+                on_dj_link_toggle(true);
+            }
+        } else {
+            ESP_LOGW(TAG, "dj_link_init: %s", esp_err_to_name(dj_rc));
         }
     }
 

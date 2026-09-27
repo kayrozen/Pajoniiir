@@ -8,7 +8,6 @@
 #include "esp_log.h"
 #include "lvgl.h"
 #include "ui_diagnostics.h"
-#include "ui_overview_perf.h"
 
 static const char *TAG = "ui";
 
@@ -65,6 +64,31 @@ esp_err_t ui_lvgl_backend_set_frame_callback(ui_lvgl_backend_frame_cb_t callback
     (void)callback;
     (void)user_ctx;
     return ESP_OK;
+}
+
+esp_err_t ui_lvgl_backend_set_perf_report_callback(ui_lvgl_backend_perf_report_cb_t callback)
+{
+    (void)callback;
+    return ESP_OK;
+}
+
+esp_err_t ui_lvgl_backend_set_post_refresh_callback(ui_lvgl_backend_post_refresh_cb_t callback,
+                                                    void *user_ctx)
+{
+    (void)callback;
+    (void)user_ctx;
+    return ESP_OK;
+}
+
+void ui_lvgl_backend_set_stall_probe_callback(ui_lvgl_backend_stall_probe_cb_t callback)
+{
+    (void)callback;
+}
+
+void ui_lvgl_backend_set_direct_rect(uint8_t slot, const ui_overlay_rect_t *logical)
+{
+    (void)slot;
+    (void)logical;
 }
 
 esp_err_t ui_lvgl_backend_start(void)
@@ -148,11 +172,23 @@ esp_err_t ui_lvgl_backend_draw_rect_rgb565(const ui_overlay_rect_t *logical, uin
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_private/esp_cache_private.h"
+#include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "driver/ppa.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
+#include <stdio.h>
 #include <sys/lock.h>
+
+/* v292: EXT_RAM_BSS_ATTR moves a static to PSRAM when
+ * CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY is set; empty on host builds. */
+#ifdef ESP_PLATFORM
+#include "esp_attr.h"
+#endif
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
+#endif
 
 #define LVGL_TICK_PERIOD_MS        2
 #define LVGL_TASK_STACK            (24 * 1024)
@@ -165,10 +201,40 @@ esp_err_t ui_lvgl_backend_draw_rect_rgb565(const ui_overlay_rect_t *logical, uin
 #define UI_DSI_FB_COUNT            BSP_LCD_FRAMEBUFFER_COUNT
 _Static_assert(UI_DSI_FB_COUNT == 1u,
                "this backend supports exactly one DPI framebuffer");
-#define UI_LVGL_PARTIAL_BUF_ROWS   80u
-#define UI_PERF_SPIKE_THRESHOLD_US 20000u
+/* v278: 128 rows (was 80, upstream value). LVGL splits an area into
+ * buf/stride rows: a DJUI zoom surface is 696x119, which 80 rows (117 rows at
+ * that width) cut into two flushes every frame - two PPA writes at different
+ * scan positions, i.e. a guaranteed tear seam. 128 rows keep any area up to
+ * 188 rows at zoom width in one flush. +96 KiB PSRAM, allocated once at init. */
+#define UI_LVGL_PARTIAL_BUF_ROWS   128u
 #define UI_LVGL_NOTIFY_REFRESH     (1u << 0)
 #define ALIGN_UP_BY(n, a)          (((n) + ((a) - 1)) & ~((a) - 1))
+
+#ifdef UI_TARGET_JC1060
+/* v278 anti-tear scan gate. The single DPI framebuffer is scanned while LVGL
+ * flushes into it, so a flush that overlaps the scanline shows half old, half
+ * new pixels - most visible on the scrolling zoom waveform. The P4 DSI bridge
+ * raises on_refresh_done on its VSYNC event; from that timestamp and the
+ * measured frame period the flush estimates the scanned row and delays a large
+ * write until the scan is clear of it. Only the LVGL task waits (the UI loses);
+ * nothing here touches audio priority or pacing.
+ * JC1060-only divergence from upstream: rotation 0 makes framebuffer rows the
+ * scan rows. Timing mirrors bsp_board_config.h (not includable here: it
+ * redefines BSP_LCD_H_RES/V_RES with different spelling). */
+#define UI_SCAN_V_LEAD_LINES       33    /* V_SYNC 10 + V_BACK_PORCH 23 */
+#define UI_SCAN_V_TOTAL_LINES      645   /* 600 + 10 + 23 + 12 (front porch) */
+#define UI_SCAN_GUARD_LINES        24    /* bridge FIFO prefetch + timing error */
+#define UI_SCAN_GATE_MIN_PX        16384u /* small label flushes are not worth a wait */
+#define UI_SCAN_MAX_WAIT_US        8000u
+/* v281: total gate wait per lv_timer_handler() call. Two zoom surfaces are
+ * rendered top-down about as fast as the panel scans, so each of their flushes
+ * can meet the scanline; per-flush waits of up to 8 ms then stack and push the
+ * refresh past the 33 ms LVGL period (one skipped panel refresh = a visible
+ * waveform hitch). Past the budget a flush tears rather than wait. */
+#define UI_SCAN_REFR_BUDGET_US     5000u
+#define UI_SCAN_FRAME_US_DEFAULT   16530u /* 54 MHz / (1384 x 645) */
+#define UI_SCAN_COPY_NS_PX_DEFAULT 16u
+#endif
 
 static _lock_t s_lvgl_lock;
 static lv_display_t *s_disp = NULL;
@@ -190,27 +256,145 @@ static uint16_t s_ver_res = 480;
 static TaskHandle_t s_lvgl_task_handle = NULL;
 static ui_lvgl_backend_frame_cb_t s_frame_callback = NULL;
 static void *s_frame_callback_ctx = NULL;
+/* v287: direct-painted rectangles and the slots LVGL flushed over since the
+ * last post-refresh callback. LVGL task only. */
+static ui_lvgl_backend_post_refresh_cb_t s_post_refresh_callback = NULL;
+static void *s_post_refresh_callback_ctx = NULL;
+static ui_overlay_rect_t s_direct_rect[UI_LVGL_BACKEND_DIRECT_SLOTS];
+static uint32_t s_direct_repainted;
 
-static ui_overview_perf_counter_t s_lvgl_handler_interval_perf;
-static ui_overview_perf_counter_t s_lvgl_handler_duration_perf;
-static ui_overview_perf_counter_t s_lvgl_flush_total_perf;
-static ui_overview_perf_counter_t s_lvgl_flush_msync_perf;
-static ui_overview_perf_counter_t s_lvgl_flush_ppa_perf;
-static ui_overview_perf_counter_t s_lvgl_refr_total_perf;
-static ui_overview_perf_counter_t s_lvgl_render_total_perf;
-static ui_overview_perf_counter_t s_lvgl_flush_event_perf;
+/* v283: diagnostics never print from the LVGL task. v280-v282 logged "spike
+ * window max" lines to the 115200-baud UART from inside flush_cb and the
+ * REFR/RENDER events, i.e. inside the very phases being timed: a line costs
+ * several ms of blocking console I/O, so each spiking window planted a spike
+ * in the next one and the report sustained itself. Phases now only update
+ * these windows; every UI_PERF_REPORT_MS the LVGL task formats one text
+ * snapshot (no I/O) and the priority-1 ui_perf task prints it. */
+typedef struct {
+    uint32_t n;
+    uint32_t max;
+    uint64_t sum;
+} ui_perf_win_t;
+
+/* One refresh, REFR_START to REFR_READY. */
+typedef struct {
+    uint32_t refr_us;
+    uint32_t flush_us;       /* msync + PPA, all flushes */
+    uint32_t gate_us;        /* scan-gate waits, all flushes */
+    uint32_t flushes;
+    uint32_t flush_px;
+    uint32_t inval_count;
+    uint32_t inval_px;
+    lv_area_t inval_max;
+} ui_perf_refr_t;
+
+static ui_perf_win_t s_win_handler_interval;
+static ui_perf_win_t s_win_handler_duration;
+static ui_perf_win_t s_win_frame_cb;
+static ui_perf_win_t s_win_refr_interval;
+static ui_perf_win_t s_win_refr_total;
+static ui_perf_win_t s_win_refr_draw;
+static ui_perf_win_t s_win_refr_flush;
+static ui_perf_win_t s_win_render_total;
+static ui_perf_win_t s_win_flush_ppa;
+static ui_perf_win_t s_win_flush_msync;
+static ui_perf_refr_t s_refr_cur;
+static ui_perf_refr_t s_refr_worst;
+static uint32_t s_refr_flush_px_max;
+static uint32_t s_refr_flushes_max;
 
 static int64_t s_lvgl_refr_start_us = 0;
 static int64_t s_lvgl_render_start_us = 0;
-static int64_t s_lvgl_flush_event_start_us = 0;
+static int64_t s_lvgl_last_refr_start_us = 0;
 static uint32_t s_lvgl_inval_count = 0;
 static uint32_t s_lvgl_inval_total_px = 0;
 static uint32_t s_lvgl_inval_max_px = 0;
 static lv_area_t s_lvgl_inval_max_area = {0};
-static uint32_t s_lvgl_frame_inval_count = 0;
-static uint32_t s_lvgl_frame_inval_total_px = 0;
-static uint32_t s_lvgl_frame_inval_max_px = 0;
-static lv_area_t s_lvgl_frame_inval_max_area = {0};
+
+/* LVGL task -> ui_perf task: one preformatted snapshot, handed over with a
+ * busy flag like the audio engine's heartbeat report. */
+#define UI_PERF_REPORT_MS          5000u
+#define UI_PERF_TEXT_MAX           2048u
+#define UI_PERF_TASK_STACK         4096
+#define UI_PERF_TASK_PRIO          1
+static const char *PERF_TAG = "ui_perf";
+static TaskHandle_t s_perf_task = NULL;
+static char *s_perf_text = NULL;
+static bool s_perf_busy = false;
+static int64_t s_perf_window_start_us = 0;
+static ui_lvgl_backend_perf_report_cb_t s_perf_report_cb = NULL;
+
+#ifdef UI_TARGET_JC1060
+/* Low 32 bits of esp_timer: single-word ISR->task handoff, differences only. */
+static volatile uint32_t s_scan_vsync_us = 0;
+static volatile uint32_t s_scan_frame_us = UI_SCAN_FRAME_US_DEFAULT;
+static uint32_t s_scan_copy_ns_px = UI_SCAN_COPY_NS_PX_DEFAULT;
+/* LVGL task: gate time spent in the current lv_timer_handler() call, and the
+ * gated flushes that gave up (tore) since the last report. */
+static uint32_t s_scan_refr_wait_us = 0;
+static ui_perf_win_t s_win_refr_gate;
+static uint32_t s_scan_giveups = 0;
+
+/* v288 stall probe. The v287 UI freezes while a MIDI fader moves, audio keeps
+ * running, and nothing on the fader path blocks the LVGL task by reading. The
+ * LVGL task only stamps a heartbeat and its current phase; the lvgl_tick
+ * esp_timer callback (esp_timer task, core 0) samples every 10 ms which task
+ * each core runs and the LVGL task state while the heartbeat is stale. On
+ * recovery it formats one report for the ui_perf task: Ready + another task
+ * owning core 1 is starvation, Blocked names the phase that waits. Plain
+ * loads and eTaskGetState() only: no allocation, no I/O, no priority change. */
+typedef enum {
+    UI_STALL_PH_WAIT = 0,
+    UI_STALL_PH_LOCK,
+    UI_STALL_PH_FRAME_CB,
+    UI_STALL_PH_HANDLER,
+    UI_STALL_PH_FLUSH,
+    UI_STALL_PH_TOUCH,
+    UI_STALL_PH_POST,
+    UI_STALL_PH_COUNT,
+} ui_stall_phase_t;
+static const char *const UI_STALL_PHASE_NAME[UI_STALL_PH_COUNT] = {
+    "wait", "lock", "frame_cb", "handler", "flush", "touch", "post",
+};
+#define UI_STALL_THRESHOLD_US  250000u
+#define UI_STALL_SAMPLE_TICKS  5u      /* x LVGL_TICK_PERIOD_MS = 10 ms */
+#define UI_STALL_REPORT_SAMPLES 500u   /* an ongoing stall reports every 5 s */
+#define UI_STALL_SLOTS         6u
+#define UI_STALL_TEXT_MAX      1024u
+typedef struct {
+    char name[configMAX_TASK_NAME_LEN];
+    uint16_t n;
+} ui_stall_slot_t;
+typedef struct {
+    bool active;
+    uint32_t start_us;
+    uint8_t phase;
+    uint16_t samples;
+    uint16_t lvgl_ready;
+    uint16_t lvgl_blocked;
+    uint16_t phase_n[UI_STALL_PH_COUNT];
+    ui_stall_slot_t core[2][UI_STALL_SLOTS];
+    uint16_t core_other[2];
+} ui_stall_window_t;
+/* LVGL task -> esp_timer task. */
+static volatile uint32_t s_stall_beat_us = 0;
+static volatile uint8_t s_stall_phase = UI_STALL_PH_WAIT;
+/* esp_timer task only, apart from the text handed to ui_perf. */
+EXT_RAM_BSS_ATTR static ui_stall_window_t s_stall;
+static uint32_t s_stall_tick = 0;
+EXT_RAM_BSS_ATTR static char s_stall_text[UI_STALL_TEXT_MAX];
+static bool s_stall_text_ready = false;
+static ui_lvgl_backend_stall_probe_cb_t s_stall_probe_cb = NULL;
+
+static inline void ui_stall_mark(ui_stall_phase_t phase)
+{
+    if (!ui_diagnostics_enabled()) {
+        return;   /* v293: the probe only runs in diagnostics builds */
+    }
+    s_stall_phase = (uint8_t)phase;
+    s_stall_beat_us = (uint32_t)esp_timer_get_time();
+}
+#endif
 
 static bool IRAM_ATTR ui_lvgl_dpi_refresh_done_cb(esp_lcd_panel_handle_t panel,
                                                   esp_lcd_dpi_panel_event_data_t *edata,
@@ -219,6 +403,18 @@ static bool IRAM_ATTR ui_lvgl_dpi_refresh_done_cb(esp_lcd_panel_handle_t panel,
     (void)panel;
     (void)edata;
     (void)user_ctx;
+
+#ifdef UI_TARGET_JC1060
+    uint32_t now_us = (uint32_t)esp_timer_get_time();
+    uint32_t prev_us = s_scan_vsync_us;
+    if (prev_us != 0) {
+        uint32_t period_us = now_us - prev_us;
+        if (period_us > 10000u && period_us < 40000u) {
+            s_scan_frame_us = period_us;
+        }
+    }
+    s_scan_vsync_us = now_us;
+#endif
 
     TaskHandle_t task = s_lvgl_task_handle;
     if (task == NULL) {
@@ -233,60 +429,24 @@ static bool IRAM_ATTR ui_lvgl_dpi_refresh_done_cb(esp_lcd_panel_handle_t panel,
     return higher_priority_task_woken == pdTRUE;
 }
 
-static void ui_lvgl_backend_perf_log_us(const char *label, const ui_overview_perf_report_t *report)
-{
-    if (!label || !report) {
-        return;
-    }
-
-    ESP_LOGI(TAG, "%s: last=%u us avg=%u us max=%u us samples=%u",
-             label,
-             (unsigned)report->last_us,
-             (unsigned)report->avg_us,
-             (unsigned)report->max_us,
-             (unsigned)report->samples);
-}
-
 static uint32_t ui_lvgl_backend_perf_elapsed_us(int64_t start_us)
 {
     int64_t elapsed_us = esp_timer_get_time() - start_us;
     return elapsed_us > 0 ? (uint32_t)elapsed_us : 0u;
 }
 
-static bool ui_lvgl_backend_perf_record_phase_us(ui_overview_perf_counter_t *counter,
-                                                 const char *label,
-                                                 uint32_t duration_us)
+static void ui_perf_win_add(ui_perf_win_t *win, uint32_t us)
 {
-    if (!ui_diagnostics_enabled()) {
-        return false;
+    win->n++;
+    win->sum += us;
+    if (us > win->max) {
+        win->max = us;
     }
-
-    ui_overview_perf_report_t report;
-    if (ui_overview_perf_record(counter, duration_us, &report)) {
-        ui_lvgl_backend_perf_log_us(label, &report);
-        if (report.max_us >= UI_PERF_SPIKE_THRESHOLD_US) {
-            ESP_LOGW(TAG,
-                     "%s spike window max: %u us",
-                     label,
-                     (unsigned)report.max_us);
-            return true;
-        }
-    }
-    return false;
 }
 
-static void ui_lvgl_log_frame_context(const char *label)
+static uint32_t ui_perf_win_avg(const ui_perf_win_t *win)
 {
-    ESP_LOGI(TAG,
-             "%s invalidated: count=%u total_px=%u max_px=%u max_area=(%d,%d %dx%d)",
-             label,
-             (unsigned)s_lvgl_frame_inval_count,
-             (unsigned)s_lvgl_frame_inval_total_px,
-             (unsigned)s_lvgl_frame_inval_max_px,
-             (int)s_lvgl_frame_inval_max_area.x1,
-             (int)s_lvgl_frame_inval_max_area.y1,
-             (int)(s_lvgl_frame_inval_max_area.x2 - s_lvgl_frame_inval_max_area.x1 + 1),
-             (int)(s_lvgl_frame_inval_max_area.y2 - s_lvgl_frame_inval_max_area.y1 + 1));
+    return win->n ? (uint32_t)(win->sum / win->n) : 0u;
 }
 
 static void ui_lvgl_display_event_cb(lv_event_t *e)
@@ -319,10 +479,17 @@ static void ui_lvgl_display_event_cb(lv_event_t *e)
     }
     case LV_EVENT_REFR_START:
         s_lvgl_refr_start_us = esp_timer_get_time();
-        s_lvgl_frame_inval_count = s_lvgl_inval_count;
-        s_lvgl_frame_inval_total_px = s_lvgl_inval_total_px;
-        s_lvgl_frame_inval_max_px = s_lvgl_inval_max_px;
-        s_lvgl_frame_inval_max_area = s_lvgl_inval_max_area;
+        /* Start-to-start: the refresh rate actually reaching the panel. */
+        if (s_lvgl_last_refr_start_us != 0) {
+            ui_perf_win_add(&s_win_refr_interval,
+                            (uint32_t)(s_lvgl_refr_start_us - s_lvgl_last_refr_start_us));
+        }
+        s_lvgl_last_refr_start_us = s_lvgl_refr_start_us;
+        s_refr_cur = (ui_perf_refr_t){
+            .inval_count = s_lvgl_inval_count,
+            .inval_px = s_lvgl_inval_total_px,
+            .inval_max = s_lvgl_inval_max_area,
+        };
         s_lvgl_inval_count = 0;
         s_lvgl_inval_total_px = 0;
         s_lvgl_inval_max_px = 0;
@@ -330,35 +497,31 @@ static void ui_lvgl_display_event_cb(lv_event_t *e)
         break;
     case LV_EVENT_REFR_READY:
         if (s_lvgl_refr_start_us != 0) {
-            uint32_t elapsed_us = ui_lvgl_backend_perf_elapsed_us(s_lvgl_refr_start_us);
-            if (ui_lvgl_backend_perf_record_phase_us(&s_lvgl_refr_total_perf,
-                                                     "LVGL refr total",
-                                                     elapsed_us)) {
-                ui_lvgl_log_frame_context("LVGL refr");
+            s_refr_cur.refr_us = ui_lvgl_backend_perf_elapsed_us(s_lvgl_refr_start_us);
+            uint32_t copy_us = s_refr_cur.flush_us + s_refr_cur.gate_us;
+            ui_perf_win_add(&s_win_refr_total, s_refr_cur.refr_us);
+            ui_perf_win_add(&s_win_refr_flush, copy_us);
+            /* Everything that is not the copy out: LVGL drawing, area joins
+             * and any time the task was preempted or blocked. */
+            ui_perf_win_add(&s_win_refr_draw,
+                            s_refr_cur.refr_us > copy_us ? s_refr_cur.refr_us - copy_us : 0u);
+            if (s_refr_cur.flush_px > s_refr_flush_px_max) s_refr_flush_px_max = s_refr_cur.flush_px;
+            if (s_refr_cur.flushes > s_refr_flushes_max) s_refr_flushes_max = s_refr_cur.flushes;
+            if (s_refr_cur.refr_us >= s_refr_worst.refr_us) {
+                s_refr_worst = s_refr_cur;
             }
         }
+#ifdef UI_TARGET_JC1060
+        ui_perf_win_add(&s_win_refr_gate, s_scan_refr_wait_us);
+#endif
         break;
     case LV_EVENT_RENDER_START:
         s_lvgl_render_start_us = esp_timer_get_time();
         break;
     case LV_EVENT_RENDER_READY:
         if (s_lvgl_render_start_us != 0) {
-            uint32_t elapsed_us = ui_lvgl_backend_perf_elapsed_us(s_lvgl_render_start_us);
-            if (ui_lvgl_backend_perf_record_phase_us(&s_lvgl_render_total_perf,
-                                                     "LVGL render total",
-                                                     elapsed_us)) {
-                ui_lvgl_log_frame_context("LVGL render");
-            }
-        }
-        break;
-    case LV_EVENT_FLUSH_START:
-        s_lvgl_flush_event_start_us = esp_timer_get_time();
-        break;
-    case LV_EVENT_FLUSH_FINISH:
-        if (s_lvgl_flush_event_start_us != 0) {
-            ui_lvgl_backend_perf_record_phase_us(&s_lvgl_flush_event_perf,
-                                                 "LVGL flush event",
-                                                 ui_lvgl_backend_perf_elapsed_us(s_lvgl_flush_event_start_us));
+            ui_perf_win_add(&s_win_render_total,
+                            ui_lvgl_backend_perf_elapsed_us(s_lvgl_render_start_us));
         }
         break;
     default:
@@ -452,6 +615,95 @@ static esp_err_t ui_lvgl_backend_blit_rgb565_ppa270_mapped(const ui_overlay_rect
     return err;
 }
 
+#ifdef UI_TARGET_JC1060
+/* Framebuffer row the DPI scan is reading now; negative inside the vertical
+ * blank before row 0. false when VSYNC has not been seen recently. */
+static bool ui_scan_line_now(int32_t *line, uint32_t *line_ns)
+{
+    uint32_t vsync_us = s_scan_vsync_us;
+    uint32_t frame_us = s_scan_frame_us;
+    if (vsync_us == 0 || frame_us == 0) {
+        return false;
+    }
+    uint32_t elapsed_us = (uint32_t)esp_timer_get_time() - vsync_us;
+    if (elapsed_us > 4u * frame_us) {
+        return false;
+    }
+    uint32_t ns = (uint32_t)(((uint64_t)frame_us * 1000u) / UI_SCAN_V_TOTAL_LINES);
+    uint32_t phase_us = elapsed_us % frame_us;
+    *line = (int32_t)(((uint64_t)phase_us * 1000u) / ns) - UI_SCAN_V_LEAD_LINES;
+    *line_ns = ns;
+    return true;
+}
+
+static bool ui_scan_band_hits(int32_t b1, int32_t b2, int32_t top, int32_t bot)
+{
+    return b1 <= bot && b2 >= top;
+}
+
+/* Delays until writing rows [y, y+h) cannot cross the scanline. Returns the
+ * time waited. Bounded: gives up (and tears) rather than stall the UI. */
+static uint32_t ui_scan_gate(int32_t y, int32_t h, uint32_t px)
+{
+    if (px < UI_SCAN_GATE_MIN_PX) {
+        return 0;
+    }
+    int64_t start_us = esp_timer_get_time();
+    uint32_t max_wait_us = s_scan_refr_wait_us < UI_SCAN_REFR_BUDGET_US
+                         ? UI_SCAN_REFR_BUDGET_US - s_scan_refr_wait_us : 0u;
+    if (max_wait_us > UI_SCAN_MAX_WAIT_US) {
+        max_wait_us = UI_SCAN_MAX_WAIT_US;
+    }
+    int32_t top = y - UI_SCAN_GUARD_LINES;
+    int32_t bot = y + h - 1 + UI_SCAN_GUARD_LINES;
+    for (int tries = 0; tries < 4; ++tries) {
+        int32_t line;
+        uint32_t line_ns;
+        if (!ui_scan_line_now(&line, &line_ns)) {
+            break;
+        }
+        int32_t copy_lines = (int32_t)(((uint64_t)px * s_scan_copy_ns_px) / line_ns) + 1;
+        int32_t b1 = line;
+        int32_t b2 = line + copy_lines;
+        if (!ui_scan_band_hits(b1, b2, top, bot) &&
+            !ui_scan_band_hits(b1 - UI_SCAN_V_TOTAL_LINES, b2 - UI_SCAN_V_TOTAL_LINES, top, bot)) {
+            break;
+        }
+        /* The scan is in the rows or will reach them mid-copy: let it pass. */
+        int32_t wait_lines = bot + 1 - line;
+        if (wait_lines <= 0) {
+            wait_lines += UI_SCAN_V_TOTAL_LINES;
+        }
+        uint32_t wait_us = (uint32_t)(((uint64_t)wait_lines * line_ns) / 1000u) + 1u;
+        uint32_t waited_us = ui_lvgl_backend_perf_elapsed_us(start_us);
+        if (waited_us + wait_us > max_wait_us) {
+            s_scan_giveups++;
+            break;
+        }
+        if (wait_us >= 2000u) {
+            vTaskDelay(pdMS_TO_TICKS(wait_us / 1000u));
+        } else {
+            esp_rom_delay_us(wait_us);
+        }
+    }
+    uint32_t waited_us = ui_lvgl_backend_perf_elapsed_us(start_us);
+    s_scan_refr_wait_us += waited_us;
+    return waited_us;
+}
+
+/* Moving average of msync + PPA cost per pixel, for the next copy estimate. */
+static void ui_scan_learn_copy(uint32_t px, uint32_t copy_us)
+{
+    if (px < UI_SCAN_GATE_MIN_PX || copy_us == 0) {
+        return;
+    }
+    uint32_t ns = (uint32_t)(((uint64_t)copy_us * 1000u) / px);
+    if (ns < 2u) ns = 2u;
+    if (ns > 64u) ns = 64u;
+    s_scan_copy_ns_px = (s_scan_copy_ns_px * 7u + ns + 7u) / 8u;
+}
+#endif
+
 static void ui_lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
     if (!area || !px_map) {
@@ -481,6 +733,20 @@ static void ui_lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t 
         return;
     }
 
+    for (uint32_t i = 0; i < UI_LVGL_BACKEND_DIRECT_SLOTS; i++) {
+        const ui_overlay_rect_t *r = &s_direct_rect[i];
+        if (r->w > 0 && logical.x < r->x + r->w && r->x < logical.x + logical.w &&
+            logical.y < r->y + r->h && r->y < logical.y + logical.h) {
+            s_direct_repainted |= 1u << i;
+        }
+    }
+
+#ifdef UI_TARGET_JC1060
+    ui_stall_mark(UI_STALL_PH_FLUSH);
+    uint32_t px = (uint32_t)area_w * (uint32_t)area_h;
+    s_refr_cur.gate_us += ui_scan_gate(physical.y, physical.h, px);
+#endif
+
     ui_lvgl_backend_blit_perf_t perf = {0};
     esp_err_t err = ui_lvgl_backend_blit_rgb565_ppa270_mapped(&logical,
                                                               &physical,
@@ -493,25 +759,156 @@ static void ui_lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t 
                                                               (uint32_t)area_h,
                                                               (size_t)area_w * (size_t)area_h * sizeof(uint16_t),
                                                               &perf);
-    ui_lvgl_backend_perf_record_phase_us(&s_lvgl_flush_msync_perf,
-                                         "LVGL flush msync",
-                                         perf.msync_us);
-    ui_lvgl_backend_perf_record_phase_us(&s_lvgl_flush_ppa_perf,
-                                         "LVGL flush PPA",
-                                         perf.ppa_us);
+    if (ui_diagnostics_enabled()) {
+        ui_perf_win_add(&s_win_flush_msync, perf.msync_us);
+        ui_perf_win_add(&s_win_flush_ppa, perf.ppa_us);
+        s_refr_cur.flush_us += perf.total_us;
+        s_refr_cur.flushes++;
+        s_refr_cur.flush_px += (uint32_t)area_w * (uint32_t)area_h;
+    }
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "LVGL flush PPA failed: %s", esp_err_to_name(err));
     }
-    ui_lvgl_backend_perf_record_phase_us(&s_lvgl_flush_total_perf,
-                                         "LVGL flush total",
-                                         perf.total_us);
+#ifdef UI_TARGET_JC1060
+    else {
+        ui_scan_learn_copy(px, perf.total_us);
+    }
+    ui_stall_mark(UI_STALL_PH_HANDLER);
+#endif
     lv_display_flush_ready(disp);
 }
+
+#ifdef UI_TARGET_JC1060
+static void ui_stall_count_core(uint8_t core)
+{
+    TaskHandle_t task = xTaskGetCurrentTaskHandleForCore(core);
+    const char *name = task ? pcTaskGetName(task) : "?";
+    ui_stall_slot_t *slots = s_stall.core[core];
+    for (uint32_t i = 0; i < UI_STALL_SLOTS; i++) {
+        if (slots[i].n == 0u) {
+            /* Copied now: the task runs, so its name is valid. */
+            strlcpy(slots[i].name, name, sizeof(slots[i].name));
+        } else if (strncmp(slots[i].name, name, sizeof(slots[i].name)) != 0) {
+            continue;
+        }
+        slots[i].n++;
+        return;
+    }
+    s_stall.core_other[core]++;
+}
+
+static void ui_stall_report(uint32_t now_us, bool ongoing)
+{
+    if (!s_perf_task || __atomic_load_n(&s_stall_text_ready, __ATOMIC_ACQUIRE)) {
+        return;   /* the previous report is still being printed: drop this one */
+    }
+    char *buf = s_stall_text;
+    size_t size = sizeof(s_stall_text);
+    size_t off = 0;
+#define UI_STALL_APPEND(...)                                                 \
+    do {                                                                     \
+        if (off < size) {                                                    \
+            int n_ = snprintf(buf + off, size - off, __VA_ARGS__);           \
+            if (n_ > 0) off += (size_t)n_;                                   \
+        }                                                                    \
+    } while (0)
+    UI_STALL_APPEND("lvgl STALL %s %u ms: entered in %s | lvgl ready %u blocked %u"
+                    " of %u samples | phase",
+                    ongoing ? "ongoing" : "ended",
+                    (unsigned)((now_us - s_stall.start_us) / 1000u),
+                    UI_STALL_PHASE_NAME[s_stall.phase],
+                    (unsigned)s_stall.lvgl_ready, (unsigned)s_stall.lvgl_blocked,
+                    (unsigned)s_stall.samples);
+    for (uint32_t p = 0; p < UI_STALL_PH_COUNT; p++) {
+        if (s_stall.phase_n[p] != 0u) {
+            UI_STALL_APPEND(" %s %u", UI_STALL_PHASE_NAME[p], (unsigned)s_stall.phase_n[p]);
+        }
+    }
+    for (uint8_t core = 0; core < 2u; core++) {
+        UI_STALL_APPEND("\nlvgl STALL core%u runs:", (unsigned)core);
+        for (uint32_t i = 0; i < UI_STALL_SLOTS && s_stall.core[core][i].n != 0u; i++) {
+            UI_STALL_APPEND(" %.*s %u", (int)sizeof(s_stall.core[core][i].name),
+                            s_stall.core[core][i].name, (unsigned)s_stall.core[core][i].n);
+        }
+        if (s_stall.core_other[core] != 0u) {
+            UI_STALL_APPEND(" other %u", (unsigned)s_stall.core_other[core]);
+        }
+    }
+#undef UI_STALL_APPEND
+    const ui_lvgl_backend_stall_probe_cb_t probe =
+        __atomic_load_n(&s_stall_probe_cb, __ATOMIC_ACQUIRE);
+    if (probe && off < size) {
+        off += probe(false, buf + off, size - off);
+    }
+    buf[size - 1] = '\0';
+    __atomic_store_n(&s_stall_text_ready, true, __ATOMIC_RELEASE);
+    xTaskNotifyGive(s_perf_task);
+}
+
+/* esp_timer task: every UI_STALL_SAMPLE_TICKS ticks, a few loads. */
+static void ui_stall_sample(void)
+{
+    if (!s_lvgl_task_handle || ++s_stall_tick < UI_STALL_SAMPLE_TICKS) {
+        return;
+    }
+    s_stall_tick = 0;
+    const uint32_t now_us = (uint32_t)esp_timer_get_time();
+    const uint32_t beat_us = s_stall_beat_us;
+    const bool stale = beat_us != 0u && now_us - beat_us >= UI_STALL_THRESHOLD_US;
+    if (!stale) {
+        if (s_stall.active) {
+            ui_stall_report(now_us, false);
+            s_stall.active = false;
+        }
+        return;
+    }
+    const ui_lvgl_backend_stall_probe_cb_t probe =
+        __atomic_load_n(&s_stall_probe_cb, __ATOMIC_ACQUIRE);
+    if (!s_stall.active) {
+        s_stall = (ui_stall_window_t){
+            .active = true,
+            .start_us = beat_us,
+            .phase = s_stall_phase < UI_STALL_PH_COUNT ? s_stall_phase : UI_STALL_PH_WAIT,
+        };
+        if (probe) {
+            (void)probe(true, NULL, 0);
+        }
+    }
+    const uint8_t phase = s_stall_phase;
+    if (phase < UI_STALL_PH_COUNT) {
+        s_stall.phase_n[phase]++;
+    }
+    const eTaskState state = eTaskGetState(s_lvgl_task_handle);
+    if (state == eRunning || state == eReady) {
+        s_stall.lvgl_ready++;
+    } else {
+        s_stall.lvgl_blocked++;
+    }
+    ui_stall_count_core(0);
+    ui_stall_count_core(1);
+    if (++s_stall.samples >= UI_STALL_REPORT_SAMPLES) {
+        ui_stall_report(now_us, true);
+        const uint32_t start_us = s_stall.start_us;
+        const uint8_t entered = s_stall.phase;
+        s_stall = (ui_stall_window_t){
+            .active = true, .start_us = start_us, .phase = entered,
+        };
+        if (probe) {
+            (void)probe(true, NULL, 0);
+        }
+    }
+}
+#endif
 
 static void ui_lvgl_tick_cb(void *arg)
 {
     (void)arg;
     lv_tick_inc(LVGL_TICK_PERIOD_MS);
+#ifdef UI_TARGET_JC1060
+    if (ui_diagnostics_enabled()) {
+        ui_stall_sample();
+    }
+#endif
 }
 
 static void ui_touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
@@ -523,7 +920,13 @@ static void ui_touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
     }
     esp_lcd_touch_point_data_t point = {0};
     uint8_t cnt = 0;
+#ifdef UI_TARGET_JC1060
+    ui_stall_mark(UI_STALL_PH_TOUCH);
+#endif
     esp_lcd_touch_read_data(tp);
+#ifdef UI_TARGET_JC1060
+    ui_stall_mark(UI_STALL_PH_HANDLER);
+#endif
     esp_err_t rc = esp_lcd_touch_get_data(tp, &point, &cnt, 1);
     if (rc == ESP_OK && cnt > 0) {
         /* Any touch counts as activity. The screensaver is a separate LVGL
@@ -557,6 +960,117 @@ static bool ui_lvgl_play_blackout_active(void)
     return false;
 }
 
+static void ui_perf_print(const char *line)
+{
+    while (*line) {
+        const char *end = strchr(line, '\n');
+        int len = end ? (int)(end - line) : (int)strlen(line);
+        if (len > 0) {
+            ESP_LOGI(PERF_TAG, "%.*s", len, line);
+        }
+        line += len + (end ? 1 : 0);
+    }
+}
+
+static void ui_perf_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        /* Two producers share the notification; each text has its own flag
+         * so a stall report never prints a window the LVGL task is writing. */
+        if (__atomic_load_n(&s_perf_busy, __ATOMIC_ACQUIRE)) {
+            ui_perf_print(s_perf_text);
+            __atomic_store_n(&s_perf_busy, false, __ATOMIC_RELEASE);
+        }
+#ifdef UI_TARGET_JC1060
+        if (__atomic_load_n(&s_stall_text_ready, __ATOMIC_ACQUIRE)) {
+            ui_perf_print(s_stall_text);
+            __atomic_store_n(&s_stall_text_ready, false, __ATOMIC_RELEASE);
+        }
+#endif
+    }
+}
+
+/* LVGL task, after lv_timer_handler(): formats the window, never prints. */
+static void ui_perf_publish(void)
+{
+    int64_t now_us = esp_timer_get_time();
+    if (s_perf_window_start_us == 0) {
+        s_perf_window_start_us = now_us;
+        return;
+    }
+    if (!s_perf_task || __atomic_load_n(&s_perf_busy, __ATOMIC_ACQUIRE) ||
+        now_us - s_perf_window_start_us < (int64_t)UI_PERF_REPORT_MS * 1000) {
+        return;
+    }
+    char *buf = s_perf_text;
+    size_t size = UI_PERF_TEXT_MAX;
+    size_t off = 0;
+    const ui_perf_refr_t *w = &s_refr_worst;
+#define UI_PERF_APPEND(...)                                                  \
+    do {                                                                     \
+        if (off < size) {                                                    \
+            int n_ = snprintf(buf + off, size - off, __VA_ARGS__);           \
+            if (n_ > 0) off += (size_t)n_;                                   \
+        }                                                                    \
+    } while (0)
+    UI_PERF_APPEND("lvgl refr n=%u interval avg/max %u/%u us | refr avg/max %u/%u us"
+                   " = draw %u/%u + flush %u/%u us | render max %u us\n",
+                   (unsigned)s_win_refr_total.n,
+                   (unsigned)ui_perf_win_avg(&s_win_refr_interval), (unsigned)s_win_refr_interval.max,
+                   (unsigned)ui_perf_win_avg(&s_win_refr_total), (unsigned)s_win_refr_total.max,
+                   (unsigned)ui_perf_win_avg(&s_win_refr_draw), (unsigned)s_win_refr_draw.max,
+                   (unsigned)ui_perf_win_avg(&s_win_refr_flush), (unsigned)s_win_refr_flush.max,
+                   (unsigned)s_win_render_total.max);
+    UI_PERF_APPEND("lvgl handler n=%u interval max %u us, duration avg/max %u/%u us |"
+                   " frame cb avg/max %u/%u us | PPA avg/max %u/%u us, msync max %u us,"
+                   " per refr max %u flushes %u px\n",
+                   (unsigned)s_win_handler_duration.n, (unsigned)s_win_handler_interval.max,
+                   (unsigned)ui_perf_win_avg(&s_win_handler_duration), (unsigned)s_win_handler_duration.max,
+                   (unsigned)ui_perf_win_avg(&s_win_frame_cb), (unsigned)s_win_frame_cb.max,
+                   (unsigned)ui_perf_win_avg(&s_win_flush_ppa), (unsigned)s_win_flush_ppa.max,
+                   (unsigned)s_win_flush_msync.max,
+                   (unsigned)s_refr_flushes_max, (unsigned)s_refr_flush_px_max);
+    UI_PERF_APPEND("lvgl worst refr %u us: flush %u us (%u flushes, %u px) gate %u us;"
+                   " inval %u areas %u px, max (%d,%d %dx%d)\n",
+                   (unsigned)w->refr_us, (unsigned)w->flush_us, (unsigned)w->flushes,
+                   (unsigned)w->flush_px, (unsigned)w->gate_us,
+                   (unsigned)w->inval_count, (unsigned)w->inval_px,
+                   (int)w->inval_max.x1, (int)w->inval_max.y1,
+                   (int)(w->inval_max.x2 - w->inval_max.x1 + 1),
+                   (int)(w->inval_max.y2 - w->inval_max.y1 + 1));
+#ifdef UI_TARGET_JC1060
+    UI_PERF_APPEND("lvgl scan-gate per refr avg/max %u/%u us, gave up (tore) %u\n",
+                   (unsigned)ui_perf_win_avg(&s_win_refr_gate), (unsigned)s_win_refr_gate.max,
+                   (unsigned)s_scan_giveups);
+    s_win_refr_gate = (ui_perf_win_t){0};
+    s_scan_giveups = 0;
+#endif
+#undef UI_PERF_APPEND
+    if (s_perf_report_cb && off < size) {
+        s_perf_report_cb(buf + off, size - off);
+    }
+    buf[size - 1] = '\0';
+
+    s_win_handler_interval = (ui_perf_win_t){0};
+    s_win_handler_duration = (ui_perf_win_t){0};
+    s_win_frame_cb = (ui_perf_win_t){0};
+    s_win_refr_interval = (ui_perf_win_t){0};
+    s_win_refr_total = (ui_perf_win_t){0};
+    s_win_refr_draw = (ui_perf_win_t){0};
+    s_win_refr_flush = (ui_perf_win_t){0};
+    s_win_render_total = (ui_perf_win_t){0};
+    s_win_flush_ppa = (ui_perf_win_t){0};
+    s_win_flush_msync = (ui_perf_win_t){0};
+    s_refr_worst = (ui_perf_refr_t){0};
+    s_refr_flush_px_max = 0;
+    s_refr_flushes_max = 0;
+    s_perf_window_start_us = now_us;
+    __atomic_store_n(&s_perf_busy, true, __ATOMIC_RELEASE);
+    xTaskNotifyGive(s_perf_task);
+}
+
 static void ui_lvgl_task(void *arg)
 {
     (void)arg;
@@ -583,37 +1097,54 @@ static void ui_lvgl_task(void *arg)
             }
         }
         if (blackout) {
+#ifdef UI_TARGET_JC1060
+            ui_stall_mark(UI_STALL_PH_WAIT);
+#endif
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
 
         uint64_t handler_start_us = (uint64_t)esp_timer_get_time();
-        if (ui_diagnostics_enabled() && last_handler_start_us != 0) {
-            ui_overview_perf_report_t interval_report;
-            if (ui_overview_perf_record(&s_lvgl_handler_interval_perf,
-                                        (uint32_t)(handler_start_us - last_handler_start_us),
-                                        &interval_report)) {
-                ui_lvgl_backend_perf_log_us("LVGL handler interval", &interval_report);
-            }
+        bool diag = ui_diagnostics_enabled();
+        if (diag && last_handler_start_us != 0) {
+            ui_perf_win_add(&s_win_handler_interval,
+                            (uint32_t)(handler_start_us - last_handler_start_us));
         }
         last_handler_start_us = handler_start_us;
 
+#ifdef UI_TARGET_JC1060
+        ui_stall_mark(UI_STALL_PH_LOCK);
+#endif
         _lock_acquire_recursive(&s_lvgl_lock);
         if (refresh_pending && s_frame_callback != NULL) {
+#ifdef UI_TARGET_JC1060
+            ui_stall_mark(UI_STALL_PH_FRAME_CB);
+#endif
+            int64_t frame_cb_start_us = esp_timer_get_time();
             s_frame_callback(s_frame_callback_ctx);
-        }
-        uint32_t next_ms = lv_timer_handler();
-        _lock_release_recursive(&s_lvgl_lock);
-
-        uint64_t handler_end_us = (uint64_t)esp_timer_get_time();
-        if (ui_diagnostics_enabled()) {
-            ui_overview_perf_report_t duration_report;
-            if (ui_overview_perf_record(&s_lvgl_handler_duration_perf,
-                                        (uint32_t)(handler_end_us - handler_start_us),
-                                        &duration_report)) {
-                ui_lvgl_backend_perf_log_us("LVGL handler duration", &duration_report);
+            if (diag) {
+                ui_perf_win_add(&s_win_frame_cb, ui_lvgl_backend_perf_elapsed_us(frame_cb_start_us));
             }
         }
+#ifdef UI_TARGET_JC1060
+        s_scan_refr_wait_us = 0;
+        ui_stall_mark(UI_STALL_PH_HANDLER);
+#endif
+        uint32_t next_ms = lv_timer_handler();
+#ifdef UI_TARGET_JC1060
+        ui_stall_mark(UI_STALL_PH_POST);
+#endif
+        if (s_post_refresh_callback != NULL) {
+            uint32_t repainted = s_direct_repainted;
+            s_direct_repainted = 0;
+            s_post_refresh_callback(repainted, s_post_refresh_callback_ctx);
+        }
+        if (diag) {
+            ui_perf_win_add(&s_win_handler_duration,
+                            (uint32_t)((uint64_t)esp_timer_get_time() - handler_start_us));
+            ui_perf_publish();
+        }
+        _lock_release_recursive(&s_lvgl_lock);
 
         if (next_ms > 100) next_ms = 100;
         if (next_ms < 5)   next_ms = 5;
@@ -622,6 +1153,9 @@ static void ui_lvgl_task(void *arg)
         // LVGL's requested cadence, preserving timers, input and animations
         // even if the display interrupt stops arriving.
         uint32_t notifications = 0;
+#ifdef UI_TARGET_JC1060
+        ui_stall_mark(UI_STALL_PH_WAIT);
+#endif
         BaseType_t notified = xTaskNotifyWait(0,
                                               UINT32_MAX,
                                               &notifications,
@@ -655,6 +1189,13 @@ esp_err_t ui_lvgl_backend_init(uint16_t hor_res, uint16_t ver_res)
     ESP_ERROR_CHECK(ppa_register_client(&ppa_cfg, &s_ppa));
 
     lv_init();
+#if LV_USE_TJPGD
+    /* v281: TJpgDec is built for ui_artwork_thumb only. lv_init() registers
+     * LVGL's JPEG image decoder at the head of the decoder list, where it would
+     * be asked first on every image draw (the image cache is off): drop it so
+     * the draw path is the one before the artwork feature. */
+    lv_tjpgd_deinit();
+#endif
 
     s_disp = lv_display_create(s_hor_res, s_ver_res);
     lv_display_set_color_format(s_disp, LV_COLOR_FORMAT_RGB565);
@@ -733,11 +1274,71 @@ esp_err_t ui_lvgl_backend_set_frame_callback(ui_lvgl_backend_frame_cb_t callback
     return ESP_OK;
 }
 
+esp_err_t ui_lvgl_backend_set_perf_report_callback(ui_lvgl_backend_perf_report_cb_t callback)
+{
+    if (s_lvgl_task_handle != NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_perf_report_cb = callback;
+    return ESP_OK;
+}
+
+void ui_lvgl_backend_set_stall_probe_callback(ui_lvgl_backend_stall_probe_cb_t callback)
+{
+#ifdef UI_TARGET_JC1060
+    __atomic_store_n(&s_stall_probe_cb, callback, __ATOMIC_RELEASE);
+#else
+    (void)callback;
+#endif
+}
+
+esp_err_t ui_lvgl_backend_set_post_refresh_callback(ui_lvgl_backend_post_refresh_cb_t callback,
+                                                    void *user_ctx)
+{
+    if (s_lvgl_task_handle != NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_post_refresh_callback = callback;
+    s_post_refresh_callback_ctx = user_ctx;
+    return ESP_OK;
+}
+
+void ui_lvgl_backend_set_direct_rect(uint8_t slot, const ui_overlay_rect_t *logical)
+{
+    if (slot >= UI_LVGL_BACKEND_DIRECT_SLOTS) {
+        return;
+    }
+    s_direct_rect[slot] = logical ? *logical : (ui_overlay_rect_t){0};
+}
+
+/* Diagnostics only, allocated once here. Without it the windows still run and
+ * nothing is printed. Same core as LVGL, below everything that matters. */
+static void ui_perf_task_start(void)
+{
+    if (!ui_diagnostics_enabled()) {
+        return;
+    }
+    s_perf_text = heap_caps_calloc(1, UI_PERF_TEXT_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_perf_text ||
+        xTaskCreatePinnedToCoreWithCaps(ui_perf_task, "ui_perf", UI_PERF_TASK_STACK, NULL,
+                                        UI_PERF_TASK_PRIO, &s_perf_task, 1,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        heap_caps_free(s_perf_text);
+        s_perf_text = NULL;
+        s_perf_task = NULL;
+        ESP_LOGW(TAG, "ui_perf task not started: UI perf reports disabled");
+        return;
+    }
+    /* Default level is WARN: the reports are INFO under their own tag. */
+    esp_log_level_set(PERF_TAG, ESP_LOG_INFO);
+}
+
 esp_err_t ui_lvgl_backend_start(void)
 {
     if (s_lvgl_task_handle != NULL) {
         return ESP_ERR_INVALID_STATE;
     }
+    ui_perf_task_start();
     if (xTaskCreatePinnedToCore(ui_lvgl_task,
                                 "lvgl",
                                 LVGL_TASK_STACK,
@@ -847,17 +1448,33 @@ esp_err_t ui_lvgl_backend_blit_rgb565_ppa270_region(const ui_overlay_rect_t *log
         return ESP_ERR_INVALID_ARG;
     }
 
-    return ui_lvgl_backend_blit_rgb565_ppa270_mapped(logical,
-                                                     &physical,
-                                                     src,
-                                                     src_w,
-                                                     src_h,
-                                                     src_x,
-                                                     src_y,
-                                                     block_w,
-                                                     block_h,
-                                                     src_bytes,
-                                                     perf);
+#ifdef UI_TARGET_JC1060
+    /* v287: direct blits (dj_ui zoom strips) write the scanned framebuffer
+     * like a flush does, so they take the same anti-tear gate and budget. */
+    uint32_t px = block_w * block_h;
+    (void)ui_scan_gate(physical.y, physical.h, px);
+    ui_lvgl_backend_blit_perf_t local_perf;
+    if (!perf) {
+        perf = &local_perf;
+    }
+#endif
+    esp_err_t err = ui_lvgl_backend_blit_rgb565_ppa270_mapped(logical,
+                                                              &physical,
+                                                              src,
+                                                              src_w,
+                                                              src_h,
+                                                              src_x,
+                                                              src_y,
+                                                              block_w,
+                                                              block_h,
+                                                              src_bytes,
+                                                              perf);
+#ifdef UI_TARGET_JC1060
+    if (err == ESP_OK) {
+        ui_scan_learn_copy(px, perf->total_us);
+    }
+#endif
+    return err;
 }
 
 esp_err_t ui_lvgl_backend_draw_rect_rgb565(const ui_overlay_rect_t *logical, uint16_t color)
