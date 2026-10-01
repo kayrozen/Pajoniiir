@@ -12,6 +12,7 @@
 #include "deck_cue_park.h"
 #include "deck_jog_scrub.h"
 #include "deck_hot_cue_recall.h"
+#include "deck_load_lock.h"
 #include "rekordbox_anlz.h"
 #if !defined(DECK_CORE_PC_TEST)
 #include "esp_timer.h"
@@ -92,6 +93,8 @@ static bool              s_jog_cdj_mode;
 /* v275: tempo range (6/10/16) shared by both decks. Settings and Shift+TEMPO
  * RANGE both change it, so a track load (deck reset) or a reboot keeps it. */
 static uint16_t          s_tempo_range_percent = DEFAULT_TEMPO_RANGE_PERCENT;
+/* v293: LOAD LOCK Settings switch (deck_core_set_load_lock). */
+static bool              s_load_lock;
 /* v267/v268: deck_jog_show_t of each deck (deck_jog_scrub.h); readers from
  * other tasks take state->position_ms, the target, unless it is ENGINE. */
 static uint8_t           s_jog_show_pub[DECK_CORE_DECK_COUNT];
@@ -3393,14 +3396,18 @@ static void on_mixer_control(uint8_t id, int16_t raw)
     case CTRL_ID_CROSSFADER:
         audio_engine_set_crossfader(value);
         break;
+    /* DDJ-400: the headphone CUE LED (0x54) is host-driven and the diff
+     * publisher only sees the new PFL state on a publish. */
     case CTRL_ID_DECK1_PFL:
         if (raw != 0) {
             audio_engine_toggle_pfl(CTRL_DECK_1);
+            publish_flx4_led_snapshot(false);
         }
         break;
     case CTRL_ID_DECK2_PFL:
         if (raw != 0) {
             audio_engine_toggle_pfl(CTRL_DECK_2);
+            publish_flx4_led_snapshot(false);
         }
         break;
     case CTRL_ID_CH1_EQ_HIGH:
@@ -3835,6 +3842,26 @@ void deck_core_set_jog_cdj_mode(bool on)
 bool deck_core_get_jog_cdj_mode(void)
 {
     return __atomic_load_n(&s_jog_cdj_mode, __ATOMIC_ACQUIRE);
+}
+
+void deck_core_set_load_lock(bool on)
+{
+    __atomic_store_n(&s_load_lock, on, __ATOMIC_RELEASE);
+}
+
+bool deck_core_get_load_lock(void)
+{
+    return __atomic_load_n(&s_load_lock, __ATOMIC_ACQUIRE);
+}
+
+bool deck_core_load_allowed(uint8_t deck)
+{
+    if (deck >= DECK_CORE_DECK_COUNT) return false;
+    const bool lock_on = deck_core_get_load_lock();
+    if (!lock_on) return true;
+    /* Seqlock copy + atomic engine flags: never waits on the audio side. */
+    const bool playing = deck_state_snapshot(deck, false).playing;
+    return deck_load_lock_allows(deck_load_lock_check(lock_on, playing));
 }
 
 void deck_core_set_tempo_range_percent(uint16_t pct)

@@ -2952,7 +2952,26 @@ Validated on hardware (v117, 2026-09-21):
   (`ui_status.c` and `UI_TOPBAR_H`/`UI_CONTENT_*` are gone).
   `CONFIG_UI_DJUI_DIRECT_STRIPS` (PPA blit of the zoom strips) stays as a
   perf fallback.
-- Gate: `tests/ui_simulator/run_ui_simulator_e2e_jc1060.sh` (22 captures).
+- Gate: `tests/ui_simulator/run_ui_simulator_e2e_jc1060.sh` (23 captures).
+- v293 LOAD LOCK (Settings > DECK LOAD, NVS `load_lock`, default OFF =
+  upstream `main-deck-p4`, which loads at any time). When on, a track load
+  onto a playing deck is refused. `deck_core` owns the switch and the verdict
+  (`deck_load_lock.c`, lock-free `deck_core_load_allowed`). `ui_library.c`
+  applies it in `ui_submit_track_load`, the one chokepoint for touch,
+  controller, web, DJ Link and peer loads. It checks again in the load worker
+  before the deck reset (PLAY during resolve), and before a peer download
+  starts. Nothing runs in the audio path. The Library LOAD button of a locked
+  deck reads `D1/D2 LOCKED` (dimmed). Host test: `tests/deck_load_lock`.
+  Still open: HIL (STARTUP_CHECKLIST Phase 2).
+- v294 Settings layout: the right column under SYSTEM STATUS holds one
+  network box, 501x190: DJ LINK (ETHERNET) with its switch, status and three
+  peer rows, then a divider and a WIRELESS row with the P4 REMOTE switch.
+  RECORD sits below it at 501x100. The left column under OUTPUT holds DECK
+  LOAD, 501x190: LOAD LOCK plus the DECK SETUP chips TEMPO / JOG / CUE,
+  moved out of MIXER STATUS with the same `DJ_F_*` ids and handlers. MIXER
+  STATUS becomes a 1008x56 bottom strip, as HOT CUE STATUS, and its flex
+  spacer takes the freed width. The simulator checks that each label sits
+  inside its box (`settings_layout_check`).
   Still open: full HIL acceptance (two-deck perf, zoom, tab switches,
   screensaver, blackout, hotplug).
 

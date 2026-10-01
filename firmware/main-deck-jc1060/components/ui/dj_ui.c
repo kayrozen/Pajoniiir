@@ -127,6 +127,7 @@ static struct {
     lv_color_t row_bg[DJ_LIB_ROWS], row_fg[DJ_LIB_ROWS], row_bc[DJ_LIB_ROWS];
     bool row_styled[DJ_LIB_ROWS];
     bool load_enabled;
+    bool load_locked[DJ_DECKS];     /* v293: LOAD LOCK on and the deck plays */
     /* settings extras */
     lv_obj_t *link_sw, *peer_lbl[DJ_LINK_ROWS], *rec_btn;
     bool recording;
@@ -737,8 +738,14 @@ static void refresh_transport(deck_t *d)
 
 static void refresh_load_btns(void)
 {
-    for (int i = 0; i < DJ_DECKS; i++)
-        lv_obj_set_style_opa(g.load_btn[i], g.load_enabled ? LV_OPA_COVER : LV_OPA_40, 0);
+    static const char *const label[DJ_DECKS][2] = {
+        {"LOAD DECK 1", "D1 LOCKED"}, {"LOAD DECK 2", "D2 LOCKED"},
+    };
+    for (int i = 0; i < DJ_DECKS; i++) {
+        bool on = g.load_enabled && !g.load_locked[i];
+        lv_obj_set_style_opa(g.load_btn[i], on ? LV_OPA_COVER : LV_OPA_40, 0);
+        lv_label_set_text(lv_obj_get_child(g.load_btn[i], 0), label[i][g.load_locked[i]]);
+    }
 }
 
 static void refresh_record(void)
@@ -1211,34 +1218,11 @@ static void build_settings(lv_obj_t *pg)
     field_txt(b, DJ_F_SYS_FW, F12, 14, 126, 470, "P4: 245 [ota_0]", DJ_TONE_OK);
     field_txt(b, DJ_F_SYS_RESET, F14, 14, 150, 470, "Last reset: Power-on", DJ_TONE_MUTED);
 
-    b = box(pg, 507, 188, 501, 100, C_PANEL, C_LINE);
-    cap(b, "WIRELESS", 14, 12);
-    g.wl_sw = lv_switch_create(b);
-    lv_obj_set_pos(g.wl_sw, 14, 40);
-    lv_obj_set_size(g.wl_sw, 56, 30);
-    lv_obj_set_style_bg_color(g.wl_sw, C_LINE, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(g.wl_sw, acc, LV_PART_INDICATOR | LV_STATE_CHECKED);
-    lv_obj_set_style_bg_color(g.wl_sw, C_INK, LV_PART_KNOB);
-    lv_obj_add_event_cb(g.wl_sw, wl_cb, LV_EVENT_VALUE_CHANGED, NULL);
-    g.wl_lbl = txt(b, F14, C_INK, "P4 REMOTE: OFF", 84, 46);
-
-    b = box(pg, 0, 294, 1008, 84, C_PANEL, C_LINE);
-    cap(b, "MIXER STATUS", 14, 12);
-    lv_obj_t *row = flex_row(b, 14, 34, 978, 40);
-    chip(row, DJ_F_MIX_MIXER, "MIXER: DDJ-400", DJ_TONE_NORMAL);
-    chip(row, DJ_F_MIX_FADERS, "CH FADERS", DJ_TONE_INFO);
-    chip(row, DJ_F_MIX_XFADER, "CROSSFADER", DJ_TONE_NORMAL);
-    chip(row, DJ_F_MIX_PFL, "PFL D1/D2", DJ_TONE_WARN);
-    lv_obj_t *sp = plain(row, 0, 0, 1, 1);
-    lv_obj_set_flex_grow(sp, 1);
-    chip(row, DJ_F_MIX_TEMPO, "TEMPO: +/-10%", DJ_TONE_NORMAL);
-    tappable(DJ_F_MIX_TEMPO);
-    chip(row, DJ_F_MIX_JOG, "JOG: VINYL", DJ_TONE_NORMAL);
-    tappable(DJ_F_MIX_JOG);
-    chip(row, DJ_F_MIX_CUE, "CUE: STEREO", DJ_TONE_NORMAL);
-    tappable(DJ_F_MIX_CUE);
-
-    b = box(pg, 0, 384, 501, 162, C_PANEL, C_LINE);
+    /* v294: the network box (DJ LINK + WIRELESS) takes the right column
+     * under SYSTEM STATUS, DECK LOAD (LOAD LOCK + deck setup chips) the left
+     * column under OUTPUT. MIXER STATUS becomes a 56 px bottom strip, the
+     * HOT CUE STATUS idiom, to give the network box room for P4 REMOTE. */
+    b = box(pg, 507, 188, 501, 190, C_PANEL, C_LINE);
     cap(b, "DJ LINK (ETHERNET)", 14, 12);
     g.link_sw = lv_switch_create(b);
     lv_obj_set_pos(g.link_sw, 14, 36);
@@ -1253,12 +1237,46 @@ static void build_settings(lv_obj_t *pg)
         lv_label_set_long_mode(g.peer_lbl[r], DJ_LONG_DOT);
         lv_obj_set_width(g.peer_lbl[r], 470);
     }
+    lv_obj_t *sep = box(b, 14, 138, 472, 1, C_LINE, C_LINE);
+    lv_obj_set_style_border_width(sep, 0, 0);
+    cap(b, "WIRELESS", 14, 157);
+    g.wl_sw = lv_switch_create(b);
+    lv_obj_set_pos(g.wl_sw, 110, 149);
+    lv_obj_set_size(g.wl_sw, 56, 30);
+    lv_obj_set_style_bg_color(g.wl_sw, C_LINE, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(g.wl_sw, acc, LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(g.wl_sw, C_INK, LV_PART_KNOB);
+    lv_obj_add_event_cb(g.wl_sw, wl_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    g.wl_lbl = txt(b, F14, C_INK, "P4 REMOTE: OFF", 180, 155);
 
-    b = box(pg, 507, 384, 501, 162, C_PANEL, C_LINE);
+    b = box(pg, 0, 294, 501, 190, C_PANEL, C_LINE);
+    cap(b, "DECK LOAD", 14, 12);
+    field_box(b, DJ_F_LOAD_LOCK, 14, 36, 230, 40, "LOAD LOCK: OFF", DJ_TONE_NORMAL);
+    tappable(DJ_F_LOAD_LOCK);
+    cap(b, "DECK SETUP", 14, 100);
+    lv_obj_t *row = flex_row(b, 14, 124, 472, 40);
+    chip(row, DJ_F_MIX_TEMPO, "TEMPO: +/-10%", DJ_TONE_NORMAL);
+    tappable(DJ_F_MIX_TEMPO);
+    chip(row, DJ_F_MIX_JOG, "JOG: VINYL", DJ_TONE_NORMAL);
+    tappable(DJ_F_MIX_JOG);
+    chip(row, DJ_F_MIX_CUE, "CUE: STEREO", DJ_TONE_NORMAL);
+    tappable(DJ_F_MIX_CUE);
+
+    b = box(pg, 507, 384, 501, 100, C_PANEL, C_LINE);
     cap(b, "RECORD", 14, 12);
     g.rec_btn = btn(b, 14, 36, 140, 44, "RECORD", F14, C_PANEL, C_ERR, C_LINE, rec_click, NULL);
     field_txt(b, DJ_F_REC_STATUS, F16, 170, 40, 316, "REC --:--", DJ_TONE_MUTED);
     field_txt(b, DJ_F_REC_DEST, F12, 170, 64, 316, "-> /sd/recordings", DJ_TONE_MUTED);
+
+    b = box(pg, 0, 490, 1008, 56, C_PANEL, C_LINE);
+    cap(b, "MIXER STATUS", 12, 20);
+    row = flex_row(b, 150, 0, 840, 54);
+    chip(row, DJ_F_MIX_MIXER, "MIXER: DDJ-400", DJ_TONE_NORMAL);
+    chip(row, DJ_F_MIX_FADERS, "CH FADERS", DJ_TONE_INFO);
+    chip(row, DJ_F_MIX_XFADER, "CROSSFADER", DJ_TONE_NORMAL);
+    chip(row, DJ_F_MIX_PFL, "PFL D1/D2", DJ_TONE_WARN);
+    lv_obj_t *sp = plain(row, 0, 0, 1, 1);
+    lv_obj_set_flex_grow(sp, 1);
 }
 
 static void build_topbar(lv_obj_t *parent)
@@ -1857,6 +1875,13 @@ void dj_ui_library_set_load_enabled(bool enabled)
 {
     if (g.load_enabled == enabled) return;
     g.load_enabled = enabled;
+    refresh_load_btns();
+}
+
+void dj_ui_library_set_load_locked(uint8_t deck, bool locked)
+{
+    if (deck >= DJ_DECKS || g.load_locked[deck] == locked) return;
+    g.load_locked[deck] = locked;
     refresh_load_btns();
 }
 

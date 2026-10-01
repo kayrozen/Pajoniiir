@@ -115,6 +115,7 @@ CAPTURES=(
     library_bridge
     library_bridge_sort_desc
     library_bridge_peer
+    library_bridge_locked
     overview_bridge
     overview_bridge_scroll
     overview_bridge_elapsed

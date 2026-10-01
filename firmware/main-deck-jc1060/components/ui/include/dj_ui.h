@@ -23,8 +23,8 @@ typedef enum { DJ_SORT_NONE, DJ_SORT_ARTIST, DJ_SORT_NAME, DJ_SORT_BPM, DJ_SORT_
 typedef enum { DJ_TONE_NORMAL, DJ_TONE_MUTED, DJ_TONE_OK, DJ_TONE_WARN, DJ_TONE_INFO, DJ_TONE_ERROR } dj_tone_t;
 
 /* Status/text fields on Settings and Hot Cues screens (dj_ui_set_field).
- * DJ_F_MASTER, DJ_F_OUT_MAIN, DJ_F_UI_RENDER, DJ_F_LOCAL, DJ_F_MIX_CUE, DJ_F_MIX_JOG and
- * DJ_F_MIX_TEMPO are tappable (on_field). */
+ * DJ_F_MASTER, DJ_F_OUT_MAIN, DJ_F_UI_RENDER, DJ_F_LOCAL, DJ_F_MIX_CUE, DJ_F_MIX_JOG,
+ * DJ_F_MIX_TEMPO and DJ_F_LOAD_LOCK are tappable (on_field). */
 typedef enum {
     DJ_F_MASTER, DJ_F_MASTER_HINT,
     DJ_F_OUT_MAIN, DJ_F_OUT_CUE, DJ_F_UI_RENDER, DJ_F_LOCAL,
@@ -32,6 +32,7 @@ typedef enum {
     DJ_F_MIX_MIXER, DJ_F_MIX_FADERS, DJ_F_MIX_XFADER, DJ_F_MIX_PFL, DJ_F_MIX_CUE,
     DJ_F_MIX_JOG,                     /* "JOG: VINYL" / "JOG: CDJ" (v267) */
     DJ_F_MIX_TEMPO,                   /* "TEMPO: +/-10%", cycles 6/10/16 (v275) */
+    DJ_F_LOAD_LOCK,                   /* "LOAD LOCK: OFF" / "LOAD LOCK: ON" (v293) */
     DJ_F_HC_CUES, DJ_F_HC_LOOPS, DJ_F_HC_ANLZ, DJ_F_HC_TARGET,
     DJ_F_LINK_STATUS,                 /* "DJ LINK: ON P4 - CDJ-3000 #1 174.2 BPM ON AIR" */
     DJ_F_REC_STATUS, DJ_F_REC_DEST,   /* "REC 01:23  12 MB", "-> /sd/recordings" */
@@ -99,7 +100,9 @@ typedef struct {
     void (*on_fx_channel)(void);                        /* CH chip tapped: next target */
     void (*on_fx_level)(uint8_t pct);                   /* LEVEL slider moved, 0..100 */
     void (*on_lib_select)(uint8_t row);
-    void (*on_lib_load)(uint8_t deck, uint8_t row);     /* not called while loads are disabled */
+    void (*on_lib_load)(uint8_t deck, uint8_t row);     /* not called while loads are disabled;
+                                                           still called on a locked deck, the
+                                                           owner refuses and says why */
     void (*on_lib_sort)(dj_sort_t sort);                /* tapped column; answer with dj_ui_library_set_sort */
     void (*on_lib_page)(int8_t dir);                    /* -1 PREV, +1 NEXT */
     void (*on_lib_source)(void);                        /* SOURCE / CANCEL button */
@@ -210,6 +213,7 @@ void dj_ui_library_set_deck_status(uint8_t deck, const char *status);      /* de
 void dj_ui_library_set_status(const char *text, dj_tone_t tone);           /* "D2 LOADED FROM #3", "LOAD BUSY" */
 void dj_ui_library_set_progress(int16_t pct);                              /* <0 hides the bar */
 void dj_ui_library_set_load_enabled(bool enabled);                         /* load gate busy = false */
+void dj_ui_library_set_load_locked(uint8_t deck, bool locked);             /* v293 LOAD LOCK: deck playing */
 void dj_ui_library_set_source_label(const char *label);                    /* "SOURCE" / "CANCEL" */
 void dj_ui_library_set_playlists_label(const char *label);                 /* "PLAYLISTS" / "ALL TRACKS" / "BACK" */
 

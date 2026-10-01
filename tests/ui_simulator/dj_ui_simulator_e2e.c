@@ -109,6 +109,81 @@ static lv_obj_t *find_visible_label(const char *text)
     return found;
 }
 
+/* v294: the Settings box (bordered, >= 400 px wide) that holds a label. */
+static lv_obj_t *settings_box_of(const char *text)
+{
+    lv_obj_t *o = find_visible_label(text);
+    for (o = o ? lv_obj_get_parent(o) : NULL; o; o = lv_obj_get_parent(o)) {
+        if (lv_obj_get_style_border_width(o, LV_PART_MAIN) > 0 &&
+            lv_obj_get_width(o) >= 400) return o;
+    }
+    return NULL;
+}
+
+/* v294: DECK LOAD holds the LOAD LOCK field and the TEMPO/JOG/CUE chips, and
+ * every label of the moved boxes stays inside its box (nothing clipped). */
+static void check_label_inside(lv_obj_t *box, const char *text)
+{
+    lv_obj_t *l = box ? find_label_ex(box, text, true, false) : NULL;
+    if (!l) return;
+    lv_area_t b, a;
+    lv_obj_get_coords(box, &b);
+    lv_obj_get_coords(l, &a);
+    if (a.x1 < b.x1 || a.y1 < b.y1 || a.x2 > b.x2 || a.y2 > b.y2) {
+        fprintf(stderr, "FAIL: '%s' clipped by its Settings box\n", text);
+        s_failures++;
+    }
+}
+
+static void settings_layout_check(void)
+{
+    lv_obj_t *deck_load = settings_box_of("LOAD LOCK: OFF");
+    if (!deck_load) {
+        fail("settings: DECK LOAD box not found");
+        return;
+    }
+    /* Scoped lookups: the demo's CUE chip text also exists in OUTPUT. */
+    const char *deck_labels[] = { "DECK LOAD", "LOAD LOCK: OFF",
+                                  "DECK SETUP", "TEMPO: +/-10%", "JOG: VINYL", "CUE: DDJ-400" };
+    for (size_t k = 0; k < sizeof deck_labels / sizeof deck_labels[0]; k++) {
+        if (!find_label_ex(deck_load, deck_labels[k], true, false)) {
+            fprintf(stderr, "FAIL: '%s' is not in the DECK LOAD box\n", deck_labels[k]);
+            s_failures++;
+        }
+        check_label_inside(deck_load, deck_labels[k]);
+    }
+    if (find_label_ex(deck_load, "MIXER: DDJ-400", true, false)) {
+        fail("settings: MIXER STATUS chips ended up in DECK LOAD");
+    }
+    lv_obj_t *link = settings_box_of("DJ LINK (ETHERNET)");
+    if (find_label_ex(deck_load, "P4 REMOTE: OFF", true, false)) {
+        fail("settings: WIRELESS is still in DECK LOAD");
+    }
+    /* WIRELESS shares the network box with DJ LINK. */
+    const char *link_labels[] = { "DJ LINK (ETHERNET)",
+                                  "DJ LINK: ON P4 - CDJ-3000 #1 174.2 BPM ON AIR",
+                                  "CDJ-3000 #1   174.2 BPM   MASTER   ON AIR   PLAY",
+                                  "XDJ-XZ #3   128.0 BPM   ON AIR",
+                                  "WIRELESS", "P4 REMOTE: OFF" };
+    if (!link) {
+        fail("settings: DJ LINK box not found");
+        return;
+    }
+    for (size_t k = 0; k < sizeof link_labels / sizeof link_labels[0]; k++) {
+        if (!find_label_ex(link, link_labels[k], true, false)) {
+            fprintf(stderr, "FAIL: '%s' is not in the DJ LINK box\n", link_labels[k]);
+            s_failures++;
+        }
+        check_label_inside(link, link_labels[k]);
+    }
+    lv_obj_t *mixer = settings_box_of("MIXER STATUS");
+    const char *mixer_labels[] = { "MIXER STATUS", "MIXER: DDJ-400", "CH FADERS",
+                                   "CROSSFADER", "PFL D1/D2" };
+    for (size_t k = 0; mixer && k < sizeof mixer_labels / sizeof mixer_labels[0]; k++) {
+        check_label_inside(mixer, mixer_labels[k]);
+    }
+}
+
 static void dump_visible_labels(lv_obj_t *root, int depth)
 {
     if (!root || depth > 10) {
@@ -313,6 +388,7 @@ static void bridge_settings_scenario(void)
         .cue_mode = "CUE: SPLIT MONO",
         .jog_cdj = true,
         .tempo_range_pct = 16,
+        .load_lock = true,
         .sd_state = UI_DJUI_SD_MOUNTED,
         .sd_free_bytes = 12ull * 1024 * 1024 * 1024 + 512ull * 1024 * 1024,
         .sd_total_bytes = 29ull * 1024 * 1024 * 1024,
@@ -346,6 +422,8 @@ static void bridge_settings_scenario(void)
     expect_label("CUE: SPLIT MONO");
     expect_label("JOG: CDJ");
     expect_label("TEMPO: +/-16%");
+    expect_label("DECK LOAD");
+    expect_label("LOAD LOCK: ON");
     expect_label("Controller (USB1): Connected");
     expect_label("Mounted: 12.5 GB free / 29.0 GB");
     expect_label("SD Log: OK  95KB  drop 0");
@@ -1617,6 +1695,69 @@ static void playing_render_timing(void)
     dj_ui_show_tab(DJ_TAB_OVERVIEW);
 }
 
+/* v293 LOAD LOCK. Runs after every clock-dependent capture: its pumps would
+ * otherwise move the Overview playheads of the scenes behind it. */
+static void bridge_load_lock_scenario(void)
+{
+    static const dj_ui_callbacks_t cb = { .on_field = bridge_on_field, .on_lib_load = lib_on_load };
+    dj_ui_set_callbacks(&cb);
+
+    /* The Settings switch is tappable and follows the view. */
+    dj_ui_show_tab(DJ_TAB_SETTINGS);
+    ui_djui_settings_view_t sv = { .brightness_pct = 50, .load_lock = true };
+    ui_djui_bridge_settings_update(&sv);
+    pump(64);
+    expect_label("LOAD LOCK: ON");
+    s_bridge_field = DJ_F_COUNT;
+    click_label("LOAD LOCK: ON");
+    if (s_bridge_field != DJ_F_LOAD_LOCK) fail("bridge: LOAD LOCK did not report DJ_F_LOAD_LOCK");
+    sv.load_lock = false;
+    ui_djui_bridge_settings_update(&sv);
+    pump(64);
+    expect_label("LOAD LOCK: OFF");
+
+    /* The playing deck's button reads LOCKED and is dimmed, the other one
+     * stays live. A tap still reaches the owner, whose chokepoint refuses it
+     * and says why. */
+    dj_ui_show_tab(DJ_TAB_LIBRARY);
+    const dj_track_t rows[2] = {
+        { .title = "Lock Track A", .artist = "Artist A", .key = "8A", .bpm = 124, .len_ms = 245000 },
+        { .title = "Lock Track B", .artist = "Artist B", .key = "11B", .bpm = 128, .len_ms = 372000 },
+    };
+    ui_djui_bridge_library_set_rows(rows, 2);
+    ui_djui_library_view_t v = {
+        .source = "LOCAL USB", .total = 2, .page = 1, .pages = 1,
+        .selected = 1, .loaded = { 0, -1 },
+        .status_deck = 0, .deck_status = "ACTIVE",
+        .load_enabled = true, .load_locked = { true, false },
+        .progress = -1, .source_label = "SOURCE",
+    };
+    ui_djui_bridge_library_update(&v);
+    ui_djui_bridge_status_hold("LOAD LOCKED", DJ_TONE_WARN, 2500, lv_tick_get());
+    pump(64);
+    expect_label("D1 LOCKED");
+    expect_hidden_label("LOAD DECK 1");
+    expect_label("LOAD LOCKED");
+    expect_button_opa("D1 LOCKED", LV_OPA_40);
+    expect_button_opa("LOAD DECK 2", LV_OPA_COVER);
+    s_lib_load_deck = -1;
+    click_label("D1 LOCKED");
+    if (s_lib_load_deck != 0) fail("bridge: tap on a locked LOAD did not reach the owner");
+    capture("library_bridge_locked");
+
+    /* Busy gate wins over the lock; unlocking restores the label. */
+    v.load_locked[0] = false;
+    ui_djui_bridge_library_update(&v);
+    pump(64);
+    expect_label("LOAD DECK 1");
+    expect_button_opa("LOAD DECK 1", LV_OPA_COVER);
+    v.load_enabled = false;
+    ui_djui_bridge_library_update(&v);
+    pump(64);
+    expect_button_opa("LOAD DECK 1", LV_OPA_40);
+    expect_button_opa("LOAD DECK 2", LV_OPA_40);
+}
+
 static void bridge_scenario(void)
 {
     dj_ui_demo_stop();
@@ -1669,6 +1810,7 @@ static void bridge_scenario(void)
     bridge_fx_scenario();
     bridge_library_playlists_scenario();
     bridge_artwork_scenario();
+    bridge_load_lock_scenario();
     playing_render_timing();
 }
 
@@ -1792,6 +1934,7 @@ int main(int argc, char **argv)
         expect_label("Controller (USB1): DDJ-400 connected");
         expect_label("CDJ-3000 #1   174.2 BPM   MASTER   ON AIR   PLAY");
         expect_label("XDJ-XZ #3   128.0 BPM   ON AIR");
+        settings_layout_check();
         click_label("MAIN: USB (DDJ)");
         expect_label("MAIN: PCM5102A RCA");
         click_button("RECORD");
@@ -1808,7 +1951,11 @@ int main(int argc, char **argv)
         lv_obj_t *boxp = lbl ? lv_obj_get_parent(lbl) : NULL;
         for (uint32_t i = 0; boxp && i < lv_obj_get_child_count(boxp); i++) {
             lv_obj_t *c = lv_obj_get_child(boxp, (int32_t)i);
-            if (lv_obj_check_type(c, &lv_switch_class)) link_sw = c;
+            /* v294: the box also holds the WIRELESS switch; DJ LINK is the first. */
+            if (lv_obj_check_type(c, &lv_switch_class)) {
+                link_sw = c;
+                break;
+            }
         }
     }
     if (!link_sw) {

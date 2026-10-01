@@ -152,6 +152,7 @@ typedef struct {
     const char *cue_mode;               /* "CUE: STEREO" */
     bool jog_cdj;                       /* v267: jog mode, false = VINYL */
     uint8_t tempo_range_pct;            /* v275: tempo fader range 6/10/16; 0 = 10 */
+    bool load_lock;                     /* v293: no LOAD onto a playing deck */
 
     ui_djui_sd_state_t sd_state;
     uint64_t sd_free_bytes, sd_total_bytes;
@@ -219,6 +220,7 @@ typedef struct {
     uint8_t status_deck;                /* DJ_DECKS = "DECK 1+2" */
     const char *deck_status;            /* "ACTIVE" / "READY" */
     bool load_enabled;                  /* load gate idle */
+    bool load_locked[DJ_DECKS];         /* v293: LOAD LOCK on and the deck plays */
     int16_t progress;                   /* peer download %, <0 hides the bar */
     const char *source_label;           /* "SOURCE" / "CANCEL" */
     const char *playlists_label;        /* "PLAYLISTS" / "ALL TRACKS" / "BACK"; NULL = "PLAYLISTS" */

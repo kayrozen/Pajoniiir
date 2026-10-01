@@ -843,6 +843,8 @@ void ui_djui_bridge_settings_update(const ui_djui_settings_view_t *v)
     field(DJ_F_MIX_MIXER, buf, DJ_TONE_NORMAL);
     field(DJ_F_MIX_CUE, v->cue_mode ? v->cue_mode : "CUE: STEREO", DJ_TONE_NORMAL);
     field(DJ_F_MIX_JOG, v->jog_cdj ? "JOG: CDJ" : "JOG: VINYL", DJ_TONE_NORMAL);
+    field(DJ_F_LOAD_LOCK, v->load_lock ? "LOAD LOCK: ON" : "LOAD LOCK: OFF",
+          v->load_lock ? DJ_TONE_WARN : DJ_TONE_NORMAL);
     snprintf(buf, sizeof buf, "TEMPO: +/-%u%%",
              (unsigned)(v->tempo_range_pct ? v->tempo_range_pct : 10u));
     field(DJ_F_MIX_TEMPO, buf, DJ_TONE_NORMAL);
@@ -982,6 +984,7 @@ typedef struct {
     int16_t selected, loaded[DJ_DECKS];
     int16_t status_deck;
     int8_t load_enabled;
+    int8_t load_locked[DJ_DECKS];
     int16_t progress;                   /* INT16_MIN = never pushed */
     int16_t sort;                       /* dj_sort_t, -1 = never pushed */
     bool sort_desc;
@@ -1004,6 +1007,7 @@ void ui_djui_bridge_library_invalidate(void)
     s_lib.selected = s_lib.loaded[0] = s_lib.loaded[1] = INT16_MIN;
     s_lib.status_deck = -1;
     s_lib.load_enabled = -1;
+    s_lib.load_locked[0] = s_lib.load_locked[1] = -1;
     s_lib.progress = INT16_MIN;
     s_lib.sort = -1;
     /* never-matching strings: the first update writes all three labels */
@@ -1057,6 +1061,11 @@ void ui_djui_bridge_library_update(const ui_djui_library_view_t *v)
     if (s_lib.load_enabled != (int8_t)v->load_enabled) {
         s_lib.load_enabled = (int8_t)v->load_enabled;
         dj_ui_library_set_load_enabled(v->load_enabled);
+    }
+    for (uint8_t d = 0; d < DJ_DECKS; d++) {
+        if (s_lib.load_locked[d] == (int8_t)v->load_locked[d]) continue;
+        s_lib.load_locked[d] = (int8_t)v->load_locked[d];
+        dj_ui_library_set_load_locked(d, v->load_locked[d]);
     }
     if (s_lib.progress != v->progress) {
         s_lib.progress = v->progress;

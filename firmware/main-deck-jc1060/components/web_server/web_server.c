@@ -2138,7 +2138,8 @@ static esp_err_t api_load_handler(httpd_req_t *req)
                           4u, track_key, generation, (uint32_t)deck, (uint32_t)rc, NULL);
         if (rc == ESP_ERR_INVALID_STATE) {
             httpd_resp_set_status(req, "409 Conflict");
-            return httpd_resp_send(req, "Library changed or load busy", HTTPD_RESP_USE_STRLEN);
+            return httpd_resp_send(req, "Library changed, load busy or deck playing (LOAD LOCK)",
+                                   HTTPD_RESP_USE_STRLEN);
         }
         if (rc == ESP_ERR_NOT_FOUND) {
             return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Track not found");

@@ -161,6 +161,7 @@ int ui_library_page_selection_after_delta(int total_tracks,
 #include "esp_log.h"
 #include "ui_lvgl_backend.h"
 #include "ui_theme.h"
+#include "deck_load_lock.h"
 
 #ifndef WIN32
 #include "audio_engine.h"
@@ -195,6 +196,8 @@ static const char *TAG = "ui_library";
 /* v257: the dj_ui build logs every LOAD step at WARN (the default level), so
  * a serial trace shows where a tap stopped. Legacy keeps its INFO logs. */
 #define UI_LIB_TRACE(...) ESP_LOGW(TAG, __VA_ARGS__)
+/* v293: status line of a load refused by LOAD LOCK (Settings). */
+#define UI_LOAD_LOCK_STATUS "LOAD LOCKED"
 
 static ui_library_config_t s_library_config;
 static int s_active_tab = 0;
@@ -771,6 +774,14 @@ static void ui_track_load_worker(void *arg)
     } else if (!ui_library_track_load_is_current(req.load_id)) {
         result->rc = ESP_ERR_INVALID_STATE;
         ui_track_load_set_status(result, "LOAD CANCELLED", "LOAD CANCELLED");
+    } else if (!deck_core_load_allowed(req.deck)) {
+        /* v293: PLAY pressed while the identity was resolving. The deck is
+         * untouched (deck_reset stays false). */
+        ESP_LOGW(TAG, "load refused: LOAD LOCK on and deck %u started playing "
+                 "during resolve (key 0x%08x)",
+                 (unsigned)req.deck + 1u, (unsigned)req.track_key);
+        result->rc = ESP_ERR_INVALID_STATE;
+        ui_track_load_set_status(result, UI_LOAD_LOCK_STATUS, UI_LOAD_LOCK_STATUS);
     } else {
         if (req.deck == CTRL_DECK_1) {
             (void)audio_engine_deck_clear_loop(req.deck);
@@ -849,6 +860,18 @@ static esp_err_t ui_submit_track_load(int index, uint32_t track_key, uint32_t ge
                  (int)deck, (int)index, (unsigned)track_key,
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    /* v293: LOAD LOCK. Every firmware load (touch, controller, web, DJ Link,
+     * finished peer download) passes here; the worker checks again before it
+     * resets the deck. */
+    if (!deck_core_load_allowed(deck)) {
+        ESP_LOGW(TAG, "load refused: LOAD LOCK on and deck %u is playing "
+                 "(%s index=%d key=0x%08x)",
+                 (unsigned)deck + 1u, peer_item ? "peer" : "catalog",
+                 index, (unsigned)track_key);
+        ui_library_status_hold(UI_LOAD_LOCK_STATUS, COL_AMBER, 2500);
+        ui_library_finish_track_load();
+        return ESP_ERR_INVALID_STATE;
+    }
     if (!s_track_load_result_q) {
         s_track_load_result_q = ui_library_create_result_queue();
     }
@@ -1101,6 +1124,8 @@ static void ui_library_peer_load(uint8_t deck)
         refusal = "LOCAL USB NEEDED";
     } else if (ui_library_track_load_busy() || media_catalog_load_in_progress()) {
         refusal = "LOAD BUSY";
+    } else if (!deck_core_load_allowed(deck)) {
+        refusal = UI_LOAD_LOCK_STATUS;   /* v293: before downloading anything */
     }
     if (refusal) {
         ESP_LOGW(TAG, "peer load refused: deck %u <- player #%u rekordbox id %u \"%s\": %s",
@@ -1210,9 +1235,11 @@ static void ui_library_load_selected_deck(uint8_t deck)
         return;
     }
 
-    ui_library_status_hold("LOADING", COL_ACCENT, 1500);
-    (void)ui_submit_track_load(catalog_idx, item.track_key, generation, deck,
-                               NULL, NULL);
+    /* A refusal (LOAD LOCK, no memory) holds its own status. */
+    if (ui_submit_track_load(catalog_idx, item.track_key, generation, deck,
+                             NULL, NULL) == ESP_OK) {
+        ui_library_status_hold("LOADING", COL_ACCENT, 1500);
+    }
     return;
 #endif
     ui_library_status_hold("TRACK LOADED", COL_GREEN, 2000);
@@ -1972,6 +1999,18 @@ static void ui_library_djui_publish(const ui_frame_context_t *ctx)
     }
 
     v.load_enabled = !ui_library_track_load_busy();
+    /* v293: same verdict as ui_submit_track_load, from this frame's state. */
+    const bool load_lock = deck_core_get_load_lock();
+    static int8_t s_traced_locked[DJ_DECKS] = {-1, -1};
+    for (uint8_t d = 0; d < DJ_DECKS && d < DECK_CORE_DECK_COUNT; d++) {
+        const bool playing = ctx && ctx->deck_state[d].playing;
+        v.load_locked[d] = !deck_load_lock_allows(deck_load_lock_check(load_lock, playing));
+        if (s_traced_locked[d] != (int8_t)v.load_locked[d]) {
+            s_traced_locked[d] = (int8_t)v.load_locked[d];
+            UI_LIB_TRACE("dj_ui LOAD DECK %u %s", (unsigned)d + 1u,
+                         v.load_locked[d] ? "locked (LOAD LOCK, deck playing)" : "unlocked");
+        }
+    }
     static int8_t s_traced_enabled = -1;
     static int8_t s_traced_loaded[DJ_DECKS] = {-2, -2};
     if (s_traced_enabled != (int8_t)v.load_enabled) {

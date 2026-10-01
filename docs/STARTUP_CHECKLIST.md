@@ -871,11 +871,26 @@ phases 0-6 done, v293 removed the legacy widgets and
 - [x] Adapt layouts for 1024x600 native landscape (`dj_ui`, 40 px tab row
       with status line instead of the 54 px top bar).
 - [x] Remove PPA rotation (native landscape, no rotation needed).
-- [x] `tests/ui_simulator/run_ui_simulator_e2e_jc1060.sh` green (22 captures).
+- [x] `tests/ui_simulator/run_ui_simulator_e2e_jc1060.sh` green (23 captures).
 - [ ] Firmware build without `.cache/djui.defaults` (the overlay is obsolete).
 - [ ] HIL: two decks playing, zoom min/max, tab switches, screensaver,
       blackout, seek, PLAY/CUE/MT, controller hotplug; no DSI underrun or
       LVGL stall report.
+- [x] v293 LOAD LOCK (Settings > DECK LOAD, NVS `load_lock`, default OFF):
+      host test `tests/deck_load_lock`, simulator capture
+      `library_bridge_locked`.
+- [ ] HIL LOAD LOCK: ON + deck playing -> touch LOAD, controller LOAD, web
+      `/api/load` (409) and peer LOAD are refused with a `load refused: LOAD
+      LOCK` W log and `LOAD LOCKED` status, audio uninterrupted; pause ->
+      LOAD works; OFF -> LOAD onto a playing deck as before; setting survives
+      a reboot.
+- [x] v294 Settings layout: DJ LINK + WIRELESS (P4 REMOTE) in one box
+      on the right under SYSTEM STATUS, DECK LOAD (LOAD LOCK, TEMPO/JOG/CUE
+      chips) under OUTPUT, MIXER STATUS as a bottom strip. Simulator
+      `settings_layout_check` and the `settings*` baselines are updated.
+- [ ] HIL v294 Settings: at 1024x600, touch LOAD LOCK, TEMPO, JOG and CUE
+      (DECK LOAD) and the P4 REMOTE and DJ LINK switches (network box), and
+      check that each one toggles.
 
 ### Phase 3: DDJ-400 Integration (planned, after Phase 2)
 

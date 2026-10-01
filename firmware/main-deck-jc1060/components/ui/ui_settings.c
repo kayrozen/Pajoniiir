@@ -138,6 +138,16 @@ static uint8_t jog_mode_toggle(void)
     return next;
 }
 
+/* v293: persisted LOAD LOCK, applied to deck_core at once (deck_load_lock.h). */
+static uint8_t load_lock_toggle(void)
+{
+    uint8_t next = app_settings_get().load_lock ? 0u : 1u;
+    app_settings_set_load_lock(next);
+    deck_core_set_load_lock(next != 0u);
+    ESP_LOGI(TAG, "Load lock saved: %s", next ? "ON (no LOAD onto a playing deck)" : "OFF");
+    return next;
+}
+
 static const char *tempo_range_name(uint8_t pct)
 {
     switch (pct) {
@@ -228,6 +238,7 @@ void ui_settings_djui_init(void)
     v->cue_mode = ui_settings_cue_mode_name(cfg.cue_mode);
     v->jog_cdj = cfg.jog_cdj_mode != 0u;
     v->tempo_range_pct = cfg.tempo_range_pct;
+    v->load_lock = cfg.load_lock != 0u;
     v->controller_name = s_djui_controller;
     v->sd_state = UI_DJUI_SD_CHECKING;
 
@@ -478,6 +489,9 @@ void ui_settings_djui_on_field(dj_field_t field)
         break;
     case DJ_F_MIX_TEMPO:
         v->tempo_range_pct = tempo_range_cycle();
+        break;
+    case DJ_F_LOAD_LOCK:
+        v->load_lock = load_lock_toggle() != 0u;
         break;
     default:
         break;   /* DJ_F_LOCAL: build-time route, nothing to toggle */

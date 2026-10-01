@@ -1354,6 +1354,53 @@ $tests = @(
         )
     },
     @{
+        Name = "deck_load_lock"
+        Dir = "tests/deck_load_lock"
+        Target = "test_deck_load_lock.exe"
+        Args = @(
+            "-Wall", "-Wextra", "-Wpedantic", "-std=c99",
+            "-I../../firmware/main-deck-jc1060/components/deck_core/include",
+            "-o", "test_deck_load_lock.exe",
+            "test_deck_load_lock.c",
+            "../../firmware/main-deck-jc1060/components/deck_core/deck_load_lock.c"
+        )
+    },
+    @{
+        Name = "deck_core_pfl_led_jc1060"
+        Dir = "tests/deck_core_pfl_led_jc1060"
+        Target = "test_deck_core_pfl_led_jc1060.exe"
+        Args = @(
+            "-Wall", "-Wextra", "-Wpedantic", "-Werror=implicit-function-declaration", "-std=c99",
+            "-Wno-unused-variable", "-Wno-unused-parameter",
+            "-DDECK_CORE_PC_TEST",
+            # Local stubs first: the deck_core_dual audio_engine fake plus the
+            # jc1060-only entry points.
+            "-Istubs",
+            "-I../deck_core_dual/stubs",
+            "-I../support/stubs",
+            "-I../../firmware/main-deck-jc1060/components/audio_engine/include",
+            "-I../../firmware/main-deck-jc1060/components/beat_jump/include",
+            "-I../../firmware/main-deck-jc1060/components/deck_core/include",
+            "-I../../firmware/main-deck-jc1060/components/control_link/include",
+            "-I../../firmware/main-deck-jc1060/components/hot_cue_store/include",
+            "-I../../firmware/main-deck-jc1060/components/library/include",
+            "-o", "test_deck_core_pfl_led_jc1060.exe",
+            "test_deck_core_pfl_led_jc1060.c",
+            "../deck_core_dual/control_link_stub.c",
+            "../deck_core_dual/hot_cue_store_stub.c",
+            "../deck_loaded_track_store/anlz_clone_stub.c",
+            "../../firmware/main-deck-jc1060/components/library/anlz_snapshot.c",
+            "../../firmware/main-deck-jc1060/components/beat_jump/beat_jump.c",
+            "../../firmware/main-deck-jc1060/components/control_link/flx4_led_snapshot.c",
+            "../../firmware/main-deck-jc1060/components/deck_core/deck_loaded_track_store.c",
+            "../../firmware/main-deck-jc1060/components/deck_core/deck_load_lock.c",
+            "../../firmware/main-deck-jc1060/components/deck_core/deck_cue_park.c",
+            "../../firmware/main-deck-jc1060/components/deck_core/deck_hot_cue_recall.c",
+            "../../firmware/main-deck-jc1060/components/deck_core/deck_jog_scrub.c",
+            "deck_core_test_snapshot_wrapper.c"
+        )
+    },
+    @{
         Name = "deck_jog_scrub"
         Dir = "tests/deck_jog_scrub"
         Target = "test_deck_jog_scrub.exe"

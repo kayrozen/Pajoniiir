@@ -121,6 +121,12 @@ deck_core_beat_jump_page_t deck_core_get_beat_jump_page(void);
 // bend, fine paused nudge). Any task may set it; the deck task reads it.
 void deck_core_set_jog_cdj_mode(bool on);
 bool deck_core_get_jog_cdj_mode(void);
+/* v293: LOAD LOCK (deck_load_lock.h). Off by default = load at any time.
+ * deck_core_load_allowed is lock-free (published snapshot + engine flags), so
+ * the LVGL, web and ui_load tasks may ask it; false for an invalid deck. */
+void deck_core_set_load_lock(bool on);
+bool deck_core_get_load_lock(void);
+bool deck_core_load_allowed(uint8_t deck);
 /* v275: tempo fader range (6/10/16 %, anything else -> 10) shared by both
  * decks; the faders are rescaled on the deck task. Shift+TEMPO RANGE cycles
  * it too, and the UI task persists whatever the getter returns. */

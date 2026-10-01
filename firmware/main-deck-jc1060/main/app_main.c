@@ -557,6 +557,7 @@ void app_main(void)
     deck_core_set_tempo_range_percent(settings.tempo_range_pct);
     ESP_ERROR_CHECK(deck_core_init(&ctrl_queue));
     deck_core_set_jog_cdj_mode(settings.jog_cdj_mode != 0u);
+    deck_core_set_load_lock(settings.load_lock != 0u);
 
     // ── UI ───────────────────────────────────────────────────────────────────
     /* v293: the stall probe is a diagnostics-build tool (UI_DIAGNOSTICS_ENABLED). */

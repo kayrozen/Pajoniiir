@@ -23,6 +23,7 @@ typedef struct {
     uint8_t dj_link_enable; // v246: 0 = Pioneer DJ Link observer off (default), 1 = on (Ethernet only)
     uint8_t jog_cdj_mode;   // v267: 0 = VINYL jog (default, touch scratch), 1 = CDJ jog (touch inert)
     uint8_t tempo_range_pct; // v275: deck tempo fader range +/-%: 6, 10 (default) or 16
+    uint8_t load_lock;      // v293: 0 = LOAD at any time (default), 1 = no LOAD onto a playing deck
 } app_settings_t;
 
 #define APP_SETTINGS_AUDIO_OUT_SPEAKER 0u
@@ -61,6 +62,8 @@ void app_settings_set_dj_link_enable(uint8_t on);
 // v267: jog mode, 0 = VINYL (default), 1 = CDJ (docs/JOG_MODES_VINYL_VS_CDJ.md).
 void app_settings_set_jog_cdj_mode(uint8_t on);
 void app_settings_set_tempo_range_pct(uint8_t pct);  // 6/10/16, anything else -> 10
+// v293: LOAD LOCK, 1 = refuse a track load onto a playing deck (deck_load_lock.h).
+void app_settings_set_load_lock(uint8_t on);
 
 /* ── Pull-OTA service network ─────────────────────────────────────────────
  *

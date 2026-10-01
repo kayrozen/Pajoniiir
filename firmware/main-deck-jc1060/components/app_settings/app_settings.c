@@ -37,6 +37,7 @@ static portMUX_TYPE s_cfg_mux = portMUX_INITIALIZER_UNLOCKED;
     .dj_link_enable = 0,                         \
     .jog_cdj_mode  = 0,                          \
     .tempo_range_pct = 10,                       \
+    .load_lock     = 0,                          \
 }
 
 static app_settings_t s_cfg = {
@@ -51,6 +52,7 @@ static app_settings_t s_cfg = {
     .dj_link_enable = 0,
     .jog_cdj_mode  = 0,
     .tempo_range_pct = 10,
+    .load_lock     = 0,
 };
 
 static char s_ota_ssid[APP_SETTINGS_OTA_SSID_CAP];
@@ -183,6 +185,7 @@ esp_err_t app_settings_init(void)
         if (nvs_get_u8(handle, "jog_cdj", &value) == ESP_OK && value <= 1) next.jog_cdj_mode = value;
         if (nvs_get_u8(handle, "tempo_rng", &value) == ESP_OK &&
             (value == 6 || value == 10 || value == 16)) next.tempo_range_pct = value;
+        if (nvs_get_u8(handle, "load_lock", &value) == ESP_OK && value <= 1) next.load_lock = value;
         load_ota_config(handle, ota_ssid, ota_pass, ota_url);
 
         uint8_t stored_schema = 0u;
@@ -198,14 +201,15 @@ esp_err_t app_settings_init(void)
     memcpy(s_ota_url, ota_url, sizeof(s_ota_url));
     portEXIT_CRITICAL(&s_cfg_mux);
 
-    ESP_LOGI(TAG, "loaded: audio_out=%s backlight=%u time_remain=%u cue_mode=%u master_trim=%u wifi_remote=%s dj_link=%s jog=%s tempo=+/-%u%%",
+    ESP_LOGI(TAG, "loaded: audio_out=%s backlight=%u time_remain=%u cue_mode=%u master_trim=%u wifi_remote=%s dj_link=%s jog=%s tempo=+/-%u%% load_lock=%s",
              next.audio_out == APP_SETTINGS_AUDIO_OUT_RCA ? "rca" : "speaker",
              next.backlight_pct, next.time_remain,
              next.cue_mode, next.master_trim_preset,
              next.wifi_remote ? "on" : "off",
              next.dj_link_enable ? "on" : "off",
              next.jog_cdj_mode ? "cdj" : "vinyl",
-             next.tempo_range_pct);
+             next.tempo_range_pct,
+             next.load_lock ? "on" : "off");
 
     return app_settings_start_backlight_worker();
 }
@@ -246,6 +250,7 @@ DEFINE_U8_SETTER(app_settings_set_dj_link_enable, dj_link_enable, "djlink_en", v
 DEFINE_U8_SETTER(app_settings_set_jog_cdj_mode, jog_cdj_mode, "jog_cdj", value = value ? 1 : 0)
 DEFINE_U8_SETTER(app_settings_set_tempo_range_pct, tempo_range_pct, "tempo_rng",
                  if (value != 6 && value != 16) value = 10)
+DEFINE_U8_SETTER(app_settings_set_load_lock, load_lock, "load_lock", value = value ? 1 : 0)
 
 /* ── Backlight: live now, persisted once the slider settles ──────────────── *
  *
