@@ -110,6 +110,7 @@ djlink_err_t djlink_status_parse(const uint8_t *buf, size_t len, djlink_status_t
     if (len >= 0x9f) {
         out->master_meaningful = buf[0x9e];
     }
+    out->master_handoff = len >= 0xa0 ? buf[0x9f] : 0xffu;
     if (len >= 0xa4) {
         out->beat = djlink_rd32(&buf[0xa0]);
     }
@@ -117,4 +118,63 @@ djlink_err_t djlink_status_parse(const uint8_t *buf, size_t len, djlink_status_t
         out->beat_in_bar = buf[0xa6];
     }
     return DJLINK_OK;
+}
+
+/* Build side of the same layout, nexus length (0xd4). Besides the parsed
+ * fields: 0x1f 0x01, 0x2a track type (0x01 rekordbox when a track is
+ * loaded), 0x7c firmware ("1.00"), 0x8b P2 (0x7a playing, 0x7e otherwise),
+ * 0x94 0x7fffffff, 0x98 / 0xc0 / 0xc4 pitch copies, 0x9d P3 (0 no track,
+ * 1 stopped, 9 playing), 0xa4 cue countdown
+ * 0x01ff (none), 0xc8 packet counter. Everything else stays 0. */
+static void wr16(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)(v >> 8);
+    p[1] = (uint8_t)v;
+}
+
+int djlink_status_build(const djlink_status_t *in, uint32_t packet_counter,
+                        uint8_t *out, size_t cap)
+{
+    if (in == NULL || out == NULL) {
+        return DJLINK_ERR_NULL;
+    }
+    if (cap < DJLINK_STATUS_PACKET_LEN) {
+        return DJLINK_ERR_BOUNDS;
+    }
+    const bool loaded = in->play_state != DJLINK_PLAY_NO_TRACK;
+    const bool playing = (in->flags & DJLINK_FLAG_PLAYING) != 0u;
+    memset(out, 0, DJLINK_STATUS_PACKET_LEN);
+    memcpy(out, DJLINK_MAGIC, DJLINK_MAGIC_LEN);
+    out[0x0a] = DJLINK_TYPE_CDJ_STATUS;
+    memcpy(&out[0x0b], in->name, DJLINK_NAME_LEN);
+    out[0x1f] = 0x01;
+    out[0x20] = 0x03;
+    out[0x21] = in->device_number;
+    wr16(&out[0x22], (uint16_t)(DJLINK_STATUS_PACKET_LEN - 0x24u));
+    out[0x24] = in->device_number;
+    wr16(&out[0x26], in->active ? 0x0001u : 0x0000u);
+    out[0x28] = in->source_device;
+    out[0x29] = in->source_slot;
+    out[0x2a] = loaded ? 0x01u : 0x00u;
+    djlink_wr32(&out[0x2c], in->rekordbox_id);
+    djlink_wr32(&out[0x78], in->play_state);
+    memcpy(&out[0x7c], "1.00", 4);
+    out[0x89] = in->flags;
+    out[0x8a] = 0xff;
+    out[0x8b] = playing ? 0x7au : 0x7eu;
+    djlink_wr32(&out[0x8c], (uint32_t)in->pitch_raw);
+    wr16(&out[0x90], 0x8000u);
+    wr16(&out[0x92], in->bpm100);
+    djlink_wr32(&out[0x94], 0x7fffffffu);
+    djlink_wr32(&out[0x98], (uint32_t)in->pitch_raw);
+    out[0x9d] = !loaded ? 0x00u : (playing ? 0x09u : 0x01u);
+    out[0x9e] = in->master_meaningful;
+    out[0x9f] = in->master_handoff ? in->master_handoff : 0xffu; /* 0 is no player */
+    djlink_wr32(&out[0xa0], in->beat);
+    wr16(&out[0xa4], 0x01ffu);
+    out[0xa6] = in->beat_in_bar;
+    djlink_wr32(&out[0xc0], (uint32_t)in->pitch_raw);
+    djlink_wr32(&out[0xc4], (uint32_t)in->pitch_raw);
+    djlink_wr32(&out[0xc8], packet_counter);
+    return (int)DJLINK_STATUS_PACKET_LEN;
 }

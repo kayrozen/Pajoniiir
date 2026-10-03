@@ -919,6 +919,7 @@ static void on_single_reply(djlink_nfs_t *c, const djlink_rpc_reply_t *rep, uint
             return;
         }
         c->size = attr.size;
+        c->attr = attr;
         begin_read(c, now_ms);
         return;
 

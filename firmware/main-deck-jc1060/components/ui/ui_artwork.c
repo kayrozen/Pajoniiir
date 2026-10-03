@@ -1,9 +1,11 @@
 #include "ui_artwork.h"
 #include "ui_artwork_thumb.h"
+#include "ui_artwork_jpeg.h"
 #include "dj_ui.h"
 
 #include "library.h"
 #include "media_io_gate.h"
+#include "sd_io_gate.h"
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -14,9 +16,11 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include <inttypes.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 /* dj_ui copies these buffers as its own square images. */
 _Static_assert(UI_ARTWORK_ROW_PX == DJ_ART_ROW_PX, "row thumbnail size");
@@ -32,6 +36,7 @@ static const char *TAG = "ui_artwork";
 #define UI_ARTWORK_CORE       1               /* audio tasks run on core 0 */
 #define UI_ARTWORK_PAUSE_MS   50
 #define UI_ARTWORK_GAP_MS     125             /* <= 8 reads+decodes/s: a page per second */
+#define UI_ARTWORK_PEER_DIR   "/sd/djlcache"  /* v300: DJ Link fetch covers, KEY.JPG */
 
 typedef enum { SLOT_EMPTY, SLOT_PENDING, SLOT_READY, SLOT_NONE } slot_state_t;
 typedef enum { RESULT_SKIPPED, RESULT_READY, RESULT_NONE } result_t;
@@ -79,32 +84,62 @@ static bool art_stale(const art_req_t *req)
     return !req->keep && req->epoch != atomic_load(&s_epoch);
 }
 
-/* Whole file, bounded gate intervals like the PDB reader. */
-static size_t art_read_file(const char *path)
+/* The USB stick (media_io_gate) or, for a DJ Link cover, the SD card. */
+static bool art_gate_begin(bool sd)
 {
+    if (sd) {
+        sd_io_gate_begin();
+        return true;
+    }
     media_io_gate_begin();
-    FILE *fp = media_io_gate_is_available() ? fopen(path, "rb") : NULL;
+    return media_io_gate_is_available();
+}
+
+static void art_gate_end(bool sd)
+{
+    if (sd) {
+        sd_io_gate_end();
+    } else {
+        media_io_gate_end();
+    }
+}
+
+/* Whole file, bounded gate intervals like the PDB reader. */
+static size_t art_read_file(const char *path, bool sd)
+{
+    FILE *fp = art_gate_begin(sd) ? fopen(path, "rb") : NULL;
     long size = fp && fseek(fp, 0, SEEK_END) == 0 ? ftell(fp) : -1;
-    media_io_gate_end();
+    art_gate_end(sd);
     if (!fp) return 0;
     size_t len = size > 0 && (size_t)size <= UI_ARTWORK_FILE_MAX ? (size_t)size : 0;
     for (size_t off = 0; off < len;) {
         size_t n = len - off > UI_ARTWORK_CHUNK ? UI_ARTWORK_CHUNK : len - off;
-        media_io_gate_begin();
-        bool ok = media_io_gate_is_available() &&
+        bool ok = art_gate_begin(sd) &&
                   fseek(fp, (long)off, SEEK_SET) == 0 &&
                   fread(s_file + off, 1, n, fp) == n;
-        media_io_gate_end();
+        art_gate_end(sd);
         if (!ok) {
             len = 0;
             break;
         }
         off += n;
     }
-    media_io_gate_begin();
+    (void)art_gate_begin(sd);
     fclose(fp);
-    media_io_gate_end();
+    art_gate_end(sd);
     return len;
+}
+
+/* v300: a track loaded from a DJ Link peer has no catalog row; its cover is
+ * the KEY.JPG the fetch saved in the SD cache. Absent = no artwork (logged, v302). */
+static bool art_peer_path(uint32_t key, char *path, size_t cap)
+{
+    snprintf(path, cap, UI_ARTWORK_PEER_DIR "/%08" PRIX32 ".JPG", key);
+    struct stat st;
+    sd_io_gate_begin();
+    bool found = stat(path, &st) == 0;
+    sd_io_gate_end();
+    return found;
 }
 
 /* Spaced reads: the stick is shared with the decks' audio streaming, and a
@@ -127,9 +162,20 @@ static result_t art_decode(const art_req_t *req)
     }
     if (art_stale(req)) return RESULT_SKIPPED;
     char path[LIBRARY_PATH_MAX];
-    if (!library_artwork_path_for_key(req->key, path, sizeof path)) return RESULT_NONE;
+    bool sd = false;
+    if (!library_artwork_path_for_key(req->key, path, sizeof path)) {
+        /* Only deck headers show peer tracks; the recorder owns the card. */
+        if (!req->keep || sd_io_gate_recorder_active()) {
+            return RESULT_NONE;
+        }
+        if (!art_peer_path(req->key, path, sizeof path)) {
+            ESP_LOGI(TAG, "track %08" PRIX32 ": no cover (catalog or %.48s)", req->key, path);
+            return RESULT_NONE;
+        }
+        sd = true;
+    }
     int64_t t0 = esp_timer_get_time();
-    size_t len = art_read_file(path);
+    size_t len = art_read_file(path, sd);
     int64_t t1 = esp_timer_get_time();
     s_last_read = xTaskGetTickCount();
     s_stage_read_us = (uint32_t)(t1 - t0);
@@ -140,7 +186,13 @@ static result_t art_decode(const art_req_t *req)
     bool ok = ui_artwork_thumb_decode(s_file, len, s_work, s_stage);
     s_stage_decode_us = (uint32_t)(esp_timer_get_time() - t1);
     if (!ok) {
-        ESP_LOGW(TAG, "track %u: JPEG not decodable (%u B)", (unsigned)req->key, (unsigned)len);
+        ui_artwork_jpeg_info_t why = ui_artwork_jpeg_probe(s_file, len);
+        ESP_LOGW(TAG, "track %u: JPEG not decodable (%u B, %ux%u SOF%02X, %u comp, "
+                 "sampling %02X/%02X/%02X: %s)",
+                 (unsigned)req->key, (unsigned)len, (unsigned)why.width, (unsigned)why.height,
+                 (unsigned)why.sof, (unsigned)why.components, (unsigned)why.sampling[0],
+                 (unsigned)why.sampling[1], (unsigned)why.sampling[2],
+                 ui_artwork_jpeg_verdict_name(why.verdict));
         return RESULT_NONE;
     }
     return RESULT_READY;
@@ -283,6 +335,15 @@ bool ui_artwork_poll(void)
     uint32_t poll_us = (uint32_t)(esp_timer_get_time() - start_us);
     if (poll_us > s_stats.poll_us_max) s_stats.poll_us_max = poll_us;
     return changed;
+}
+
+void ui_artwork_forget(uint32_t track_key)
+{
+    for (int i = 0; i < UI_ARTWORK_SLOTS; i++) {
+        art_slot_t *s = &s_slot[i];
+        /* A pending decode lands on its slot: it reads the file again. */
+        if (s->key == track_key && s->state != SLOT_PENDING) s->state = SLOT_EMPTY;
+    }
 }
 
 void ui_artwork_set_paused(bool paused)

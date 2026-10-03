@@ -59,6 +59,46 @@ bool sd_io_gate_recorder_active(void);
  * writer; bounded fast ops always proceed. */
 bool sd_io_gate_admit(sd_io_class_t op_class, bool recorder_active);
 
+/* v323: the SD/USB probes of the download-crackle HIL (v319-v323: these
+ * diag marks, the mix "PROBE sdio" classes, the isochronous cadence probe,
+ * the download write timings) only run in a diagnostics build, on the same
+ * switch as ui_diagnostics.h: idf.py -DPAJONIIIR_DIAGNOSTICS=1 build. */
+#ifndef UI_DIAGNOSTICS_ENABLED
+#define UI_DIAGNOSTICS_ENABLED 0
+#endif
+#define SD_IO_DIAG_ENABLED (UI_DIAGNOSTICS_ENABLED != 0)
+
+/* v319 DIAGNOSTIC (HIL of the download crackles): which SD transfer is in
+ * flight when the audio mix stalls. A writer (dj_link download) and a reader
+ * (deck loader page) mark their transfer with diag_begin / diag_end (task
+ * context, not the audio path); the mix asks diag_overlaps only for a
+ * stalled group, so a normal block pays nothing. Times are the low 32 bits
+ * of esp_timer_get_time() (us; wrap-safe differences). */
+typedef enum {
+    SD_IO_DIAG_WRITE = 0,
+    SD_IO_DIAG_READ,
+    SD_IO_DIAG_KINDS,
+} sd_io_diag_kind_t;
+
+extern uint32_t g_sd_io_diag_active[SD_IO_DIAG_KINDS];   /* transfers in flight */
+extern uint32_t g_sd_io_diag_end_us[SD_IO_DIAG_KINDS];   /* last transfer end */
+
+void sd_io_gate_diag_begin(sd_io_diag_kind_t kind);
+void sd_io_gate_diag_end(sd_io_diag_kind_t kind);
+
+/* A transfer of `kind` is in flight now, or ended at or after since_us. */
+static inline bool sd_io_gate_diag_overlaps(sd_io_diag_kind_t kind, uint32_t since_us)
+{
+    if (!SD_IO_DIAG_ENABLED) {
+        return false;
+    }
+    if (__atomic_load_n(&g_sd_io_diag_active[kind], __ATOMIC_RELAXED) != 0u) {
+        return true;
+    }
+    const uint32_t end = __atomic_load_n(&g_sd_io_diag_end_us[kind], __ATOMIC_RELAXED);
+    return (int32_t)(end - since_us) >= 0;
+}
+
 #ifdef __cplusplus
 }
 #endif

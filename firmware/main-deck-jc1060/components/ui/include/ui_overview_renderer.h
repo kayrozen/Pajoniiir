@@ -90,6 +90,22 @@ void ui_overview_renderer_draw_main_rgb565_column_span(uint16_t *pixels,
                                                        uint32_t loop_start_ms,
                                                        uint32_t loop_end_ms);
 
+/* v309: memory cue triangles (red, bottom edge) over a span already drawn
+ * by one of the column_span renderers, same geometry arguments. */
+void ui_overview_renderer_draw_memory_rgb565_column_span(uint16_t *pixels,
+                                                         int stride_px,
+                                                         int height_px,
+                                                         int dest_x_px,
+                                                         int logical_x_px,
+                                                         int column_count,
+                                                         int logical_width_px,
+                                                         uint32_t center_ms,
+                                                         uint32_t window_ms,
+                                                         const uint16_t *palette,
+                                                         size_t palette_count,
+                                                         const anlz_memory_cue_t *cues,
+                                                         uint8_t cue_count);
+
 /* v244: same as ..._column_span but the hot-cue markers come from `cues`
  * (merged local + ANLZ list) instead of meta->cues. */
 void ui_overview_renderer_draw_main_rgb565_column_span_cues(uint16_t *pixels,

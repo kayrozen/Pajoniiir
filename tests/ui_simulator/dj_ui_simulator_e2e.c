@@ -143,7 +143,7 @@ static void settings_layout_check(void)
         return;
     }
     /* Scoped lookups: the demo's CUE chip text also exists in OUTPUT. */
-    const char *deck_labels[] = { "DECK LOAD", "LOAD LOCK: OFF",
+    const char *deck_labels[] = { "DECK LOAD & SYNC", "LOAD LOCK: OFF", "LINK SYNC: OFF",
                                   "DECK SETUP", "TEMPO: +/-10%", "JOG: VINYL", "CUE: DDJ-400" };
     for (size_t k = 0; k < sizeof deck_labels / sizeof deck_labels[0]; k++) {
         if (!find_label_ex(deck_load, deck_labels[k], true, false)) {
@@ -251,6 +251,30 @@ static bool click_button(const char *text)
         return false;
     }
     return click_obj(label, text);
+}
+
+/* v307: visible lv_bar objects `w` px wide showing `value` (-1 = any). */
+static int count_bars(lv_obj_t *root, int32_t w, int32_t value)
+{
+    int n = 0;
+    if (lv_obj_check_type(root, &lv_bar_class) && lv_obj_is_visible(root) &&
+        lv_obj_get_width(root) == w && (value < 0 || lv_bar_get_value(root) == value)) {
+        n++;
+    }
+    for (uint32_t i = 0; i < lv_obj_get_child_count(root); i++) {
+        n += count_bars(lv_obj_get_child(root, (int32_t)i), w, value);
+    }
+    return n;
+}
+
+static void expect_bars(const char *what, int32_t w, int32_t value, int want)
+{
+    int n = count_bars(lv_screen_active(), w, value);
+    if (n != want) {
+        fprintf(stderr, "%s: %d visible %d px bars at %d, want %d\n", what, n, (int)w,
+                (int)value, want);
+        s_failures++;
+    }
 }
 
 static void expect_hidden_label(const char *text)
@@ -389,6 +413,7 @@ static void bridge_settings_scenario(void)
         .jog_cdj = true,
         .tempo_range_pct = 16,
         .load_lock = true,
+        .link_sync = true,
         .sd_state = UI_DJUI_SD_MOUNTED,
         .sd_free_bytes = 12ull * 1024 * 1024 * 1024 + 512ull * 1024 * 1024,
         .sd_total_bytes = 29ull * 1024 * 1024 * 1024,
@@ -422,8 +447,9 @@ static void bridge_settings_scenario(void)
     expect_label("CUE: SPLIT MONO");
     expect_label("JOG: CDJ");
     expect_label("TEMPO: +/-16%");
-    expect_label("DECK LOAD");
+    expect_label("DECK LOAD & SYNC");
     expect_label("LOAD LOCK: ON");
+    expect_label("LINK SYNC: ON");
     expect_label("Controller (USB1): Connected");
     expect_label("Mounted: 12.5 GB free / 29.0 GB");
     expect_label("SD Log: OK  95KB  drop 0");
@@ -684,7 +710,7 @@ static void bridge_library_scenario(void)
     /* Peer page shrinking under the selection, download running. */
     const dj_track_t peer[3] = {
         { .title = "Peer Track", .artist = "Peer Artist", .key = "", .bpm = 128, .len_ms = 240000,
-          .badge = "42%", .badge_tone = DJ_TONE_OK },
+          .badge = "42%", .badge_tone = DJ_TONE_OK, .has_progress = true, .progress = 42 },
         { .title = "Peer Meta", .artist = "Peer Artist", .key = "", .badge = "META",
           .badge_tone = DJ_TONE_MUTED, .bpm_text = "...", .time_text = "..." },
         { .title = "Peer No Tempo", .artist = "Peer Artist", .key = "", .len_ms = 180000,
@@ -705,6 +731,8 @@ static void bridge_library_scenario(void)
     expect_label("DECK 1+2");
     expect_label("ACTIVE");
     expect_label("USB CDJ-3000 #2  DOWNLOAD 42%     3 TRACKS     PAGE 1/1");
+    expect_bars("bridge: downloading row bar", 850, 42, 1);   /* v307: only that row */
+    expect_bars("bridge: row bars", 850, -1, 1);
     expect_hidden_label("Bridge Track B");
     expect_label("META");
     expect_label("...");
@@ -770,12 +798,14 @@ static void bridge_library_playlists_scenario(void)
 static anlz_beat_t s_ov_beats[640];
 static uint8_t s_ov_high[OV_DURATION_MS / 1000u * OV_HIGH_PER_S];
 static anlz_metadata_t s_ov_meta[DJ_DECKS];
+/* v313: rekordbox PWV4 colour preview (1200 x 6 bytes) for deck 1 */
+static uint8_t s_ov_color[1200 * 6];
 
 static void overview_fixture(void)
 {
-    /* 128 BPM grid, bar-phased */
+    /* 128 BPM grid, bar-phased: PQTZ beat numbers 1..4, beat 0 = downbeat */
     for (uint32_t i = 0; i < 640; i++) {
-        s_ov_beats[i] = (anlz_beat_t){ .beat_phase = (uint16_t)(i % 4), .bpm_x100 = 12800,
+        s_ov_beats[i] = (anlz_beat_t){ .beat_phase = (uint16_t)(i % 4 + 1), .bpm_x100 = 12800,
                                        .time_ms = 250 + i * 60000u / 128u };
     }
     for (uint32_t i = 0; i < sizeof s_ov_high; i++) {
@@ -798,6 +828,27 @@ static void overview_fixture(void)
     s_ov_meta[0].cue_count = 2;
     s_ov_meta[1].cues[0] = (anlz_cue_t){ ANLZ_CUE_SINGLE, 2, 31000, 0 };
     s_ov_meta[1].cue_count = 1;
+    /* v313: deck 1 has a colour preview: a bass (red) half, then a treble
+     * (blue) half, heights rising; deck 2 keeps its mono PWAV mini. */
+    for (uint32_t i = 0; i < 1200; i++) {
+        uint8_t *e = &s_ov_color[i * 6];
+        const bool bass = i < 600;
+        e[0] = (uint8_t)(20 + (i * 7 + (i / 37) * 11) % 60);
+        e[1] = 255;
+        e[2] = 20;
+        e[3] = bass ? 60 : 5;
+        e[4] = 15;
+        e[5] = bass ? 0 : 50;
+    }
+    s_ov_meta[0].color_preview = s_ov_color;
+    s_ov_meta[0].color_preview_len = sizeof s_ov_color;
+    /* v309: memory cues between beats, a memory loop on deck 1 */
+    s_ov_meta[0].memory_cues[0] = (anlz_memory_cue_t){ 59100, 0 };
+    s_ov_meta[0].memory_cues[1] = (anlz_memory_cue_t){ 64300, 65300 };
+    s_ov_meta[0].memory_cue_count = 2;
+    s_ov_meta[1].memory_cues[0] = (anlz_memory_cue_t){ 27600, 0 };
+    s_ov_meta[1].memory_cues[1] = (anlz_memory_cue_t){ 32400, 0 };
+    s_ov_meta[1].memory_cue_count = 2;
 }
 
 static void overview_deck(ui_djui_deck_view_t *v, uint8_t d, uint32_t pos_ms)
@@ -815,6 +866,7 @@ static void overview_deck(ui_djui_deck_view_t *v, uint8_t d, uint32_t pos_ms)
         .wave = ui_waveform_source_select(m, NULL, false), .meta = m,
         .center_ms = pos_ms, .window_ms = 8000,
         .cues = m->cues, .cue_count = m->cue_count,
+        .memory = m->memory_cues, .memory_count = m->memory_cue_count,
     };
     if (d == 0) {                     /* active loop, burned into the strip */
         v->loop_active = true;
@@ -1030,6 +1082,72 @@ static void bridge_direct_scenario(ui_djui_frame_t *f, uint32_t *p0, uint32_t *p
     free(cur);
 }
 
+/* v309: a memory cue triangle (CDJ red, base on the bottom row of the
+ * surface, tip h - 1 rows above it) within 2 px of the cue's x. outlined:
+ * the zoom one has a white base row and edges around a red inside. */
+static bool is_memory_red(uint32_t px)
+{
+    const uint32_t r = (px >> 16) & 0xffu, g = (px >> 8) & 0xffu, b = px & 0xffu;
+    return r >= 0xf0u && g <= 0x30u && b >= 0x30u && b <= 0x50u;
+}
+
+static bool is_white(uint32_t px)
+{
+    return ((px >> 16) & 0xffu) >= 0xe0u && ((px >> 8) & 0xffu) >= 0xe0u && (px & 0xffu) >= 0xe0u;
+}
+
+static bool memory_triangle_at(const lv_area_t *a, int32_t cx, int32_t half_w, int32_t h,
+                               bool outlined)
+{
+    if (cx - half_w < a->x1 || cx + half_w > a->x2) return false;
+    for (int32_t r = 0; r < h; r++) {
+        const uint32_t *row = s_framebuffer + (size_t)(a->y2 - r) * DISPLAY_WIDTH;
+        const int32_t half = half_w - r;
+        for (int32_t k = -half; k <= half; k++) {
+            const bool edge = r == 0 || k == -half || k == half;
+            const uint32_t px = row[cx + k];
+            if (outlined ? (edge ? !is_white(px) : !is_memory_red(px)) : !is_memory_red(px)) {
+                return false;
+            }
+        }
+        /* nothing of the marker beside its row */
+        if (r > 0 && (is_memory_red(row[cx - half - 1]) || is_memory_red(row[cx + half + 1]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void expect_memory_triangle(const char *what, uint8_t deck, dj_wave_t wave, uint32_t ms,
+                                   int32_t half_w, int32_t h, bool outlined)
+{
+    lv_area_t a;
+    int32_t x = 0;
+    if (!dj_ui_wave_get_area(deck, wave, &a) || !dj_ui_wave_ms_to_x(deck, wave, ms, &x)) {
+        fprintf(stderr, "%s: cue outside the surface\n", what);
+        s_failures++;
+        return;
+    }
+    for (int32_t dx = -2; dx <= 2; dx++) {
+        if (memory_triangle_at(&a, a.x1 + x + dx, half_w, h, outlined)) return;
+    }
+    fprintf(stderr, "%s: no memory cue triangle near x=%d\n", what, (int)(a.x1 + x));
+    s_failures++;
+}
+
+/* v313: the colour of the mini's bar at fraction `at` of the track (the row
+ * above its base line), 0 when the column is empty. */
+static uint32_t mini_bar_color(uint8_t deck, uint32_t ms)
+{
+    lv_area_t a;
+    int32_t x = 0;
+    if (!dj_ui_wave_get_area(deck, DJ_WAVE_MINI, &a) || !dj_ui_wave_ms_to_x(deck, DJ_WAVE_MINI, ms, &x)) {
+        return 0u;
+    }
+    /* well above the bottom-edge markers (memory cues, loop band) */
+    return s_framebuffer[(size_t)(a.y2 - 8) * DISPLAY_WIDTH + (size_t)(a.x1 + x)] & 0xffffffu;
+}
+
 static void bridge_overview_scenario(void)
 {
     overview_fixture();
@@ -1072,6 +1190,35 @@ static void bridge_overview_scenario(void)
     } else {
         expect_near("bridge D1 zoom playhead x", x, lv_area_get_width(&z) / 2, 1);
     }
+    /* v309: memory cues: burned into the zoom strips (11 px x 6 rows, white
+     * outline: unlike a plain red downbeat cap), drawn by dj_ui on the minis
+     * (7 x 4, red). */
+    lv_obj_invalidate(lv_screen_active());
+    lv_refr_now(s_display);
+    sim_post_refresh();
+    expect_memory_triangle("D1 zoom memory cue", 0, DJ_WAVE_ZOOM, 59100, 5, 6, true);
+    expect_memory_triangle("D1 zoom memory loop", 0, DJ_WAVE_ZOOM, 64300, 5, 6, true);
+    expect_memory_triangle("D2 zoom memory cue", 1, DJ_WAVE_ZOOM, 32400, 5, 6, true);
+    expect_memory_triangle("D1 mini memory cue", 0, DJ_WAVE_MINI, 59100, 3, 4, false);
+    /* v313: deck 1's mini takes the PWV4 colours (bass red, treble blue);
+     * deck 2, without PWV4, keeps its mono deck colour. */
+    {
+        const uint32_t bass = mini_bar_color(0, 40000), treble = mini_bar_color(0, 260000);
+        const uint32_t mono = mini_bar_color(1, 40000);
+        if (((bass >> 16) & 0xffu) < 0xe0u || (bass & 0xffu) > 0x20u) {
+            fprintf(stderr, "D1 mini: bass column not red (0x%06x)\n", (unsigned)bass);
+            s_failures++;
+        }
+        if ((treble & 0xffu) < 0xe0u || ((treble >> 16) & 0xffu) > 0x30u) {
+            fprintf(stderr, "D1 mini: treble column not blue (0x%06x)\n", (unsigned)treble);
+            s_failures++;
+        }
+        if (((mono >> 16) & 0xffu) < 0xd0u || ((mono >> 8) & 0xffu) < 0x80u) {
+            fprintf(stderr, "D2 mini: not the mono pink (0x%06x)\n", (unsigned)mono);
+            s_failures++;
+        }
+    }
+    expect_memory_triangle("D2 mini memory cue", 1, DJ_WAVE_MINI, 27600, 3, 4, false);
     capture("overview_bridge");
 
     /* v275: a tap on the footer time shows the elapsed time, per deck, and
@@ -1159,12 +1306,13 @@ static void bridge_overview_scenario(void)
  * every event LVGL derives from a tap (PRESSED, SHORT_CLICKED, CLICKED,
  * RELEASED) reaches the buttons. */
 static struct {
-    unsigned play, cue, mt, seek, hotcue;
+    unsigned play, cue, mt, seek, hotcue, sync;
     uint8_t deck;
 } s_tr;
 static void tr_on_play(uint8_t deck) { s_tr.play++; s_tr.deck = deck; }
 static void tr_on_cue(uint8_t deck) { s_tr.cue++; s_tr.deck = deck; }
 static void tr_on_mt(uint8_t deck) { s_tr.mt++; s_tr.deck = deck; }
+static void tr_on_sync(uint8_t deck) { s_tr.sync++; s_tr.deck = deck; }
 static void tr_on_seek(uint8_t deck, uint32_t pos_ms, dj_wave_t wave) { (void)pos_ms; (void)wave; s_tr.seek++; s_tr.deck = deck; }
 static void tr_on_hotcue(uint8_t deck, uint8_t index) { (void)index; s_tr.hotcue++; s_tr.deck = deck; }
 
@@ -1207,7 +1355,7 @@ static void bridge_transport_scenario(void)
 {
     static const dj_ui_callbacks_t cb = {
         .on_play = tr_on_play, .on_cue = tr_on_cue, .on_master_tempo = tr_on_mt,
-        .on_seek = tr_on_seek, .on_hotcue = tr_on_hotcue,
+        .on_seek = tr_on_seek, .on_hotcue = tr_on_hotcue, .on_sync = tr_on_sync,
     };
     dj_ui_set_callbacks(&cb);
     dj_ui_show_tab(DJ_TAB_OVERVIEW);
@@ -1227,6 +1375,7 @@ static void bridge_transport_scenario(void)
         f.deck[1].playing = (i / 7) % 2 == 0;
         f.deck[0].cue_point_ms = (i / 10) % 2 ? 60000 : p0;
         f.deck[0].master_tempo = (i / 8) % 2 == 0;
+        f.deck[0].sync = (dj_sync_t)((i / 6) % 4);
         f.deck[0].tempo_pct = (float)(i % 5) - 2.0f;
         ui_djui_bridge_update(&f);
         pump(16);
@@ -1248,6 +1397,15 @@ static void bridge_transport_scenario(void)
         tap_obj(mt, "MT");
         expect_transport("MT tap", 1, 1, 1, 0);
         if (s_tr.deck != 0) fail("transport: tap reported the wrong deck");
+    }
+    /* v304: SYNC is a plain tap; deck_core decides local vs DJ Link sync. */
+    lv_obj_t *sync = find_label_ex(lv_screen_active(), "SYNC", true, true);
+    if (!sync) {
+        fail("transport: D1 SYNC button not found");
+    } else {
+        tap_obj(sync, "SYNC");
+        if (s_tr.sync != 1 || s_tr.deck != 0) fail("transport: SYNC tap not reported for D1");
+        expect_transport("SYNC tap", 1, 1, 1, 0);
     }
 
     for (int i = 0; i < 20; i++) {
@@ -1801,6 +1959,27 @@ static void bridge_scenario(void)
     ui_djui_bridge_update(&f);
     pump(64);
     expect_hidden_label("Bridge Title");
+    expect_bars("bridge: no deck load bar", 336, -1, 0);
+
+    /* v307: a DJ Link download into deck 1: a thin bar under the footer
+     * title, dim while the peer's export.pdb is read, deck colour after. No
+     * pump: the clock-dependent captures behind must not move. */
+    dj_ui_show_tab(DJ_TAB_OVERVIEW);
+    f.deck[0].load_active = true;
+    f.deck[0].load_db = true;
+    ui_djui_bridge_update(&f);
+    lv_refr_now(s_display);
+    expect_bars("bridge: deck load bar, DB", 336, 0, 1);
+    f.deck[0].load_db = false;
+    f.deck[0].load_percent = 63;
+    ui_djui_bridge_update(&f);
+    lv_refr_now(s_display);
+    expect_bars("bridge: deck load bar", 336, 63, 1);
+    capture("overview_bridge_download");
+    f.deck[0].load_active = false;
+    ui_djui_bridge_update(&f);
+    lv_refr_now(s_display);
+    expect_bars("bridge: deck load bar done", 336, -1, 0);
 
     bridge_settings_scenario();
     bridge_hotcues_scenario();

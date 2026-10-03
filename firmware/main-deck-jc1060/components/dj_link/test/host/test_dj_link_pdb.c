@@ -296,6 +296,34 @@ static void test_cross_check(void)
     unlink(tmpl);
 }
 
+/* v303: the cached export.pdb is reused only while the peer serves the
+ * same file (size + mtime from the NFS GETATTR). */
+static void test_stamp(void)
+{
+    dj_link_pdb_stamp_t a = { true, 0x0a000002u, 2u, 81920u, 1700000000u, 0u };
+    dj_link_pdb_stamp_t b = a;
+    CHECK(dj_link_pdb_stamp_matches(&a, &b));
+    b.mtime_s++;                        /* edited at the source */
+    CHECK(!dj_link_pdb_stamp_matches(&a, &b));
+    b = a;
+    b.size += 4096u;                    /* a page added */
+    CHECK(!dj_link_pdb_stamp_matches(&a, &b));
+    b = a;
+    b.peer = 3u;
+    CHECK(!dj_link_pdb_stamp_matches(&a, &b));
+    b = a;
+    b.ip++;
+    CHECK(!dj_link_pdb_stamp_matches(&a, &b));
+    b = a;
+    a.valid = false;                    /* nothing cached */
+    CHECK(!dj_link_pdb_stamp_matches(&a, &b));
+    a.valid = true;
+    a.mtime_s = 0u;                     /* the server has no mtime */
+    b.mtime_s = 0u;
+    CHECK(!dj_link_pdb_stamp_matches(&a, &b));
+    CHECK(!dj_link_pdb_stamp_matches(NULL, &b));
+}
+
 static void test_extension(void)
 {
     char ext[8];
@@ -317,6 +345,7 @@ int main(void)
     test_errors();
     test_cross_check();
     test_extension();
+    test_stamp();
     if (failures == 0) {
         printf("all dj_link_pdb tests passed\n");
         return 0;

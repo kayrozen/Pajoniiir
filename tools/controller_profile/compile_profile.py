@@ -135,6 +135,9 @@ PAD_MODES = {
 EXT_ACTIONS = {
     "censor": 0, "sync_master": 1, "reloop_stop": 2, "loop_adjust_in": 3,
     "loop_adjust_out": 4, "quantize": 5, "sync_off": 6,
+    # v309, JC1060 deck_core only
+    "memory_call_prev": 7, "memory_call_next": 8, "memory_store": 9,
+    "memory_delete": 10,
 }
 
 # control_link.h LED ids

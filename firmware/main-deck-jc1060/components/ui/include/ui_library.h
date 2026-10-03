@@ -78,6 +78,8 @@ typedef struct {
                                 uint16_t bpm,
                                 uint32_t duration_ms);
     void (*set_deck_anlz)(uint8_t deck, const anlz_metadata_t *meta);
+    /* v307: a DJ Link track's artist, arrived after its load. Optional. */
+    void (*set_deck_artist)(uint8_t deck, const char *artist);
 } ui_library_actions_t;
 
 typedef struct {
@@ -115,5 +117,8 @@ void ui_library_djui_on_playlists(void);
 /* Catalog key of the local track the deck holds, for its thumbnail;
  * 0 = none or a DJ Link download. */
 uint32_t ui_library_deck_artwork_key(uint8_t deck);
+/* v307: a DJ Link download into the deck is running: its percent (0 while
+ * the peer's export.pdb is read, db = true then). False = none. */
+bool ui_library_deck_load_progress(uint8_t deck, uint8_t *percent, bool *db);
 
 #endif

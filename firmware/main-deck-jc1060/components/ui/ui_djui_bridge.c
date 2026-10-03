@@ -30,6 +30,9 @@ typedef struct {
     const uint8_t *wave_src;           /* waveform_low rendered into img */
     uint32_t wave_sum;                 /* cheap content check: same buffer, new track */
     int32_t wave_w;                    /* mini columns the PWAV preview spans (v271) */
+    const uint8_t *color_src;          /* v313: PWV4 rendered into img, NULL = mono */
+    uint32_t color_len;
+    uint32_t color_sum;                /* same buffer address, another track */
     uint16_t *px;
     int32_t w, h;
     lv_image_dsc_t img;
@@ -128,19 +131,32 @@ static int32_t mini_wave_w(const bridge_deck_t *b, const ui_djui_deck_view_t *v)
 /* Full-track mini waveform from the 400-column PWAV preview, bottom-anchored
  * like the legacy mini canvas, over the first wave_w columns. Runs on track
  * change only. */
-static void render_mini(uint8_t deck, const uint8_t *wave, int32_t wave_w)
+static void render_mini(uint8_t deck, const uint8_t *wave, int32_t wave_w,
+                        const uint8_t *color, uint32_t color_len)
 {
     bridge_deck_t *b = &s_deck[deck];
     if (!b->px) return;
     const uint16_t bg = rgb565(0x08090b), fg = rgb565(deck ? 0xee8fd0 : 0x4fd1a8);
+    /* v313: rekordbox's PWV4 colour preview when the track has one: column
+     * height from its byte 0 (scaled to the track's loudest), colour from
+     * its bass / mid / treble mix (anlz_color_preview_column). */
+    const uint8_t peak = color ? anlz_color_preview_peak(color, color_len) : 0u;
     for (int32_t x = 0; x < b->w; x++) {
         int32_t hh = 0;
-        if (wave && x < wave_w) {
+        uint16_t c = fg;
+        anlz_color_column_t cc;
+        if (peak && x < wave_w &&
+            anlz_color_preview_column(color, color_len, (uint32_t)x, (uint32_t)wave_w, &cc)) {
+            hh = cc.height * (b->h - 4) / peak;
+            if (cc.r | cc.g | cc.b) {
+                c = rgb565(((uint32_t)cc.r << 16) | ((uint32_t)cc.g << 8) | cc.b);
+            }
+        } else if (wave && x < wave_w) {
             int32_t col = x * UI_DJUI_WAVEFORM_LOW_LEN / wave_w;
             hh = (wave[col] & 0x1f) * (b->h - 4) / 31;
         }
         for (int32_t y = 0; y < b->h; y++) {
-            b->px[y * b->w + x] = (y >= b->h - 2 - hh && y < b->h - 2) ? fg : bg;
+            b->px[y * b->w + x] = (y >= b->h - 2 - hh && y < b->h - 2) ? c : bg;
         }
     }
     /* same descriptor, new pixels: drop and re-set so dj_ui invalidates */
@@ -243,7 +259,7 @@ bool ui_djui_bridge_create(lv_obj_t *parent)
             continue;
         }
         image_dsc(&b->img, b->px, b->w, b->h);
-        render_mini(d, NULL, b->w);
+        render_mini(d, NULL, b->w, NULL, 0u);
     }
     /* v287: the columns under the direct strips' markers: the armed-loop
      * shade spans at most half the view, the playhead and cue triangle a few */
@@ -309,8 +325,16 @@ static void update_deck(uint8_t d, const ui_djui_deck_view_t *v)
         dj_ui_set_transport(d, v->playing, false);
     }
     /* dj_ui drops unchanged values itself */
+    dj_ui_set_load_progress(d, v->load_active ? (int16_t)v->load_percent : -1, v->load_db);
     dj_ui_set_master_tempo(d, v->master_tempo);
+    dj_ui_set_sync(d, v->sync);
     dj_ui_set_cue_point(d, v->loaded && v->cue_point_set, v->cue_point_ms);
+    uint32_t memory_ms[DJ_MEMORY_CUES];
+    uint8_t memory_n = 0;
+    for (uint8_t i = 0; v->loaded && v->memory && i < v->memory_count && i < DJ_MEMORY_CUES; i++) {
+        memory_ms[memory_n++] = v->memory[i].start_ms;
+    }
+    dj_ui_set_memory_cues(d, memory_ms, memory_n);
     dj_ui_set_loop(d, v->loaded && v->loop_active, v->loop_start_ms, v->loop_end_ms);
     dj_ui_set_loop_armed(d, v->loaded && v->loop_armed, v->loop_armed_ms);
     dj_ui_set_beat(d, v->loaded && v->beat_valid, v->beat_phase, v->beat_downbeat);
@@ -326,12 +350,20 @@ static void update_deck(uint8_t d, const ui_djui_deck_view_t *v)
     const uint8_t *wave = v->loaded ? v->waveform_low : NULL;
     uint32_t sum = wave ? wave_sum(wave) : 0;
     int32_t wave_w = mini_wave_w(b, v);
-    if (!b->init || b->wave_src != wave || b->wave_sum != sum || b->wave_w != wave_w) {
+    const uint8_t *color = v->loaded && v->meta ? v->meta->color_preview : NULL;
+    const uint32_t color_len = color ? v->meta->color_preview_len : 0u;
+    uint32_t color_sum = 0u;
+    for (uint32_t i = 0; i < color_len; i++) color_sum = color_sum * 31u + color[i];
+    if (!b->init || b->wave_src != wave || b->wave_sum != sum || b->wave_w != wave_w ||
+        b->color_src != color || b->color_len != color_len || b->color_sum != color_sum) {
+        b->color_sum = color_sum;
         b->wave_src = wave;
         b->wave_sum = sum;
         b->wave_w = wave_w;
+        b->color_src = color;
+        b->color_len = color_len;
         int64_t t0 = bridge_now_us();
-        render_mini(d, wave, wave_w);
+        render_mini(d, wave, wave_w, color, color_len);
         s_perf.mini_renders++;
         perf_max(&s_perf.mini_us_max, t0);
     }
@@ -351,6 +383,7 @@ static bool strip_pending(bridge_deck_t *b, const ui_djui_deck_view_t *v, uint32
     ui_overview_wave_cache_t *c = &b->cache;
     ui_overview_wave_cache_set_loop(c, v->loop_active, v->loop_start_ms, v->loop_end_ms);
     ui_overview_wave_cache_set_cues(c, v->cues, v->cues ? v->cue_count : 0);
+    ui_overview_wave_cache_set_memory_cues(c, v->memory, v->memory ? v->memory_count : 0);
     return !c->valid || ui_overview_wave_cache_filling(c) || c->center_ms != center_ms || c->window_ms != v->window_ms ||
            c->duration_ms != wave_span_ms(v) || c->source_samples != v->wave.samples ||
            c->source_sample_count != v->wave.sample_count || c->source_kind != v->wave.kind;
@@ -845,6 +878,8 @@ void ui_djui_bridge_settings_update(const ui_djui_settings_view_t *v)
     field(DJ_F_MIX_JOG, v->jog_cdj ? "JOG: CDJ" : "JOG: VINYL", DJ_TONE_NORMAL);
     field(DJ_F_LOAD_LOCK, v->load_lock ? "LOAD LOCK: ON" : "LOAD LOCK: OFF",
           v->load_lock ? DJ_TONE_WARN : DJ_TONE_NORMAL);
+    field(DJ_F_LINK_SYNC, v->link_sync ? "LINK SYNC: ON" : "LINK SYNC: OFF",
+          v->link_sync ? DJ_TONE_INFO : DJ_TONE_NORMAL);
     snprintf(buf, sizeof buf, "TEMPO: +/-%u%%",
              (unsigned)(v->tempo_range_pct ? v->tempo_range_pct : 10u));
     field(DJ_F_MIX_TEMPO, buf, DJ_TONE_NORMAL);

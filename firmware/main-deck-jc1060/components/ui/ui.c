@@ -162,6 +162,15 @@ static void ui_deck_track_info_set(uint8_t deck,
     info->valid = true;
 }
 
+/* v307: a DJ Link track's artist, arrived after its load. */
+static void ui_deck_track_artist_set(uint8_t deck, const char *artist)
+{
+    ui_deck_track_info_t *info = &s_deck_track_info[ui_deck_index(deck)];
+    if (info->valid && artist && artist[0]) {
+        ui_copy_str(info->artist, sizeof(info->artist), artist);
+    }
+}
+
 /* Time base of the waveforms and the PVBR table: the Rekordbox analysis. */
 static uint32_t ui_deck_wave_span_ms(uint8_t deck)
 {
@@ -665,6 +674,7 @@ static void ui_djui_hotcues_update(const ui_frame_context_t *ctx)
 static void ui_djui_on_play(uint8_t deck);
 static void ui_djui_on_cue(uint8_t deck);
 static void ui_djui_on_master_tempo(uint8_t deck);
+static void ui_djui_on_sync(uint8_t deck);
 static void ui_djui_on_seek(uint8_t deck, uint32_t pos_ms, dj_wave_t wave);
 
 #if defined(CONFIG_UI_DJUI_DIRECT_STRIPS) && !defined(WIN32)
@@ -719,6 +729,7 @@ static esp_err_t ui_djui_init(void)
             .clear_deck_track_info = ui_deck_track_info_clear,
             .set_deck_track_info = ui_deck_track_info_set,
             .set_deck_anlz = ui_deck_anlz_set_from_current,
+            .set_deck_artist = ui_deck_track_artist_set,
         },
     };
     ui_library_init(&library_config);
@@ -752,6 +763,7 @@ static esp_err_t ui_djui_init(void)
         .on_play = ui_djui_on_play,
         .on_cue = ui_djui_on_cue,
         .on_master_tempo = ui_djui_on_master_tempo,
+        .on_sync = ui_djui_on_sync,
         .on_seek = ui_djui_on_seek,
         .on_fx_beat = ui_djui_on_fx_beat,
         .on_fx_toggle = ui_djui_on_fx_toggle,
@@ -786,10 +798,32 @@ static anlz_snapshot_t *s_djui_anlz[DECK_CORE_DECK_COUNT];
 static ui_position_interpolator_t s_djui_interp[DECK_CORE_DECK_COUNT];
 static ui_audible_position_t s_djui_audible[DECK_CORE_DECK_COUNT];
 static anlz_cue_t s_djui_cues[DECK_CORE_DECK_COUNT][ANLZ_MAX_CUES];
+static anlz_memory_cue_t s_djui_memory[DECK_CORE_DECK_COUNT][ANLZ_MAX_MEMORY_CUES];
 
 static void ui_djui_on_play(uint8_t deck) { ui_overview_action_play_pause(ui_deck_index(deck)); }
 static void ui_djui_on_cue(uint8_t deck) { ui_overview_action_cue(ui_deck_index(deck)); }
 static void ui_djui_on_master_tempo(uint8_t deck) { ui_overview_action_toggle_master_tempo(ui_deck_index(deck)); }
+/* v304: SYNC press + release through the deck queue, as from the controller,
+ * so LINK SYNC and local BEAT SYNC take the same deck_core path. */
+static void ui_djui_on_sync(uint8_t deck)
+{
+#ifndef WIN32
+    deck = ui_deck_index(deck);
+    ESP_LOGW(TAG, "touch D%u SYNC", (unsigned)deck + 1u);
+    ctrl_event_t ev = {
+        .type  = CTRL_EV_BUTTON,
+        .id    = ui_deck_control_id(deck, CTRL_ID_DECK1_SYNC, CTRL_ID_DECK2_SYNC),
+        .deck  = deck,
+        .value = 1,
+        .seq   = 0
+    };
+    deck_core_queue_event(&ev);
+    ev.value = 0;
+    deck_core_queue_event(&ev);
+#else
+    (void)deck;
+#endif
+}
 static void ui_djui_on_seek(uint8_t deck, uint32_t pos_ms, dj_wave_t wave)
 {
     ui_touch_seek(ui_deck_index(deck), pos_ms,
@@ -830,6 +864,10 @@ static void ui_djui_overview_deck(const ui_frame_context_t *ctx, uint8_t deck, u
     view->position_ms = position_ms;
     view->tempo_pct = (float)state->pitch_centipercent / 100.0f;
     view->master_tempo = state->master_tempo;
+    view->sync = !state->sync_enabled ? DJ_SYNC_OFF
+               : state->sync_net == DECK_NET_SYNC_OFF ? DJ_SYNC_LOCAL
+               : state->sync_net == DECK_NET_SYNC_LOCKED ? DJ_SYNC_LINK_LOCKED
+               : DJ_SYNC_LINK_WAIT;
     view->cue_point_set = view->duration_ms > 0 && state->cue_point_ms <= view->duration_ms;
     view->cue_point_ms = state->cue_point_ms;
     view->vu_peak = ctx->mixer_snapshot.deck_peak_display[deck];
@@ -870,6 +908,25 @@ static void ui_djui_overview_deck(const ui_frame_context_t *ctx, uint8_t deck, u
     bool has_store = deck_core_get_hot_cues(deck, &store);
     view->cue_count = ui_hot_cue_view_merge(has_store ? &store : NULL, meta, s_djui_cues[deck]);
     view->cues = s_djui_cues[deck];
+
+    /* v309: the deck's memory cues (with the MEMORY / DELETE edits); the
+     * analysis list until the deck actor has read them for this load. */
+    deck_core_memory_cues_t memory;
+    uint8_t memory_count = 0;
+    if (deck_core_get_memory_cues(deck, &memory)) {
+        for (uint8_t i = 0; i < memory.count && i < ANLZ_MAX_MEMORY_CUES; i++) {
+            s_djui_memory[deck][memory_count++] = (anlz_memory_cue_t){
+                .start_ms = memory.cues[i].pos_ms,
+                .end_ms = memory.cues[i].end_ms,
+            };
+        }
+    } else if (meta) {
+        memory_count = meta->memory_cue_count < ANLZ_MAX_MEMORY_CUES ? meta->memory_cue_count
+                                                                     : ANLZ_MAX_MEMORY_CUES;
+        memcpy(s_djui_memory[deck], meta->memory_cues, memory_count * sizeof(meta->memory_cues[0]));
+    }
+    view->memory = s_djui_memory[deck];
+    view->memory_count = memory_count;
 }
 
 static void ui_djui_update(const ui_frame_context_t *ctx)
@@ -895,6 +952,7 @@ static void ui_djui_update(const ui_frame_context_t *ctx)
         ui_djui_overview_deck(ctx, deck, view);
         view->art_key = view->loaded ? ui_library_deck_artwork_key(deck) : 0u;
         view->art = view->art_key ? ui_artwork_get(view->art_key, UI_ARTWORK_DECK) : NULL;
+        view->load_active = ui_library_deck_load_progress(deck, &view->load_percent, &view->load_db);
     }
     ui_step_lap(UI_STEP_DECK_VIEWS);
     char fx_name[12];

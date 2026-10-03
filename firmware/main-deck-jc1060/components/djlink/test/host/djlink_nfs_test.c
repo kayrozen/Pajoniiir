@@ -204,6 +204,8 @@ static void node_attr(const node_t *n, uint8_t out[DJLINK_NFS_FATTR_LEN])
     a.size = n->size;
     a.blocksize = 4096;
     a.fileid = n->id;
+    a.mtime_s = 1700000000u + n->id;     /* per-file stamp the client keeps */
+    a.mtime_us = 1000u * n->id;
     djlink_nfs_fattr_encode(&a, out);
 }
 
@@ -429,6 +431,8 @@ typedef struct {
     uint8_t *data;
     uint32_t cap;
     uint32_t size;       /* from open() */
+    uint32_t open_mtime_s;  /* client attr at open() (cache validation) */
+    uint32_t open_mtime_us;
     uint32_t written;
     int opens;
     int order_errors;
@@ -448,11 +452,15 @@ static int h_send(void *ctx, uint32_t ip, uint16_t port, const uint8_t *buf, siz
     return sendto(s->fd, buf, len, 0, (struct sockaddr *)&to, sizeof(to)) == (ssize_t)len ? 0 : -1;
 }
 
+static djlink_nfs_t s_client;
+
 static int h_open(void *ctx, uint32_t size)
 {
     sink_t *s = (sink_t *)ctx;
     s->opens++;
     s->size = size;
+    s->open_mtime_s = s_client.attr.mtime_s;
+    s->open_mtime_us = s_client.attr.mtime_us;
     return size > s->cap ? -1 : 0;
 }
 
@@ -478,7 +486,6 @@ static void h_progress(void *ctx, uint32_t done, uint32_t total)
     s->last_done = done;
 }
 
-static djlink_nfs_t s_client;
 static uint8_t s_window_buf[DJLINK_NFS_WINDOW_MAX * DJLINK_NFS_MAXDATA];
 
 static void base_cfg(djlink_nfs_fetch_cfg_t *cfg, const char *path)
@@ -739,6 +746,10 @@ static void test_small_fetch(sink_t *sink)
     CHECK_EQ(s_client.window, 1);
     CHECK_EQ(sink->opens, 1);
     CHECK_EQ(sink->size, 12288);
+    /* The file's LOOKUP attributes are there when the sink opens. */
+    CHECK_EQ(sink->open_mtime_s, 1700000004u);
+    CHECK_EQ(sink->open_mtime_us, 4000u);
+    CHECK_EQ(s_client.attr.size, 12288);
     CHECK_EQ(sink->order_errors, 0);
     CHECK_EQ(sink->progress_calls, 12);
     CHECK(content_ok(sink, 4, 12288));

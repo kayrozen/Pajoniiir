@@ -71,6 +71,9 @@ typedef struct {
     bool cues_set;
     uint8_t cue_count;
     anlz_cue_t cues[ANLZ_MAX_CUES];
+    /* v309: memory cue starts burned as bottom triangles (copied). */
+    uint8_t memory_count;
+    anlz_memory_cue_t memory[ANLZ_MAX_MEMORY_CUES];
     struct {
         uint32_t update_count[UI_OVERVIEW_WAVE_CACHE_KIND_COUNT];
         uint32_t total_columns_rendered;
@@ -132,6 +135,12 @@ void ui_overview_wave_cache_set_loop(ui_overview_wave_cache_t *cache,
 void ui_overview_wave_cache_set_cues(ui_overview_wave_cache_t *cache,
                                      const anlz_cue_t *cues,
                                      uint8_t cue_count);
+
+/* v309: set the memory cues burned on the main waveform (copied, at most
+ * ANLZ_MAX_MEMORY_CUES). A change invalidates the cache like set_cues. */
+void ui_overview_wave_cache_set_memory_cues(ui_overview_wave_cache_t *cache,
+                                            const anlz_memory_cue_t *cues,
+                                            uint8_t count);
 
 bool ui_overview_wave_cache_update(ui_overview_wave_cache_t *cache,
                                    const ui_waveform_source_t *source,

@@ -10,6 +10,8 @@
 #include "bsp_board_config.h"
 #include "bsp/sd.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "esp_memory_utils.h"
 #include "esp_check.h"
 #include "esp_idf_version.h"
 #include "driver/sdmmc_host.h"
@@ -36,6 +38,34 @@ static bool s_mounted = false;
 
 /* v233: failed mount attempts so far; retries skip the high-speed switch. */
 static int s_mount_failures = 0;
+
+/* v320: the SD driver's bounce buffer for transfers whose buffer is not
+ * DMA-aligned (sdmmc_read/write_sectors use host.dma_aligned_buffer before
+ * allocating). Without it every such transfer tried a fresh 8 KB internal
+ * DMA allocation, failed once internal DMA RAM fragmented ("[HEAP] alloc
+ * FAILED size=8192", v317-v319 HIL) and fell back to 4 KB pieces. Taken
+ * once, at the first mount (internal RAM still whole), kept for good:
+ * 8 KB = 16 sectors = unaligned_multi_block_rw_max_chunk_size. */
+#define BSP_SD_BOUNCE_BYTES 8192u
+static void *s_bounce;
+
+/* v322/v323: the card never DMAs to or from PSRAM. Every PSRAM buffer is
+ * reported unaligned, so sdmmc_read/write_sectors bounce it through s_bounce
+ * (internal RAM, 16 sectors per command). Since v318 the aligned download
+ * stage, loader pages and seek-table buffer went by direct DMA into PSRAM,
+ * and the USB-DWC DMA buffers are in PSRAM too
+ * (CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM); the isochronous OUT stream
+ * then stopped after a download in 4 of 5 boots (never in 11 before, never
+ * with this hook in the v322 A/B). Upstream main-deck-p4 keeps USB DMA in
+ * internal RAM and needs no such hook. See
+ * docs/validation/SD_USB_PSRAM_DMA_REPRO.md. */
+static bool bsp_sd_check_buffer_alignment(int slot, const void *buf, size_t size)
+{
+    if (esp_ptr_external_ram(buf)) {
+        return false;   /* bounce through internal RAM */
+    }
+    return sdmmc_host_check_buffer_alignment(slot, buf, size);
+}
 
 #if WORKAROUND_HOSTED_DOES_SDMMC_HOST_INIT
 /* The SDMMC host controller is already managed by ESP-Hosted. */
@@ -119,6 +149,21 @@ esp_err_t bsp_sd_mount(const char* mount_point, sdmmc_card_t** out_card)
         host.max_freq_khz = SDMMC_FREQ_DEFAULT;
     }
     host.pwr_ctrl_handle = s_ldo_handle;      /* IDF6: power control lives on the host */
+    if (!s_bounce) {
+        s_bounce = heap_caps_aligned_alloc(64u, BSP_SD_BOUNCE_BYTES,
+                                           MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (!s_bounce) {
+            ESP_LOGW(TAG, "no %u B SD bounce buffer: the driver allocates per transfer "
+                          "and aligned PSRAM buffers go by direct DMA",
+                     (unsigned)BSP_SD_BOUNCE_BYTES);
+        }
+    }
+    host.dma_aligned_buffer = s_bounce;
+    if (s_bounce) {
+        host.check_buffer_alignment = &bsp_sd_check_buffer_alignment;
+        ESP_LOGI(TAG, "no SD DMA to PSRAM (bounced via %u B internal)",
+                 (unsigned)BSP_SD_BOUNCE_BYTES);
+    }
 
 #if WORKAROUND_HOSTED_DOES_SDMMC_HOST_INIT
     /* ESP-Hosted (SDIO slot 1) has already initialised the SDMMC host

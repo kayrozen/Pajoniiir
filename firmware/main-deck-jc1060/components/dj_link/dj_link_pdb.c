@@ -300,3 +300,11 @@ void dj_link_pdb_extension(const char *path, char *out, size_t cap)
     }
     out[n] = '\0';
 }
+
+bool dj_link_pdb_stamp_matches(const dj_link_pdb_stamp_t *stamp, const dj_link_pdb_stamp_t *now)
+{
+    return stamp && now && stamp->valid && now->valid && stamp->ip == now->ip &&
+           stamp->peer == now->peer && stamp->size == now->size &&
+           (stamp->mtime_s != 0u || stamp->mtime_us != 0u) &&
+           stamp->mtime_s == now->mtime_s && stamp->mtime_us == now->mtime_us;
+}

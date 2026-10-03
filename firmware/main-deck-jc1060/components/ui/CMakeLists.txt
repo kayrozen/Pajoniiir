@@ -9,6 +9,7 @@ idf_component_register(
          "ui_lvgl_backend.c"
          "ui_controls.c"
          "ui_hot_cue_view.c"
+         "ui_peer_nav.c"
          "ui_deck_anlz_store.c"
          "ui_event_counter.c"
          "ui_overview_motion.c"
@@ -31,8 +32,9 @@ idf_component_register(
          "ui_djui_text.c"
          "ui_artwork.c"
          "ui_artwork_thumb.c"
+         "ui_artwork_jpeg.c"
     INCLUDE_DIRS "include"
-    REQUIRES log deck_core library bsp_jc4880 audio_engine audio_recorder service_log app_settings control_link firmware_health media_catalog hot_cue_store controller_profile_manager dj_link media_io_gate fatfs esp_lcd esp_lcd_touch esp_timer esp_driver_gpio esp_driver_ppa esp_mm idf::lvgl__lvgl
+    REQUIRES log deck_core library bsp_jc4880 audio_engine audio_recorder service_log app_settings control_link firmware_health media_catalog hot_cue_store controller_profile_manager dj_link media_io_gate sd_io_gate fatfs esp_lcd esp_lcd_touch esp_timer esp_driver_gpio esp_driver_ppa esp_mm idf::lvgl__lvgl
 )
 
 # JC1060P470C_I_W_Y: 1024x600 native landscape UI (same size as the

@@ -86,6 +86,22 @@ activation, before the first LED snapshot.
   is logged as `ctrl_profile: profile rejected: ...`. The pre-v232 file
   (6160 bytes, no raw type 8) still loads.
 
+### CUE/LOOP CALL : memory cues (v309)
+
+Le profil DDJ-400 ne suit plus la map FLX4 sur ces huit entrées. Après une
+copie du profil FLX4, il faut les remettre :
+
+| Note | Bouton | Action |
+|------|--------|--------|
+| `90/91 51` | CUE/LOOP CALL ◀ | `memory_call_prev` : memory cue précédente (dans une boucle active : moitié) |
+| `90/91 53` | CUE/LOOP CALL ▶ | `memory_call_next` : memory cue suivante (dans une boucle active : double) |
+| `90/91 3E` | SHIFT + CALL ◀ (DELETE) | `memory_delete` : supprime la memory cue sous la tête de lecture |
+| `90/91 3D` | SHIFT + CALL ▶ (MEMORY) | `memory_store` : mémorise la boucle active, sinon la position |
+
+Avant v309, ces notes déclenchaient loop halve / double et beat jump ∓. Le beat
+jump reste disponible en mode pads Beat Jump. Il faut un firmware v309 ou
+plus récent : les firmwares antérieurs ignorent les actions 7..10 (CALL ne fait alors plus rien).
+
 ## Hardware Identification
 
 - **Vendor ID**: `0x2B73` (Pioneer DJ)

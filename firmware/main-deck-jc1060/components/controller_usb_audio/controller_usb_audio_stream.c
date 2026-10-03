@@ -9,8 +9,10 @@
 #include "esp_cpu.h"
 #include "esp_log.h"
 #include "esp_memory_utils.h"
+#include "esp_timer.h"
 #include "flx4_uac_descriptors.h"
 #include "flx4_uac_packetizer.h"
+#include "sd_io_gate.h"
 
 /* v208: back to upstream 44.1 kHz. The DDJ-400 DAC runs at 44.1 kHz and its
  * observed alt 1/alt 2 descriptors list 44.1 kHz only
@@ -380,6 +382,19 @@ static uint32_t s_work_isoc_cycles;
 static uint32_t s_work_isoc_max_cycles;
 static uint32_t s_work_isoc_submit_cycles;
 
+/* v323 cadence probe (residual download crackles with every engine/UAC
+ * counter clean): completed URBs should arrive every
+ * STREAM_PACKETS_PER_TRANSFER ms. A longer gap means the resubmit came late
+ * and the bus queue (STREAM_TRANSFER_COUNT URBs) ran short. Late gaps are
+ * tagged with the SD transfer kind that overlapped them. Counters only,
+ * diagnostics builds only (SD_IO_DIAG_ENABLED). */
+#define STREAM_ISOC_LATE_US 6000u
+static uint32_t s_isoc_last_us;
+static uint32_t s_isoc_gap_max_us;
+static uint32_t s_isoc_late;
+static uint32_t s_isoc_late_wr;
+static uint32_t s_isoc_late_rd;
+
 static esp_err_t prepare_and_submit(usb_transfer_t *transfer)
 {
     const int index = transfer_index(transfer);
@@ -525,9 +540,40 @@ static void isoc_callback_body(usb_transfer_t *transfer)
     }
 }
 
+static void isoc_cadence_note(const usb_transfer_t *transfer)
+{
+    if (!SD_IO_DIAG_ENABLED) {
+        return;
+    }
+    const uint32_t now = (uint32_t)esp_timer_get_time();
+    if (!transfer || transfer->status != USB_TRANSFER_STATUS_COMPLETED) {
+        s_isoc_last_us = 0u;
+        return;
+    }
+    const uint32_t last = s_isoc_last_us;
+    s_isoc_last_us = now != 0u ? now : 1u;
+    if (last == 0u) {
+        return;
+    }
+    const uint32_t gap = now - last;
+    if (gap > __atomic_load_n(&s_isoc_gap_max_us, __ATOMIC_RELAXED)) {
+        __atomic_store_n(&s_isoc_gap_max_us, gap, __ATOMIC_RELAXED);
+    }
+    if (gap >= STREAM_ISOC_LATE_US) {
+        __atomic_add_fetch(&s_isoc_late, 1u, __ATOMIC_RELAXED);
+        if (sd_io_gate_diag_overlaps(SD_IO_DIAG_WRITE, last)) {
+            __atomic_add_fetch(&s_isoc_late_wr, 1u, __ATOMIC_RELAXED);
+        }
+        if (sd_io_gate_diag_overlaps(SD_IO_DIAG_READ, last)) {
+            __atomic_add_fetch(&s_isoc_late_rd, 1u, __ATOMIC_RELAXED);
+        }
+    }
+}
+
 static void isoc_callback(usb_transfer_t *transfer)
 {
     const uint32_t start = esp_cpu_get_cycle_count();
+    isoc_cadence_note(transfer);
     isoc_callback_body(transfer);
     const uint32_t spent = esp_cpu_get_cycle_count() - start;
     __atomic_add_fetch(&s_work_isoc_callbacks, 1u, __ATOMIC_RELAXED);
@@ -548,6 +594,17 @@ void controller_usb_audio_stream_get_work(uint32_t *callbacks,
                                       __ATOMIC_RELAXED);
     *submit_cycles = __atomic_load_n(&s_work_isoc_submit_cycles,
                                      __ATOMIC_RELAXED);
+}
+
+void controller_usb_audio_stream_take_cadence(uint32_t *gap_max_us,
+                                              uint32_t *late,
+                                              uint32_t *late_wr,
+                                              uint32_t *late_rd)
+{
+    *gap_max_us = __atomic_exchange_n(&s_isoc_gap_max_us, 0u, __ATOMIC_RELAXED);
+    *late = __atomic_exchange_n(&s_isoc_late, 0u, __ATOMIC_RELAXED);
+    *late_wr = __atomic_exchange_n(&s_isoc_late_wr, 0u, __ATOMIC_RELAXED);
+    *late_rd = __atomic_exchange_n(&s_isoc_late_rd, 0u, __ATOMIC_RELAXED);
 }
 
 static const char *step_name(uint8_t step)
@@ -742,6 +799,7 @@ static void prime_and_ready(void)
      * DMA reserve. Allocation here is only a fallback. */
     s_ready_tick = xTaskGetTickCount();
     s_isoc_done = 0u;
+    s_isoc_last_us = 0u;
     for (unsigned i = 0u; i < STREAM_TRANSFER_COUNT; ++i) {
         esp_err_t rc = ESP_OK;
         if (!s_isoc[i]) {

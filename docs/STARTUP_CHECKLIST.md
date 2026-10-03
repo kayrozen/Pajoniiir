@@ -891,6 +891,531 @@ phases 0-6 done, v293 removed the legacy widgets and
 - [ ] HIL v294 Settings: at 1024x600, touch LOAD LOCK, TEMPO, JOG and CUE
       (DECK LOAD) and the P4 REMOTE and DJ LINK switches (network box), and
       check that each one toggles.
+- [x] v297 DJ Link keep-alive peers: port-50000 0x06 from players and
+      rekordbox sources feed the peer table; rekordbox #17 is listed as a
+      collection source. LOAD from it resolves the file path with dbserver
+      0x2102 (no `export.pdb`) and downloads over NFS (portmap 50111,
+      export `/C/`). Host tests `test_keepalive_sources` and
+      `test_track_info_path`.
+- [ ] HIL v297 with vynull (Rekordbox mode, #17):
+      - Settings lists `#17 Vynull`, and the status no longer reads "no
+        players".
+      - Library SOURCE -> `RB Vynull #17` lists the collection.
+      - LOAD of a row downloads it into `/sd/djlcache` and plays it. A
+        second LOAD of the same row is a cache hit.
+      - Stopping vynull drops it within ~5 s, and the Library returns to
+        LOCAL USB.
+- [x] v298 DJ Link two players: deck 1 and deck 2 each claim a player
+      number (deck 2 after deck 1, never the same one) and broadcast a CDJ
+      status 0x0a every 200 ms (track source, rekordbox id, play state,
+      pitch, BPM, sync/master). A 0x19 load goes to the deck its byte 0x40
+      names. A 0x19 for another player's track (vynull collection) is
+      downloaded over NFS when that player is the browsed Library source.
+      The dbserver string length is in UTF-16 units (fixes vynull
+      `BAD REPLY`). Host tests `test_status_build`, `test_session_two_decks`,
+      `test_session_status`, plus the vynull menu-item capture in
+      `djlink_test2`.
+- [ ] HIL v298:
+      - Settings reads `ON P4+P3` (or the two numbers claimed).
+      - vynull's players grid lists two PAJONIIIR players. Each shows its
+        deck's title, BPM and play state, and follows PLAY/PAUSE, pitch and
+        load within about 0.5 s.
+      - SOURCE on vynull pointing at PAJONIIIR lists our tracks (no
+        `BAD REPLY`).
+      - With the Library browsing vynull, a load sent from vynull to either
+        player downloads and lands on that deck, and is refused while that
+        deck plays. With the Library on LOCAL USB, it is refused with
+        "source not browsed".
+      - With real CDJs and/or a DJM on the network, there is no number
+        conflict or kick-off, and both of our players stay listed.
+- [x] v300 DJ Link peer waveform: after the NFS download, the wave detail
+      (`0x2904`) and beat grid (`0x2204`) come from the browsed dbserver
+      and are written as `<key>.DAT` / `<key>.EXT` in `/sd/djlcache`. The
+      deck parses them like a local track. The artwork (`0x2003` →
+      `<key>.JPG`) is fetched the same way and shown through the
+      `ui_artwork` cache. Host tests `test_analysis_blobs`, `test_artwork`,
+      `test_dj_link_anlz`.
+- [ ] HIL v300 with vynull:
+      - A track loaded from vynull shows its overview and scrolling
+        waveform, a beat grid aligned with the audio, and the right
+        duration.
+      - The log shows `peer analysis: N beats, wave M`. A second LOAD of the
+        same track is a cache hit with the waveform, and no new dbserver
+        request.
+      - A track vynull has not analysed still loads (no waveform), with no
+        delay beyond the 10 s timeout.
+      - The deck header shows the cover of a vynull track that has one. The
+        log shows `artwork N B`. A track without a cover shows none and
+        produces no `ui_artwork` warning.
+      - With a real CDJ, check the 19-byte wave detail offset (see
+        `docs/DJ_LINK_SPEC.md` Phase 2c).
+- [x] v301 DJ Link beat and position emission. Each joined deck with a
+      track broadcasts on 50001:
+      - an absolute position `0x0b` every 30 ms;
+      - a beat `0x28` on each grid beat while it plays.
+
+      The CDJ status `0x0a` has been sent every 200 ms since v298. Host tests:
+      `test_report_beats`, `test_deck_playhead`, `test_session_position`,
+      `test_session_beat`.
+- [ ] HIL v301 with vynull and/or a CDJ/DJM:
+      - The playing deck's position follows the audio in vynull, with no
+        backward jumps.
+      - A paused deck holds its position.
+      - The beat counter or beat LEDs blink in time with the audible beat,
+        and bar 1 lands on the downbeat.
+      - After a seek, a loop or a scratch, there is no burst of beats.
+      - Wireshark on 50001: about 33 `0x0b` per second per deck, and one
+        `0x28` per beat.
+      - No audio dropouts and no change in UI fluidity with both decks
+        playing.
+- [x] v302 DJ Link peer seek table and artwork fixes:
+      - `audio_pvbr_build` plus the `<key>.VBR` sidecar;
+      - JPG fetched when the DAT is already cached;
+      - `ui_artwork_forget` on peer load;
+      - `ui_artwork_jpeg_probe` in the decode warning.
+
+      Host tests: `test_pvbr_build`, `test_plan` (became `test_commit`
+      in v303), `ui_artwork_jpeg_jc1060`.
+- [ ] HIL v302 with vynull:
+      - On first load of a VBR MP3 peer track, the log shows
+        `peer seek table built in N ms`. On a reload, the `.VBR` is read
+        (no new log).
+      - Cue, hot cue, loop and beat jump on that track: the audio matches
+        the waveform and grid at the landing point, with no drift that grows
+        after each seek.
+      - A track cached before v300 (DAT present, no JPG) gets its cover on
+        the next load: the log shows `artwork N B`.
+      - A track with a PNG-sourced cover logs `sampling 12/12/12: chroma
+        sampling` until vynull encodes `yuvj420p`.
+      - Measure by ear or on a click track the residual grid and waveform
+        offset (about 26 ms and 51 ms expected on vynull-analysed MP3s).
+
+- [x] v303 DJ Link source refresh: analysis and cues fetched on every
+      peer LOAD (`dj_link_anlz_commit`). Cue list `0x2b04` is written as
+      PCOB lists, with the cue origin tracked in `hot_cue_store`
+      (`hot_cue_store_merge_source`). `PEER.PDB` is checked against the
+      peer's NFS size and mtime (`dj_link_pdb_stamp_matches`).
+
+      Host tests:
+      - `test_cue_parse`, `test_cue_roundtrip`, `test_commit`;
+      - `test_cues` (empty reply plus a request chained from `io.blob`);
+      - `test_stamp`;
+      - `hot_cue_store_jc1060` merge tests;
+      - `djlink_nfs_test` attrs.
+- [ ] HIL v303 with vynull:
+      - Edit a track's beat grid in vynull, then reload it on the deck: the
+        log shows `analysis: ... refreshed` and the grid is the new one.
+      - Add, move or delete hot cues and the memory cue in vynull, then
+        reload: the pads and CUE follow. Pads set on the deck stay.
+      - A track whose cues were seeded before v303 keeps them until cleared
+        (shift+pad, shift+CUE); after that they follow the source.
+      - Stop vynull's dbserver mid-load on a cached track: it loads after
+        about 4 s at most with the cached analysis (`cache kept`).
+      - The cache-hit load time with vynull reachable is acceptable.
+      - CDJ / non-collection peer: a second LOAD logs `export.pdb
+        unchanged`. After re-exporting the stick, `export.pdb` is
+        downloaded again.
+
+- [x] v304 DJ Link network sync: `dj_link_table_beat_clock`, the
+      `beat_clock` hook, and `deck_net_sync.c` driven by the deck task
+      (pitch store plus bar-snap seek). Settings LINK SYNC (`dj_link_sync`,
+      default OFF), touch SYNC button, top-bar master beat.
+
+      Host tests: `deck_net_sync`, `test_beat_clock`,
+      `deck_core_pfl_led_jc1060`. The UI simulator baselines were updated
+      for the SYNC button and the DECK LOAD & SYNC box.
+- [ ] HIL v304 with vynull or a CDJ as master:
+      - With LINK SYNC OFF, SYNC behaves as before (local BEAT SYNC, blue).
+      - Top bar: the 4 master segments step with the master's beats, and
+        the downbeat is red.
+      - LINK SYNC ON, master playing, deck paused: SYNC turns amber, and
+        TEMPO shows the master's BPM against our grid. PLAY snaps to the
+        master's bar (log `DJ Link bar snap`), then the button turns green
+        within about 2 s (`LOCKED`).
+      - Two minutes playing: no audible drift against the master, and the
+        log does not alternate between `ALIGNING` and `LOCKED`.
+      - Jump on the master (seek, hot cue): a single re-snap after about
+        1 s. Stop the master: the deck keeps its tempo (amber).
+      - Touch the jog while locked: no snap during the hold, and the loop
+        locks again after release.
+      - Master at half/double tempo (over ±20 %): the button stays amber and
+        the tempo is unchanged.
+      - Measure the audible offset against the master (click track). It
+        sets the output-latency compensation to add.
+      - Moving the tempo fader or pressing SYNC again turns it OFF.
+      - No audio dropouts and no change in UI fluidity.
+- [x] v305 DJ Link tempo master and sync control. Codec Mh (`0x9f`),
+      `dj_link_master.c`, `2a` / `26` / `27` on port 50001,
+      `deck_core_net_command()`. Behind LINK SYNC (default OFF).
+
+      Host tests: `test_dj_link_master`, djlink codec,
+      `deck_core_pfl_led_jc1060`.
+- [ ] HIL v305 with a CDJ (or beat-link / vynull) and LINK SYNC ON:
+      - No master on the network, SYNC MASTER on deck 1: the log shows
+        `tempo master: deck 1 master`, and the CDJ shows the P4 player as
+        MASTER and SYNCs to it.
+      - CDJ is master, SYNC MASTER on deck 1: `26` is sent, the CDJ hands
+        over (Mh), and the log shows `requesting`, then `master`. The CDJ
+        drops its MASTER.
+      - The CDJ presses MASTER while the P4 is master: `tempo master
+        request from #n -> yielding`, our status shows Mh = n, then deck 1
+        loses SYNC MASTER (`drop master`).
+      - The CDJ never answers our `26`: after about 2 s, no master
+        (`idle`), and no new request until SYNC MASTER is pressed again.
+      - While the P4 is master, SYNC on deck 2 syncs locally to deck 1
+        (blue), not to the CDJ.
+      - `2a` sent with beat-link to our IP: SYNC on/off and MASTER land on
+        the only loaded deck, or the only playing one. With both decks
+        playing: `refused: ambiguous deck`.
+      - LINK SYNC OFF: as v304, and `26` / `2a` are logged as ignored.
+      - Never two masters on the network for more than about 3 s. No audio
+        dropouts.
+- [x] v306 Beat-grid downbeat on PQTZ beat number 1 (it was one beat
+      early). Host tests: `beatgrid_downbeat_jc1060`,
+      `test_dj_link_anlz`.
+- [ ] HIL v306:
+      - A vynull track whose downbeat was moved in vynull: the red
+        downbeat (zoom grid, overview, beat indicator) falls on vynull's
+        downbeat.
+      - Same check for a local rekordbox USB track.
+- [x] v307 DJ Link load: the artist comes from the metadata of the loaded
+      row (sent before the page), and a deck / row progress bar is shown
+      during a DJ Link download. Host tests: `test_dj_link_db` (vynull mock,
+      `test_pick_detail`). UI simulator baselines updated.
+- [ ] HIL v307:
+      - LOAD of a vynull track whose row is on the visible page: the deck
+        shows the vynull artist.
+      - Network load-track from vynull (row off the page, or Library on
+        another page): the deck shows the artist, at load or a moment after.
+      - Cached track loaded again: the artist is still shown.
+      - During the download, the deck footer bar fills (dim during
+        `READING DB`, deck colour during `DOWNLOAD`). The row bar fills
+        too. Both disappear when the deck loads, on CANCEL, and on error.
+      - No audio dropouts or UI stalls on the other playing deck during the
+        download.
+- [x] v308 DJ Link: deck 1 claims the lower player number and deck 2 the
+      next one above it (3/4 alone on the network); re-claims keep the
+      order. Host tests: `test_dj_link_state`
+      (`test_session_pair_numbers`, `test_session_two_decks`).
+- [ ] HIL v308:
+      - vynull alone: its players grid shows deck 1 as player 3 and deck 2
+        as player 4. Settings reads `ON P3+P4`.
+      - Load-track from vynull to player 3 loads deck 1; to player 4 loads
+        deck 2. The `load-track` log names the same deck.
+      - Reboot the P4 and toggle DJ LINK OFF/ON: the numbers are the same
+        (3/4).
+      - With a CDJ on 4 (or 3) already on the network: the decks take 2/3
+        (or 1/2), deck 1 still lower, and there are no number conflicts.
+- [x] v309 Memory cues: the analysis keeps up to 16 memory cues (USB
+      rekordbox and DJ Link peers). DDJ-400 CUE/LOOP CALL < / > calls the
+      previous / next one (inside an active loop it still halves / doubles
+      the loop). SHIFT + CALL > (MEMORY) stores the playhead or the active
+      loop. SHIFT + CALL < (DELETE) removes the cue at the playhead. The
+      cues show as red triangles on the bottom edge of the zoom and of the
+      overview. Host tests: `hot_cue_store_jc1060`,
+      `deck_memory_cue_jc1060`, `test_dj_link_anlz`; UI simulator baselines
+      updated. The DDJ-400 `profile.s3bin` was recompiled and must be
+      copied to the SD card.
+- [ ] HIL v309:
+      - Upload the new `controllers/pioneer_ddj_400/profile.s3bin` (Wi-Fi
+        Remote, overwrite) and check that the profile becomes active.
+      - Load a rekordbox USB track with several memory cues. The red
+        triangles match rekordbox's memory cues, on the zoom and on the
+        overview. The deck parks on the first one.
+      - CALL > / CALL < step through them, playing and paused. A memory loop
+        sets the loop. CUE then returns to the called cue.
+      - Inside an active loop CALL < / > still halve / double it.
+      - SHIFT + CALL > stores a cue; SHIFT + CALL < on a called cue deletes
+        it. Both survive an eject and a reload, and a reboot.
+      - A deleted rekordbox cue stays hidden after a reload. Storing it
+        again brings it back.
+      - Same checks with a vynull / DJ Link peer track.
+      - Beat jump still works from the Beat Jump pad mode (SHIFT + CALL no
+        longer jumps).
+      - No audio dropouts during CALL on the other playing deck.
+- [x] v310 DJ Link Library sort: on a DJ Link player's track list, SORT
+      ARTIST / NAME / BPM / KEY asks the player for that order. A first tap
+      sorts ascending, a second descending, a third goes back to the
+      player's order. Local USB sort and playlists are unchanged (no sort in
+      playlists). Host tests: `test_dj_link_db` (`test_sort_request`,
+      `test_row_index`, `test_next_sort`); UI simulator baselines unchanged.
+- [ ] HIL v310:
+      - SOURCE on vynull: SORT BPM lists by BPM ascending, the column lit
+        with the up arrow; a second tap descending (down arrow); a third
+        back to vynull's order, no column lit.
+      - Same for ARTIST, NAME and KEY. LOAD from a sorted list loads the
+        track on that row (title, artist and audio match).
+      - Metadata (BPM, time, artwork) still fills the visible page in both
+        directions.
+      - Back to LOCAL and to vynull again: vynull's own order.
+      - A sort tap during a download shows LOAD BUSY and changes nothing.
+- [x] v311 DJ Link playlists: on a DJ Link player, PLAYLISTS opens its
+      playlist root. A folder row opens the folder, a playlist row its
+      tracks (tap or LOAD), and the button goes back one level ("ALL TRACKS"
+      from the root, "BACK" deeper), giving the previous selection back.
+      Playlist tracks load like any peer track. There is no sort in
+      playlists. A new list (sort or level) is refused with DOWNLOAD BUSY
+      while a peer download runs. Host tests: `test_dj_link_db`
+      (`test_playlist_menus`), `ui_peer_nav_jc1060`; UI simulator baselines
+      unchanged.
+- [ ] HIL v311:
+      - SOURCE on vynull, PLAYLISTS: the root shows vynull's folders
+        (FOLDER) and playlists (PLAYLIST) in vynull's order; the button
+        reads ALL TRACKS.
+      - Open a folder, then a playlist: the header names it, the button
+        reads BACK, the tracks are in the playlist's order with BPM / time
+        filling in.
+      - LOAD a playlist track on deck 1 and deck 2: download and play as
+        from all tracks.
+      - BACK twice, then ALL TRACKS: each level comes back on the row it was
+        left on; all tracks keeps the sort set before (v310).
+      - A sort tap inside a playlist shows SORT: ALL TRACKS ONLY.
+      - During a download, PLAYLISTS / BACK / a sort show DOWNLOAD BUSY and
+        the download completes.
+      - A vynull network load-track of a track not in the playlist shown
+        is refused ("track not listed", as since v298).
+- [x] v312 Overview (mini waveform) of USB rekordbox tracks: built from
+      the PWV3 detail, as for a DJ Link peer track, instead of rekordbox's
+      PWAV, which is a low average (some tracks drew nearly flat). PWAV
+      stays the fallback without PWV3. Host test: `test_dj_link_anlz`
+      (`test_usb_preview_matches_peer`); UI simulator baselines unchanged.
+- [ ] HIL v312:
+      - The same track on deck 1 from the USB and on deck 2 from vynull:
+        both overviews have the same shape and height.
+      - A track whose overview was nearly flat on v311 now shows its
+        waveform. The playhead, cue and hot cue marks stay in place.
+      - A USB track without an .EXT (no PWV3) still shows its PWAV
+        overview.
+- [x] v313 Colour overview: a USB rekordbox track with a PWV4 colour
+      preview (.EXT) draws its mini waveform in rekordbox colours: height
+      from PWV4 byte 0, colour from the bass / mid / treble mix. Without
+      PWV4 the mini stays mono (v312 PWV3 preview, then PWAV). The track
+      cache is v7 (PWV4 kept). Host test: `test_dj_link_anlz`
+      (`test_color_preview`); UI simulator: colour checks on the deck 1
+      mini, three Overview baselines updated after visual review.
+- [ ] HIL v313:
+      - A rekordbox USB track: the mini shows red bass / orange-yellow mid
+        / blue-white treble sections, as on rekordbox's overview, on both
+        decks.
+      - Load the same track again (cache hit): same colours.
+      - A vynull track keeps the mono mini (no PWV4 over DJ Link yet;
+        v314 adds it).
+      - A USB without .EXT: mono mini, no error.
+      - No audio dropouts or UI stalls when a deck loads.
+- [x] v314 Colour mini for DJ Link tracks: the fetch job asks the peer
+      for the track's PWV4 (dbserver 0x2c04 'PWV4' / 'EXT', after the cue
+      list) and writes it into the cached .EXT after the PWV3. The deck
+      then draws the same colour mini as a USB track. A peer without PWV4
+      ("not found") keeps the mono mini. Host tests: `test_dj_link_db`
+      (`test_anlz_tag_pwv4`), `test_dj_link_anlz`
+      (`test_peer_color_preview`).
+- [ ] HIL v314:
+      - A vynull track from a rekordbox USB served by vynull: the
+        `fetch ... analysis` log shows `colour 7228 B` and the deck's mini
+        has the same colours as the same track loaded from our USB.
+      - A vynull track vynull analysed itself: colour mini from vynull's
+        own PWV4 (`colour ... B` > 0).
+      - A track loaded before v314 (analysis cached): the next load fetches
+        the analysis again and the mini turns colour.
+      - The download and the load time stay as before (one more request,
+        about 7 KB).
+- [x] v315 Network on CPU1 (Ethernet bring-up task pinned to CPU1,
+      `emac_rx` pinned, lwIP `tcpip` on CPU1): HIL showed no change in the
+      download crackles and the hypothesis was refuted; reverted in v316.
+      Kept from v315: the `[HEAP] alloc FAILED` hook prints at most one
+      line per second, with a count.
+- [x] v316 DIAGNOSTIC build (not for normal use): `dj_link.c`
+      `DJ_LINK_FETCH_DIAG_NO_SD_WRITE 1` (mode A: a peer track's audio is
+      received but never written to SD, and the fetch ends FAILED "DIAG:
+      NO SD WRITE"); `audio_engine.c` `AE_MIX_PROBE_ISOLATE 1` (probe B:
+      each block runs one scheduler-suspended group and one
+      interrupts-masked group, `susp@` / `irqoff@` in `PROBE worst`). Set
+      both back to 0 after the test.
+- [ ] HIL v316 (diagnostic):
+      - Deck 1 playing (any source), then load a vynull track that is NOT
+        already cached into deck 2: the log shows `DIAG mode A - ...
+        received, not written`, then `DIAG: NO SD WRITE`.
+      - Listen during the download and keep the HB / PROBE lines.
+      - In each `PROBE worst ... susp@S irqoff@I ... grp=...` line, note
+        whether the long groups (> 1 ms) include group I (interrupts
+        masked) or only other groups.
+      - Optional: the same with a normal browse of vynull (no download).
+      - Result (HIL v316): mode A (no SD write) left one crackle at the
+        download start, then clean audio: the download's SD writes cause
+        the crackles; the network side is sound.
+- [x] v317 DJ Link download written through a 4 KB internal DMA buffer:
+      each fetch gets an internal, DMA-capable, 64-byte aligned 4 KB
+      buffer; the temp file is unbuffered (no newlib PSRAM buffer); the
+      32 KB PSRAM stage goes out as 4 KB whole-sector writes, one per
+      sd_io_gate hold, with a 1-tick wait between them (dj_link task, CPU1,
+      prio 1). Without the buffer the fetch writes from PSRAM as before.
+      Both v316 diagnostic switches are back to 0. Syntax-checked; no host
+      test applies.
+- [ ] HIL v317:
+      - Deck 1 playing (from /sd/djlcache and from USB), download a vynull
+        track into deck 2: no crackles; HB at 187 blk/s, `behind` <= 5,
+        `PROBE worst` groups below ~0.5 ms during the download.
+      - The track loads and plays (the file is complete), as do its
+        analysis and artwork.
+      - `[HEAP] alloc FAILED size=8192` no longer appears during a
+        download.
+      - Download speed: compare with the v314/v315 figures (150-190 KB/s
+        with a deck playing, 220-440 KB/s idle).
+      - The one crackle at the download start seen in mode A: note whether
+        it is still there.
+      - Result (HIL v317): USB playback during a download much calmer, but
+        a burst at the start and at the end of each download, crackles
+        when the playing deck reads a /sd/djlcache track, and `[HEAP]
+        alloc FAILED size=8192` still there (now from SD reads).
+- [x] v318 SD transfers straight by DMA from 64-byte aligned PSRAM:
+      - download stage: 64 KB, aligned PSRAM, one fwrite per stage
+        (v317's 4 KB internal buffer removed: 8x fewer card writes);
+      - peer seek-table rebuild: aligned 32 KB buffer, reads from 4 KB file
+        offsets, unbuffered FILE, a tick between reads;
+      - deck loader cache (256 KB, `audio_engine.c`): aligned, unbuffered
+        FILE (load time only, not the decode loop);
+      - `[HEAP]` line: free / largest for the requested caps too (the
+        internal figure includes RTCRAM, which is not DMA-capable).
+      Syntax-checked. The seek-table reader was checked outside the suite:
+      same PVBR table as the old reader on a 23 MB synthetic VBR MP3.
+- [ ] HIL v318:
+      - Deck 1 playing a /sd/djlcache track, download a vynull track into
+        deck 2: no crackles during the download, nor at its end (seek
+        table). HB 187 blk/s, `behind` <= 5, `PROBE worst` groups below
+        ~1 ms.
+      - Same with deck 1 playing from USB; and two decks playing from
+        /sd/djlcache with no download.
+      - `[HEAP] alloc FAILED size=8192` gone during playback from SD and
+        during the seek-table build; if one remains, note its
+        `caps free / largest`.
+      - Downloaded tracks load and play; `peer seek table built in N ms`
+        stays in the 2-7 s range; seeking in a downloaded MP3 lands right.
+      - Note any burst at the download start and the log lines around it.
+      - Result (HIL v318): crackles remain with a deck playing from
+        /sd/djlcache during a download; `[HEAP]` 56 -> 2; seek-table
+        rebuild 1.3 s, no end burst noted.
+- [x] v319 DIAGNOSTIC (measurement only, no behaviour change):
+      - `sd_io_gate_diag_begin/_end/_overlaps`: a download write
+        (dj_link fwrite) and a deck page read (`ae_fw_cache_read_at`)
+        mark their transfer;
+      - the mix probe classifies every 16-frame group above 1 ms by the
+        transfer that overlapped it: `PROBE sdio long=N wr=n/us
+        rd=n/us both=n/us none=n/us` (worst group per class);
+      - dj_link logs `fetch ... SD writes (audio|analysis): N x avg B, avg
+        us, max us, N over 2 ms, gate wait max us`.
+- [ ] HIL v319: deck 1 playing a /sd/djlcache track, download a vynull
+      track into deck 2. Keep the `PROBE sdio`, `PROBE worst`, `diag
+      preload` and `fetch ... SD writes` lines. If time allows, the same
+      with deck 1 playing from USB.
+      - Result (HIL v319): stalled mix groups almost all `rd` (up to 53 of
+        55 in a window, worst 6.7 ms), a few `none`, `wr` about 0;
+        download fwrite 64 KB avg 28-33 ms, max 96-100 ms, gate wait max
+        43.6 ms; loader page reads up to 213 ms during a download.
+        Separately: after loading a /sd/djlcache track the USB audio output
+        drops to 34-41 blocks/s (UAC ring full, `over` climbing, no USB
+        error); also seen in two earlier boots (v318, v319).
+- [x] v320 Shorter SD transfers:
+      - deck loader: a 32 KB cache page is read in 4 x 8 KB freads
+        (`AE_FW_READ_PIECE`, same cache, pages and gate hold);
+      - download: the 64 KB stage is written in 16 KB writes with 10 ms
+        between them (`DJ_LINK_FETCH_WRITE_PIECE`, `_GAP_MS`);
+      - `bsp_sd.c`: an 8 KB internal DMA bounce buffer taken at the first
+        mount and passed as `host.dma_aligned_buffer` (no per-transfer
+        8 KB allocation).
+      The v319 measurement lines stay. Syntax-checked.
+- [ ] HIL v320:
+      - Deck playing /sd/djlcache, download into the other deck: no
+        crackles; `PROBE sdio` rd worst below ~1.7 ms; `fetch ... SD
+        writes` avg about 7-8 ms per 16 KB; `diag preload` max well below
+        213 ms.
+      - No `[HEAP] alloc FAILED size=8192` for the whole session.
+      - Downloads complete at their usual speed; tracks load and play.
+      - Note whether the 34 blocks/s output drop after a /sd/djlcache load
+        is still there (not addressed in v320).
+      - Not flashed: superseded by v321 after the root cause was found
+        upstream (esp-idf #19034).
+- [x] v321 SD card-busy wait without a CMD13 storm: new component
+      `sd_idle_wait` wraps `sdmmc_wait_for_idle` at link time
+      (`--wrap`, like `usb_storage`) and polls the card once per FreeRTOS
+      tick instead of back-to-back for 100 ms (p3a's variant of the
+      esp-idf #19034 fix). The v320 transfer splitting is removed: one
+      64 KB write(2) per download stage, one read(2) per 32 KB cache page
+      and per seek-table chunk (no stdio, no `_IONBF`). Kept: aligned
+      buffers (v318), the 8 KB SD bounce buffer (v320), the v319
+      measurement. dj_link logs `SD card busy waits: N, polls, max us,
+      timeouts` with each fetch's SD write line. Syntax-checked; the
+      `--wrap` redirection was checked on a host mock-up.
+- [ ] HIL v321:
+      - Boot, SD mount and the cached-track loads are normal.
+      - Deck playing /sd/djlcache, download into the other deck: no
+        crackles. HB 187 blk/s, `behind` <= 5, `PROBE sdio` long groups
+        rare and below ~1 ms, `PROBE worst` groups below ~1 ms.
+      - `SD card busy waits` line present (proves the wrap is linked), 0
+        timeouts; `fetch ... SD writes` avg / max close to the card busy
+        time.
+      - Same with deck playing from USB; and two decks on /sd/djlcache with
+        no download.
+      - Downloaded tracks load, play and seek; downloads at their usual
+        speed.
+      - Note whether the 34 blocks/s USB output drop after a /sd/djlcache
+        load is still there (separate issue).
+      - Result (HIL v321): no more crackles (card busy waits 265, 1640
+        polls, max 211 ms, 0 timeouts). The USB output still stops: from
+        about 63 s (end of a download, before the deck load at 65.5 s) the
+        UAC ring stays full (`uac_low=2048`), every block is rejected
+        (`drop` +500, `over` +128000 per window) and the engine paces down
+        to 34 blocks/s (4-period pace wait + 1 period). No USB error, no
+        fault.
+- [x] v322 A/B diagnostic (two changes, both reversible):
+      - `bsp_sd.c` `BSP_SD_DIAG_NO_PSRAM_DMA 1`: every PSRAM buffer is
+        reported unaligned to the SD driver (`host.check_buffer_alignment`),
+        so all SD transfers bounce through the 8 KB internal buffer; no SD
+        DMA to or from PSRAM. Boot log: `v322 A/B: no SD DMA to PSRAM`;
+      - `HB UAC` gains `isoc_cb=` (isochronous URB completions in the
+        window; 0 while streaming = the OUT stream stopped) and `bna=`
+        (BNA recoveries since boot).
+      Syntax-checked.
+- [ ] HIL v322: the same scenario as v321 (a deck playing, a vynull
+      download into the other deck, then its load), two or three times.
+      - Does the USB output stay at 187 blocks/s (`win` about 2664 ms,
+        ring not stuck at 2048)?
+      - `isoc_cb` per window before and after (normal about 2660 at 1 URB
+        per ms, to be confirmed on the first lines) and `bna`.
+      - No crackles back (`PROBE sdio`, HB `behind`).
+      - Downloads and loads still work (now bounced, slower writes).
+      - Result (HIL v322): no USB output stop, `isoc_cb` 632-702 per
+        window, 0 `[HEAP] alloc FAILED`, `behind` max 3, runway 82-93 KB.
+        Cause confirmed. Residual crackles, barely audible, with every
+        engine/UAC counter clean.
+- [x] v323: no-PSRAM SD DMA permanent (`bsp_sd.c`, switch removed, boot log
+      `no SD DMA to PSRAM (bounced via 8192 B internal)`); Espressif repro
+      draft `docs/validation/SD_USB_PSRAM_DMA_REPRO.md` (not published);
+      `HB UAC` gains `gap_max=…us late=… wr=… rd=…` (isochronous completion
+      cadence, gaps of 6 ms or more and their overlap with SD writes /
+      reads). Syntax-checked.
+- [ ] HIL v323: same scenario (a deck playing, two or three vynull
+      downloads into the other deck, then their loads).
+      - Boot log line `no SD DMA to PSRAM` present, no USB stop.
+      - `gap_max` idle vs during download (nominal ~4000 us); `late`, `wr`,
+        `rd` in the windows where a crackle is heard (note the time).
+      - Result (HIL v323): no crackle at all, 0 USB stop, 0 `[HEAP] alloc
+        FAILED`, `bna=0`, `gap_max` ~4000 us without `late`, runway full.
+        SD/USB saga closed, workaround permanent.
+      - Expected: `behind` 13-17 per window with `pace_wait` max 6.8 ms and
+        runway full (92 KB) during downloads (catch-up blocks after the
+        decode preload work; the ring absorbs them, not audible).
+- [x] v324: probes behind `idf.py -DPAJONIIIR_DIAGNOSTICS=1 build`
+      (`UI_DIAGNOSTICS_ENABLED`, `SD_IO_DIAG_ENABLED`): SD diag marks, `PROBE
+      sdio`, `HB isoc gap_max/late` (own line), download `SD writes` / `SD
+      card busy waits`. Every build keeps `HB UAC isoc_cb/bna` and the boot
+      line `no SD DMA to PSRAM`. Repro doc completed (esp-usb `cc65dc26`,
+      patches, ports); chip ECO still to read with `esptool.py chip_id`.
+      Syntax-checked with the switch at 0 and 1.
+- [ ] HIL v324 (production build, switch 0): no `PROBE sdio`, `HB isoc`,
+      `SD writes` lines; `HB UAC` still has `isoc_cb`/`bna`; playback during
+      a download stays clean (same as v323).
+- [ ] Before any Espressif issue: `esptool.py --port /dev/ttyUSB0 chip_id`
+      for the chip revision, then the operator's agreement.
 
 ### Phase 3: DDJ-400 Integration (planned, after Phase 2)
 

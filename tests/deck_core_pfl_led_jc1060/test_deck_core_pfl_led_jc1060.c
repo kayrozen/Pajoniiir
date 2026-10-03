@@ -134,11 +134,38 @@ static void test_second_pfl_press_turns_led_off(void)
     s_tests_run++;
 }
 
+/* v305: SYNC MASTER asked by the DJ Link network, applied like the button. */
+static void test_net_master_commands(void)
+{
+    reset_all();
+    deck_core_net_command(CTRL_DECK_2, DECK_CORE_NET_MASTER_TAKE);
+    assert(deck_core_get_deck_state(CTRL_DECK_2).sync_master);
+    assert(!deck_core_get_deck_state(CTRL_DECK_1).sync_master);
+
+    deck_core_net_command(CTRL_DECK_1, DECK_CORE_NET_MASTER_TAKE);
+    assert(deck_core_get_deck_state(CTRL_DECK_1).sync_master);
+    assert(!deck_core_get_deck_state(CTRL_DECK_2).sync_master);
+
+    /* Dropping a deck that is not master leaves the other alone. */
+    deck_core_net_command(CTRL_DECK_2, DECK_CORE_NET_MASTER_DROP);
+    assert(deck_core_get_deck_state(CTRL_DECK_1).sync_master);
+
+    deck_core_net_command(CTRL_DECK_1, DECK_CORE_NET_MASTER_DROP);
+    assert(!deck_core_get_deck_state(CTRL_DECK_1).sync_master);
+    assert(!deck_core_get_deck_state(CTRL_DECK_2).sync_master);
+
+    deck_core_net_command(CTRL_DECK_1, DECK_CORE_NET_SYNC_OFF);
+    assert(!deck_core_get_deck_state(CTRL_DECK_1).sync_enabled);
+    deck_core_net_command(DECK_CORE_DECK_COUNT, DECK_CORE_NET_MASTER_TAKE); /* ignored */
+    s_tests_run++;
+}
+
 int main(void)
 {
     test_pfl_press_lights_led_on_its_deck();
     test_pfl_release_leaves_led_alone();
     test_second_pfl_press_turns_led_off();
+    test_net_master_commands();
     printf("deck_core_pfl_led_jc1060: %d tests passed\n", s_tests_run);
     return 0;
 }

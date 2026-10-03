@@ -21,6 +21,8 @@
 #include "esp_netif.h"
 
 #include "dj_link_db.h"
+#include "dj_link_master.h"
+#include "dj_link_session.h"
 #include "dj_link_state.h"
 
 #ifdef __cplusplus
@@ -32,6 +34,15 @@ extern "C" {
 typedef struct {
     bool (*ip_ready)(void);          /* Ethernet has a DHCP lease */
     esp_netif_t *(*eth_netif)(void); /* Ethernet esp_netif, NULL if absent */
+    /* v304: the beat clock to sync to (dj_link_table_beat_clock), called from
+     * the dj_link task on every change, invalid when the master is lost or
+     * DJ Link stops. Must not block. NULL = not wanted. */
+    void (*beat_clock)(const dj_link_beat_clock_t *clock);
+    /* v305: a SYNC / SYNC MASTER change for deck 0/1 asked by the network
+     * (sync control 0x2a, tempo master handoff), called from the dj_link task
+     * while sync control is on. Must not block; deck_core decides. NULL = not
+     * wanted. */
+    void (*deck_command)(uint8_t deck, dj_link_deck_cmd_t cmd);
 } dj_link_config_t;
 
 /* Store the hooks. No task, no PCB, no allocation. Call once before
@@ -44,6 +55,12 @@ esp_err_t dj_link_init(const dj_link_config_t *config);
  * ~200 ms. Safe to call from the LVGL task. */
 esp_err_t dj_link_set_enabled(bool enable);
 
+/* v305: tempo master negotiation and sync control 0x2a (dj_link_master.h),
+ * with the LINK SYNC switch, off by default. Off, a deck's status shows
+ * master whenever its SYNC MASTER is set (v301 behaviour), and 0x2a / 0x26 /
+ * 0x27 are only logged. Any task may call it. */
+void dj_link_set_sync_control(bool on);
+
 /* Last published summary; state OFF when the task is not running. */
 void dj_link_get_summary(dj_link_summary_t *out);
 
@@ -51,11 +68,15 @@ void dj_link_get_summary(dj_link_summary_t *out);
  * LVGL task, which may block on the library; the dj_link task never does. */
 void dj_link_set_local_track_count(uint32_t count);
 
-/* A validated network load-track (0x19) for a track of our own USB. */
+/* A validated network load-track (0x19) for a track of our own USB or, v298,
+ * of another player's media. */
 typedef struct {
     uint32_t id;            /* handoff token for dj_link_finish_load_request() */
     uint32_t rekordbox_id;
     uint8_t  from_number;   /* player that sent the command */
+    int8_t   deck;          /* v298: deck whose player was named, -1 = UI picks */
+    uint8_t  source_number; /* v298: 0 = our USB, else the player holding it */
+    uint8_t  source_slot;   /* DJLINK_SLOT_* of source_number */
 } dj_link_load_request_t;
 
 /* ui_update() only. Takes the pending request, if any; the caller must then
@@ -63,6 +84,13 @@ typedef struct {
  * for accepted loads only; an untaken request is dropped after ~3 s. */
 bool dj_link_take_load_request(dj_link_load_request_t *out);
 void dj_link_finish_load_request(uint32_t id, bool accepted);
+
+/* v298: what deck `deck` (0/1) shows the network in its CDJ status. The LVGL
+ * task calls this with a copy of its own deck state; the dj_link task
+ * broadcasts the latest every DJ_LINK_STATUS_MS. v301: it stamps the report
+ * (stamp_ms) and extrapolates its playhead for the 0x0b position and 0x28
+ * beat packets. */
+void dj_link_set_deck_report(uint8_t deck, const dj_link_deck_report_t *report);
 
 /* v248 peer library browse. The LVGL task selects a player and reads a cache
  * the dj_link task fills from the peer's dbserver; no call here blocks on the
@@ -86,6 +114,10 @@ typedef struct {
     uint32_t count;             /* rows readable now (<= DJ_LINK_BROWSE_MAX_TRACKS) */
     uint32_t generation;
     uint32_t detail_seq;        /* bumps whenever a row gains metadata */
+    uint8_t  sort;              /* v310: DJ_LINK_DB_SORT_* of this list */
+    bool     sort_desc;         /* v310: reversed here; rows appear when listed */
+    uint8_t  menu;              /* v311: dj_link_db_menu_t of this list */
+    uint32_t menu_id;           /* v311: its folder / playlist id */
     char     error[32];
 } dj_link_browse_status_t;
 
@@ -93,11 +125,24 @@ typedef struct {
  * the current peer again restarts it (retry after FAILED). */
 void dj_link_browse_select(uint8_t peer);
 void dj_link_browse_get_status(dj_link_browse_status_t *out);
+/* v310: list the selected player's tracks again in this order
+ * (DJ_LINK_DB_SORT_*, the peer sorts; descending reverses the list here).
+ * New generation. A retry keeps the order; another player starts in its
+ * own order (DJ_LINK_DB_SORT_DEFAULT). */
+void dj_link_browse_set_sort(uint8_t sort, bool descending);
+/* v311: list the selected player's menu `menu` (folder / playlist `id`, see
+ * dj_link_db_menu_t), or all tracks again. New generation. Folders and
+ * playlists come in the player's order; all tracks keep the sort last set.
+ * Another player starts on all tracks. */
+void dj_link_browse_open(dj_link_db_menu_t menu, uint32_t id);
 /* Copy row `index` of `generation`; false if stale or not listed yet. */
 bool dj_link_browse_get_track(uint32_t generation, uint32_t index,
                               dj_link_peer_track_t *out);
 /* Rows [first, first + count) want duration / BPM (the visible page). */
 void dj_link_browse_want_details(uint32_t generation, uint32_t first, uint32_t count);
+/* v307: row `index` (still holding rekordbox_id) wants its metadata before
+ * the page: a track being loaded needs its artist wherever it is listed. */
+void dj_link_browse_want_detail_row(uint32_t generation, uint32_t index, uint32_t rekordbox_id);
 
 /* v249 peer track download. The dj_link task fetches the peer's export.pdb
  * over NFS (to find the file path of the rekordbox id), then the audio file,
@@ -131,9 +176,11 @@ typedef struct {
 
 /* Fetch track `rekordbox_id` from the USB of player `peer`. keep_keys (NULL
  * or two entries, 0 = none) name cached files that must survive the cache
- * pruning, e.g. the ones loaded on the decks. Returns the fetch id, or 0 if
- * dj_link is off or a fetch is already running. */
-uint32_t dj_link_fetch_start(uint8_t peer, uint32_t rekordbox_id, const uint32_t *keep_keys);
+ * pruning, e.g. the ones loaded on the decks. v300: artwork_id (from the
+ * listing, 0 = none) is fetched with the analysis into <key>.JPG. Returns
+ * the fetch id, or 0 if dj_link is off or a fetch is already running. */
+uint32_t dj_link_fetch_start(uint8_t peer, uint32_t rekordbox_id, uint32_t artwork_id,
+                             const uint32_t *keep_keys);
 /* Stop fetch `id` (no-op once it is over); the partial file is deleted. */
 void dj_link_fetch_cancel(uint32_t id);
 void dj_link_fetch_get_status(dj_link_fetch_status_t *out);

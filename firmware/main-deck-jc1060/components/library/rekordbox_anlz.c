@@ -451,7 +451,8 @@ static esp_err_t parse_pcob(FILE *fp, anlz_metadata_t *out)
  *   0x20  u32  time_ms (loop start for loops)
  *   0x24  u32  loop_time_ms (loop end; 0xffffffff for points)
  *
- * The earliest memory point or loop start wins, like CDJ auto-cue. A real
+ * The earliest memory point or loop start is the load cue, like CDJ
+ * auto-cue; v309 keeps the earliest 16 by time for CALL / the waveform. A real
  * hot-cue list replaces whatever parse_pcob() guessed; slot index is
  * hot_cue - 1 and the first entry for a slot wins. A PCPT
  * entry that does not fit its section ends the list without rejecting the
@@ -482,6 +483,33 @@ static void add_hot_cue(anlz_metadata_t *out, uint32_t hot_cue, uint8_t type,
     cue->end_ms   = loop ? loop_time_ms : 0u;
 }
 
+/* v309: insert by time, keeping the earliest ANLZ_MAX_MEMORY_CUES; an exact
+ * duplicate is dropped. The earliest is also the load cue (memory_cue_ms). */
+static void add_memory_cue(anlz_metadata_t *out, uint8_t type, uint32_t time_ms,
+                           uint32_t loop_time_ms)
+{
+    const bool loop = type == 2u && loop_time_ms != UINT32_MAX && loop_time_ms > time_ms;
+    const anlz_memory_cue_t cue = { .start_ms = time_ms, .end_ms = loop ? loop_time_ms : 0u };
+    uint8_t at = 0;
+    while (at < out->memory_cue_count && out->memory_cues[at].start_ms <= time_ms) {
+        if (out->memory_cues[at].start_ms == time_ms && out->memory_cues[at].end_ms == cue.end_ms) {
+            return;
+        }
+        at++;
+    }
+    if (at >= ANLZ_MAX_MEMORY_CUES) {
+        return;
+    }
+    uint8_t n = out->memory_cue_count < ANLZ_MAX_MEMORY_CUES ? out->memory_cue_count
+                                                             : ANLZ_MAX_MEMORY_CUES - 1u;
+    memmove(&out->memory_cues[at + 1u], &out->memory_cues[at],
+            (size_t)(n - at) * sizeof(out->memory_cues[0]));
+    out->memory_cues[at] = cue;
+    out->memory_cue_count = (uint8_t)(n + 1u);
+    out->memory_cue_ms = out->memory_cues[0].start_ms;
+    out->has_memory_cue = true;
+}
+
 static void read_pcob_list(FILE *fp, uint32_t pos, uint32_t header_size,
                                  uint32_t segment_size, anlz_metadata_t *out)
 {
@@ -499,6 +527,7 @@ static void read_pcob_list(FILE *fp, uint32_t pos, uint32_t header_size,
     } else if (list_type != ANLZ_PCOB_LIST_MEMORY) {
         return;
     }
+    out->has_cue_lists = true;
 
     const uint32_t end = pos + segment_size;
     uint32_t entry = pos + header_size;
@@ -523,10 +552,8 @@ static void read_pcob_list(FILE *fp, uint32_t pos, uint32_t header_size,
         }
         if (list_type == ANLZ_PCOB_LIST_HOT_CUES) {
             add_hot_cue(out, hot_cue, buf[0x1c], time_ms, loop_ms);
-        } else if (hot_cue == 0u && time_ms != UINT32_MAX &&
-            (!out->has_memory_cue || time_ms < out->memory_cue_ms)) {
-            out->memory_cue_ms = time_ms;
-            out->has_memory_cue = true;
+        } else if (hot_cue == 0u && time_ms != UINT32_MAX) {
+            add_memory_cue(out, buf[0x1c], time_ms, loop_ms);
         }
         entry += len;
     }
@@ -536,6 +563,9 @@ static esp_err_t parse_pcob_lists(FILE *fp, anlz_metadata_t *out)
 {
     out->has_memory_cue = false;
     out->memory_cue_ms = 0u;
+    out->has_cue_lists = false;
+    out->memory_cue_count = 0u;
+    memset(out->memory_cues, 0, sizeof(out->memory_cues));
 
     if (fseek(fp, 0, SEEK_END) != 0) return ESP_ERR_INVALID_SIZE;
     const long fsz = ftell(fp);
@@ -616,6 +646,50 @@ static esp_err_t parse_pwv3(FILE *fp, anlz_metadata_t *meta)
     return complete ? ESP_OK : ESP_FAIL;
 }
 
+/* ── PWV4 parser (v313) ──────────────────────────────────────────────────── *
+ *
+ * After the tag: header_size, segment_size, then u32 entry size (6) and u32
+ * entry count (1200) inside the header; the entries follow it. A section
+ * with another entry size is ignored (no colour preview).
+ */
+static esp_err_t parse_pwv4(FILE *fp, anlz_metadata_t *meta)
+{
+    uint32_t header_size  = read_be32(fp);
+    uint32_t segment_size = read_be32(fp);
+    if (segment_size < header_size || header_size < 20u) {
+        ANLZ_LOGW(TAG, "PWV4: bad sizes");
+        return ESP_ERR_INVALID_SIZE;
+    }
+    const uint32_t entry = read_be32(fp);
+    (void)read_be32(fp);                    /* entry count */
+    if (entry != ANLZ_COLOR_PREVIEW_ENTRY) {
+        ANLZ_LOGW(TAG, "PWV4: entry size %u, ignored", (unsigned)entry);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (fseek(fp, (long)(header_size - 20u), SEEK_CUR) != 0) return ESP_ERR_INVALID_ARG;
+    uint32_t data_len = segment_size - header_size;
+    if (data_len > ANLZ_COLOR_PREVIEW_MAX) data_len = ANLZ_COLOR_PREVIEW_MAX;
+    data_len -= data_len % ANLZ_COLOR_PREVIEW_ENTRY;
+    if (data_len == 0u) return ESP_ERR_INVALID_SIZE;
+
+    free(meta->color_preview);
+    meta->color_preview = NULL;
+    meta->color_preview_len = 0;
+    meta->color_preview = (uint8_t *)malloc(data_len);
+    if (!meta->color_preview) {
+        ANLZ_LOGE(TAG, "PWV4: malloc %u bytes failed", (unsigned)data_len);
+        return ESP_ERR_NO_MEM;
+    }
+    if (!anlz_read_exact(meta->color_preview, data_len, fp)) {
+        free(meta->color_preview);
+        meta->color_preview = NULL;
+        return ESP_FAIL;
+    }
+    meta->color_preview_len = data_len;
+    ANLZ_LOGI(TAG, "PWV4: %u bytes colour preview", (unsigned)data_len);
+    return ESP_OK;
+}
+
 /* ── Public API ───────────────────────────────────────────────────────────── *
  *
  * Parsing is transactional. Every section is walked and parsed into a temporary
@@ -649,6 +723,7 @@ static esp_err_t parse_one_strict(FILE *fp,
     case ANLZ_TAG_PWAV: rc = parse_pwav(fp, meta); break;
     case ANLZ_TAG_PCOB: rc = parse_pcob(fp, meta); break;
     case ANLZ_TAG_PWV3: rc = parse_pwv3(fp, meta); break;
+    case ANLZ_TAG_PWV4: rc = parse_pwv4(fp, meta); break;
     default: break;
     }
     if (s_anlz_short_read && rc == ESP_OK) rc = ESP_ERR_INVALID_SIZE;
@@ -729,6 +804,16 @@ esp_err_t anlz_parse_ext(const char *ext_path, anlz_metadata_t *meta)
         result = parse_one_strict(fp, ANLZ_TAG_PWV3, &next, &found);
         if (result == ESP_OK && !found) result = ESP_ERR_NOT_FOUND;
     }
+    if (result == ESP_OK) {
+        /* v313: the colour preview is optional; a bad one never costs the
+         * PWV3 (the overview falls back to it). */
+        bool found4 = false;
+        if (parse_one_strict(fp, ANLZ_TAG_PWV4, &next, &found4) != ESP_OK) {
+            free(next.color_preview);
+            next.color_preview = NULL;
+            next.color_preview_len = 0;
+        }
+    }
     fclose(fp);
 
     if (result != ESP_OK) {
@@ -743,6 +828,79 @@ esp_err_t anlz_parse_ext(const char *ext_path, anlz_metadata_t *meta)
     return ESP_OK;
 }
 
+bool anlz_color_preview_column(const uint8_t *preview, uint32_t len, uint32_t col,
+                               uint32_t cols, anlz_color_column_t *out)
+{
+    const uint32_t n = len / ANLZ_COLOR_PREVIEW_ENTRY;
+    if (!out || !preview || n == 0u || cols == 0u || col >= cols) {
+        return false;
+    }
+    uint32_t from = (uint32_t)((uint64_t)col * n / cols);
+    uint32_t to = (uint32_t)((uint64_t)(col + 1u) * n / cols);
+    if (to <= from) {
+        to = from + 1u;   /* fewer entries than columns */
+    }
+    uint8_t height = 0u;
+    uint32_t sum[3] = { 0u, 0u, 0u };
+    for (uint32_t i = from; i < to; i++) {
+        const uint8_t *e = &preview[i * ANLZ_COLOR_PREVIEW_ENTRY];
+        if (e[0] > height) {
+            height = e[0];
+        }
+        sum[0] += e[3];
+        sum[1] += e[4];
+        sum[2] += e[5];
+    }
+    uint32_t top = sum[0] > sum[1] ? sum[0] : sum[1];
+    if (sum[2] > top) {
+        top = sum[2];
+    }
+    out->height = height;
+    out->r = top ? (uint8_t)(sum[0] * 255u / top) : 0u;
+    out->g = top ? (uint8_t)(sum[1] * 255u / top) : 0u;
+    out->b = top ? (uint8_t)(sum[2] * 255u / top) : 0u;
+    return true;
+}
+
+uint8_t anlz_color_preview_peak(const uint8_t *preview, uint32_t len)
+{
+    uint8_t peak = 0u;
+    for (uint32_t i = 0; preview && i + ANLZ_COLOR_PREVIEW_ENTRY <= len;
+         i += ANLZ_COLOR_PREVIEW_ENTRY) {
+        if (preview[i] > peak) {
+            peak = preview[i];
+        }
+    }
+    return peak;
+}
+
+bool anlz_preview_from_high(const uint8_t *high, size_t len,
+                            uint8_t out[ANLZ_WAVEFORM_LOW_LEN])
+{
+    if (!out) {
+        return false;
+    }
+    memset(out, 0, ANLZ_WAVEFORM_LOW_LEN);
+    if (!high || len == 0u) {
+        return false;
+    }
+    for (size_t c = 0; c < ANLZ_WAVEFORM_LOW_LEN; c++) {
+        size_t from = c * len / ANLZ_WAVEFORM_LOW_LEN;
+        size_t to = (c + 1u) * len / ANLZ_WAVEFORM_LOW_LEN;
+        if (to <= from) {
+            to = from + 1u;   /* fewer entries than columns */
+        }
+        uint8_t best = high[from];
+        for (size_t i = from + 1u; i < to; i++) {
+            if ((high[i] & 0x1fu) > (best & 0x1fu)) {
+                best = high[i];
+            }
+        }
+        out[c] = best;
+    }
+    return true;
+}
+
 esp_err_t anlz_clone(const anlz_metadata_t *src, anlz_metadata_t *out)
 {
     if (!src || !out || src == out) {
@@ -753,6 +911,8 @@ esp_err_t anlz_clone(const anlz_metadata_t *src, anlz_metadata_t *out)
     *out = *src;
     out->beats = NULL;
     out->waveform_high = NULL;
+    out->color_preview = NULL;      /* v313 */
+    out->color_preview_len = 0u;
 
     if (src->beat_count > 0u) {
         if (!src->beats) {
@@ -781,6 +941,16 @@ esp_err_t anlz_clone(const anlz_metadata_t *src, anlz_metadata_t *out)
         }
         memcpy(out->waveform_high, src->waveform_high, src->waveform_high_len);
     }
+    if (src->color_preview && src->color_preview_len > 0u) {
+        out->color_preview = (uint8_t *)malloc(src->color_preview_len);
+        if (!out->color_preview) {
+            anlz_free(out);
+            memset(out, 0, sizeof(*out));
+            return ESP_ERR_NO_MEM;
+        }
+        memcpy(out->color_preview, src->color_preview, src->color_preview_len);
+        out->color_preview_len = src->color_preview_len;
+    }
     return ESP_OK;
 }
 
@@ -793,6 +963,9 @@ void anlz_free(anlz_metadata_t *meta)
         meta->beats      = NULL;
         meta->beat_count = 0;
     }
+    free(meta->color_preview);            /* v313 */
+    meta->color_preview     = NULL;
+    meta->color_preview_len = 0;
     if (meta->waveform_high) {
         free(meta->waveform_high);
         meta->waveform_high     = NULL;

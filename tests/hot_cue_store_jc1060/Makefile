@@ -4,7 +4,8 @@ CFLAGS  = -Wall -Wextra -Wpedantic -std=c99 \
            -I../../firmware/main-deck-jc1060/components/hot_cue_store/include
 
 SRCS    = test_hot_cue_store_jc1060.c \
-          ../../firmware/main-deck-jc1060/components/hot_cue_store/hot_cue_store.c
+          ../../firmware/main-deck-jc1060/components/hot_cue_store/hot_cue_store.c \
+          ../../firmware/main-deck-jc1060/components/hot_cue_store/hot_cue_store_merge.c
 
 TARGET  = test_hot_cue_store_jc1060
 

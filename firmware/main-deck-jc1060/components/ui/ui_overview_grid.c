@@ -21,7 +21,7 @@ size_t ui_overview_grid_build_columns(const anlz_beat_t *beats,
     int last_x = -min_spacing_px;
 
     for (uint16_t b = 0; b < beat_count; b++) {
-        if (beats[b].beat_phase != 0) {
+        if (!anlz_beat_is_downbeat(beats[b].beat_phase)) {
             continue;
         }
 
@@ -47,8 +47,8 @@ size_t ui_overview_grid_build_columns(const anlz_beat_t *beats,
 
 ui_overview_grid_style_t ui_overview_grid_style_for_phase(uint16_t beat_phase)
 {
-    if ((beat_phase % 4u) == 0u) {
-        /* Downbeat (every 4th beat): bright 2px line plus a small red triangle
+    if (anlz_beat_is_downbeat(beat_phase)) {
+        /* Downbeat (beat 1 of the bar): bright 2px line plus a small red triangle
          * marker at the cap edge (pointing into the waveform). */
         return (ui_overview_grid_style_t){
             .palette_index = 4,

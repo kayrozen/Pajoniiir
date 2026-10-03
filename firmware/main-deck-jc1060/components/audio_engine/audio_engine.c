@@ -75,6 +75,7 @@
 #else
 #   include "esp_log.h"
 #   include "esp_attr.h"
+#   include "sd_io_gate.h"     /* v319 diagnostic: SD transfer in flight */
 #endif
 
 /* v206: with CONFIG_SPIRAM_XIP_FROM_PSRAM every instruction is fetched from
@@ -91,6 +92,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <sys/types.h>
+#include <unistd.h>          /* v321: lseek/read for cache pages */
 #if AE_PC
 #   include <time.h>
 #endif
@@ -3041,12 +3044,28 @@ static size_t ae_fw_cache_read_at(void *ctx, size_t offset,
     FILE *src = fw ? (FILE *)fw->source : NULL;
     if (!src || !dst || bytes == 0u || offset >= fw->file_size) return 0u;
     media_io_gate_begin();
-    if (!media_io_gate_is_available() || fseek(src, (long)offset, SEEK_SET) != 0) {
+    /* v321: the page is read with read(2) on the file's descriptor, straight
+     * into the 64-byte aligned page (v318): FATFS moves its whole sectors by
+     * DMA into PSRAM, no stdio buffer in between. The SD card-busy stalls of
+     * v314-v320 came from the IDF CMD13 poll storm (esp-idf #19034), now
+     * yielding (sd_idle_wait), so the page goes in one read again. */
+    const int fd = fileno(src);
+    if (!media_io_gate_is_available() || fd < 0 ||
+        lseek(fd, (off_t)offset, SEEK_SET) != (off_t)offset) {
         media_io_gate_end();
         return 0u;
     }
     int64_t started = esp_timer_get_time();
-    size_t got = fread(dst, 1u, bytes, src);
+    size_t got = 0u;
+    sd_io_gate_diag_begin(SD_IO_DIAG_READ);   /* v319: also /usb reads */
+    while (got < bytes) {
+        const ssize_t n = read(fd, (uint8_t *)dst + got, bytes - got);
+        if (n <= 0) {
+            break;
+        }
+        got += (size_t)n;
+    }
+    sd_io_gate_diag_end(SD_IO_DIAG_READ);
     uint32_t elapsed = (uint32_t)(esp_timer_get_time() - started);
     media_io_gate_end();
     ae_diag_record_preload_chunk((uint8_t)(fw - s_fw_preloads), elapsed,
@@ -3089,8 +3108,13 @@ static void ae_loader_task(void *arg)
         goto park;
     }
 
-    uint8_t *storage = heap_caps_malloc(AUDIO_FW_CACHE_BYTES,
-                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    /* v318: 64-byte aligned (the P4 cache line), so every 32 KB page read
+     * DMAs straight from the card into PSRAM. Unaligned, the IDF SD driver
+     * bounced each page through internal RAM in 4 KB pieces (8+ card
+     * transactions per page, "[HEAP] alloc FAILED size=8192" per read).
+     * Load time only, outside the decode loop; freed with heap_caps_free. */
+    uint8_t *storage = heap_caps_aligned_alloc(64u, AUDIO_FW_CACHE_BYTES,
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!storage) {
         media_io_gate_begin();
         fclose(src);
@@ -3975,6 +3999,10 @@ static inline void ae_output_note_uac_write(esp_err_t rc)
     if (rc != ESP_OK) s_hb.uac_write_fail++;
 }
 
+/* v319 diagnostic: a 16-frame group normally takes ~60-90 us; above this it
+ * lost the CPU or stalled, and is classified by the SD transfer in flight. */
+#define AE_PROBE_LONG_GROUP_US 1000u
+
 /* Per-group timing conditions, see ae_mix_probe_block_end(). */
 enum {
     AE_PROBE_NORM = 0,
@@ -4004,6 +4032,14 @@ typedef struct {
     uint8_t worst_susp_group;
     uint8_t worst_irq_group;
     uint32_t worst_deck_modes[AUDIO_ENGINE_DECK_COUNT];
+    /* v319 diagnostic: groups longer than AE_PROBE_LONG_GROUP_US, by the
+     * SD transfer that overlapped them (sd_io_gate_diag_overlaps). */
+    uint32_t long_groups;
+    uint32_t long_write;            /* a download write, no deck read */
+    uint32_t long_read;             /* a deck page read, no write */
+    uint32_t long_both;
+    uint32_t long_none;
+    uint32_t long_max_us[4];        /* worst group per class: wr, rd, both, none */
 } ae_mix_probe_t;
 
 static ae_mix_probe_t s_mix_probe;
@@ -4138,6 +4174,7 @@ static inline AE_RT_ATTR void ae_mix_probe_block_begin(const audio_output_mixer_
  * 0 = every group runs normally; susp/irqoff then only label group slots and
  * read like norm. Masking CPU0 interrupts delays the USB ISR if it lands on
  * CPU0, so production builds should use 0 once the spike source is known. */
+/* v316 used 1 (probe B) for the download-crackle HIL; v317 back to 0. */
 #define AE_MIX_PROBE_ISOLATE 0
 
 static inline AE_RT_ATTR void ae_mix_probe_group_begin(uint32_t group)
@@ -4161,7 +4198,25 @@ static inline AE_RT_ATTR void ae_mix_probe_group_end(uint32_t group)
     if (group == s_mix_probe.susp_group) (void)xTaskResumeAll();
 #endif
     if (group < AE_MIX_GROUPS) {
-        s_mix_probe.group_us[group] = (uint32_t)(t1 - s_mix_probe.t0_us);
+        const uint32_t us = (uint32_t)(t1 - s_mix_probe.t0_us);
+        s_mix_probe.group_us[group] = us;
+#if !defined(AUDIO_ENGINE_PC_TEST)
+        /* v319 diagnostic: only a stalled group looks at the SD transfers
+         * (two atomic reads each); a normal group pays one compare.
+         * v323: diagnostics builds only (SD_IO_DIAG_ENABLED). */
+        if (SD_IO_DIAG_ENABLED && us > AE_PROBE_LONG_GROUP_US) {
+            const uint32_t since = (uint32_t)s_mix_probe.t0_us;
+            const bool wr = sd_io_gate_diag_overlaps(SD_IO_DIAG_WRITE, since);
+            const bool rd = sd_io_gate_diag_overlaps(SD_IO_DIAG_READ, since);
+            const uint32_t cls = wr && rd ? 2u : wr ? 0u : rd ? 1u : 3u;
+            s_mix_probe.long_groups++;
+            if (cls == 0u) s_mix_probe.long_write++;
+            else if (cls == 1u) s_mix_probe.long_read++;
+            else if (cls == 2u) s_mix_probe.long_both++;
+            else s_mix_probe.long_none++;
+            if (us > s_mix_probe.long_max_us[cls]) s_mix_probe.long_max_us[cls] = us;
+        }
+#endif
     }
 }
 
@@ -4222,6 +4277,16 @@ static void ae_mix_probe_report_print(const ae_mix_probe_t *p)
                  (unsigned)w[8], (unsigned)w[9], (unsigned)w[10], (unsigned)w[11],
                  (unsigned)w[12], (unsigned)w[13], (unsigned)w[14], (unsigned)w[15]);
     }
+    /* v319 diagnostic: stalled groups (> 1 ms) by the SD transfer in flight,
+     * with the worst group of each class. */
+    if (p->long_groups) {
+        ESP_LOGI(TAG, "PROBE sdio long=%u wr=%u/%uus rd=%u/%uus both=%u/%uus none=%u/%uus",
+                 (unsigned)p->long_groups,
+                 (unsigned)p->long_write, (unsigned)p->long_max_us[0],
+                 (unsigned)p->long_read, (unsigned)p->long_max_us[1],
+                 (unsigned)p->long_both, (unsigned)p->long_max_us[2],
+                 (unsigned)p->long_none, (unsigned)p->long_max_us[3]);
+    }
 }
 
 static void ae_mix_probe_window_reset(void)
@@ -4234,11 +4299,25 @@ static void ae_mix_probe_window_reset(void)
 
 /* v230: runs in ae_log only. Reads the UAC/limiter counters and resets the
  * per-window cumulative bases here, off the output path. */
+/* v322 diagnostic: BNA recoveries of the USB-DWC channel decoder wrap
+ * (usb_storage, WHOLE_ARCHIVE). Weak so audio_engine needs no dependency. */
+extern uint32_t usb_dwc_compat_bna_recovered_count(void) __attribute__((weak));
+
 static void ae_hb_report_print(const ae_hb_report_t *r)
 {
     const ae_output_heartbeat_t *hb = &r->hb;
     controller_usb_host_audio_stats_t uac = { 0 };
     controller_usb_host_get_audio_stats(&uac);
+    /* v322: isochronous URB completions in this window (0 while streaming =
+     * the OUT stream stopped, the SD/USB PSRAM DMA failure of v318-v321),
+     * BNA recoveries since boot. Kept in every build: counters only. */
+    static uint32_t s_isoc_cb_base;
+    controller_usb_host_work_t work = { 0 };
+    controller_usb_host_get_work(&work);
+    const uint32_t isoc_cb = work.isoc_callbacks - s_isoc_cb_base;
+    s_isoc_cb_base = work.isoc_callbacks;
+    const uint32_t bna = usb_dwc_compat_bna_recovered_count
+                             ? usb_dwc_compat_bna_recovered_count() : 0u;
     /* v215: cumulative MAIN soft-limiter activity (knee 30000) next to the
      * UAC slip/loss counters, to tell engine saturation from USB damage. */
     audio_mixer_limiter_stats_t lim;
@@ -4246,7 +4325,7 @@ static void ae_hb_report_print(const ae_hb_report_t *r)
     ESP_LOGI(TAG, "HB UAC rc=0x%x fail=%u/%u claimed=%d cfg=%d streaming=%d "
              "faulted=%d epoch=%u cfg_fail=%u xfer_fail=%u pkt_fail=%u "
              "sub=%u drop=%u ring=%u/%u under=%u over=%u trim=%u dup=%u "
-             "lost=%u lim=%u peak=%d",
+             "lost=%u lim=%u peak=%d isoc_cb=%u bna=%u",
              (unsigned)hb->last_uac_rc, (unsigned)hb->uac_write_fail,
              (unsigned)(hb->active + hb->idle),
              uac.claimed ? 1 : 0, uac.configuring ? 1 : 0,
@@ -4259,7 +4338,18 @@ static void ae_hb_report_print(const ae_hb_report_t *r)
              (unsigned)uac.clock_trimmed_frames,
              (unsigned)uac.clock_duplicated_frames,
              (unsigned)uac.packet_lost_frames,
-             (unsigned)lim.limited_samples, (int)lim.peak_input_abs);
+             (unsigned)lim.limited_samples, (int)lim.peak_input_abs,
+             (unsigned)isoc_cb, (unsigned)bna);
+    /* v323 diagnostics build: longest isoc completion gap and late (>= 6 ms)
+     * completions, tagged by overlapping SD write / read. */
+    if (SD_IO_DIAG_ENABLED) {
+        uint32_t gap_max_us = 0u, late = 0u, late_wr = 0u, late_rd = 0u;
+        controller_usb_host_take_isoc_cadence(&gap_max_us, &late, &late_wr,
+                                              &late_rd);
+        ESP_LOGI(TAG, "HB isoc gap_max=%uus late=%u wr=%u rd=%u",
+                 (unsigned)gap_max_us, (unsigned)late, (unsigned)late_wr,
+                 (unsigned)late_rd);
+    }
 
     uint32_t window_ms = r->window_ms;
     uint32_t blocks = hb->active + hb->idle;

@@ -192,6 +192,13 @@ typedef enum {
     CTRL_DECK_EXT_ACTION_LOOP_ADJUST_OUT,
     CTRL_DECK_EXT_ACTION_QUANTIZE,
     CTRL_DECK_EXT_ACTION_SYNC_OFF,
+    /* v309 (JC1060): CUE/LOOP CALL. Prev/next call a memory cue, or halve /
+     * double an active loop; store / delete are SHIFT + CALL (MEMORY /
+     * DELETE). */
+    CTRL_DECK_EXT_ACTION_MEMORY_CALL_PREV,
+    CTRL_DECK_EXT_ACTION_MEMORY_CALL_NEXT,
+    CTRL_DECK_EXT_ACTION_MEMORY_STORE,
+    CTRL_DECK_EXT_ACTION_MEMORY_DELETE,
 } ctrl_deck_ext_action_t;
 
 #define CTRL_DECK_EXT_VALUE(action, pressed) \

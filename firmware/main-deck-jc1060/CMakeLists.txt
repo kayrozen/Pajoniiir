@@ -12,9 +12,17 @@ set(EXTRA_COMPONENT_DIRS
     "${CMAKE_CURRENT_LIST_DIR}/../common/control_state_reconciler")
 
 # Bump on every OTA-worthy change (same-version images are skipped by OTA).
-set(PROJECT_VER "296")
+set(PROJECT_VER "323")
 
 project(pajoniiir_deck)
+
+# v323: diagnostics build (UI stall probe, SD/USB probes of the download
+# HIL; ui_diagnostics.h, sd_io_gate.h): idf.py -DPAJONIIIR_DIAGNOSTICS=1
+# build. Cached: -DPAJONIIIR_DIAGNOSTICS=0 to go back.
+option(PAJONIIIR_DIAGNOSTICS "Diagnostics build (UI and SD/USB probes)" OFF)
+if(PAJONIIIR_DIAGNOSTICS)
+    idf_build_set_property(COMPILE_DEFINITIONS "UI_DIAGNOSTICS_ENABLED=1" APPEND)
+endif()
 
 # v155: patch the pinned esp-usb fork exactly like upstream main-deck-p4 -
 # indexed idle-recovery + HS/FS FIFO split + MSC teardown. Must run AFTER

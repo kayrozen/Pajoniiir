@@ -48,6 +48,7 @@
 #define C_ERR       lv_color_hex(0xf06a5f)
 /* Colours carried over from the current Pajoniiir overview */
 #define C_CUEPT     lv_color_hex(0xffff00)   /* deck cue point triangle */
+#define C_MEMCUE    lv_color_hex(0xff1744)   /* memory cue triangle (CDJ red) */
 #define C_PLAYED    lv_color_hex(0xffb05a)   /* mini played shade, loop edges */
 #define C_LOOP      lv_color_hex(0x6b3f00)   /* active loop band */
 #define C_BEAT_OFF  lv_color_hex(0x30343b)
@@ -76,8 +77,10 @@ typedef struct {
     lv_obj_t *zoom, *zoom_time;
     lv_obj_t *pad[DJ_HOTCUES];
     lv_image_dsc_t art_dsc;           /* over s_art_px, see art_buffers() */
+    lv_obj_t *ft_load_bar;           /* v307: DJ Link download into the deck */
+    int16_t load_pct; bool load_db;
     lv_obj_t *ft_title, *ft_artist, *ft_art_lbl, *ft_art, *ft_remain_cap, *ft_remain, *ft_tempo, *ft_bpm_cap, *ft_bpm, *ov;
-    lv_obj_t *card, *badge, *num_lbl, *beat_seg[4], *vu_seg[DJ_VU_SEGS], *play, *cue, *mt;
+    lv_obj_t *card, *badge, *num_lbl, *beat_seg[4], *vu_seg[DJ_VU_SEGS], *play, *cue, *mt, *sync_btn;
     /* data */
     const uint8_t *peaks, *cores;
     uint32_t count; uint16_t pps;
@@ -88,6 +91,7 @@ typedef struct {
     uint8_t ov_peak[OV_MAX]; int32_t ov_n; bool ov_valid;
     bool cue_loop[DJ_HOTCUES];
     bool cue_pt_set; uint32_t cue_pt_ms;
+    uint8_t mem_n; uint32_t mem_ms[DJ_MEMORY_CUES];   /* v309 */
     bool loop_on; uint32_t loop_start, loop_end;
     /* surfaces, indexed by dj_wave_t */
     dj_wave_src_t src[2]; const lv_image_dsc_t *img[2]; int32_t img_x[2];
@@ -99,6 +103,7 @@ typedef struct {
     int32_t mini_px;                 /* last mini playhead column (absolute), -1 = none */
     int8_t beat_lit; bool beat_down; uint8_t vu_lit;
     bool playing, cue_lit, mt_on;
+    dj_sync_t sync_mode;
     bool elapsed;                    /* footer time: elapsed instead of remaining (tap) */
 } deck_t;
 
@@ -122,6 +127,7 @@ static struct {
     lv_obj_t *lib_prev, *lib_next;
     dj_tone_t badge_tone[DJ_LIB_ROWS];
     lv_obj_t *row_art[DJ_LIB_ROWS];
+    lv_obj_t *row_bar[DJ_LIB_ROWS];  /* v307: download bar on the fetching row */
     lv_image_dsc_t row_art_dsc[DJ_LIB_ROWS];
     /* last colours pushed per row: a style write invalidates even when equal */
     lv_color_t row_bg[DJ_LIB_ROWS], row_fg[DJ_LIB_ROWS], row_bc[DJ_LIB_ROWS];
@@ -435,11 +441,29 @@ static void zoom_img_sync(deck_t *d)
 
 #define CUEPT_HALF_W 4          /* zoom cue-point triangle */
 #define CUEPT_H      5
+#define MEMCUE_HALF_W 5         /* zoom memory-cue triangle (v309), white outline */
+#define MEMCUE_H      6
 
 /* Solid down-pointing triangle hanging from y, one rect per row. */
 static void tri_down(lv_layer_t *layer, int32_t x, int32_t y, int32_t half_w, int32_t h, lv_color_t c)
 {
     for (int32_t r = 0; r < h && half_w - r >= 0; r++) fill(layer, x - half_w + r, y + r, x + half_w - r, y + r, c, LV_OPA_COVER);
+}
+
+/* Base on row y (the bottom edge), tip h - 1 rows above it. */
+static void tri_up(lv_layer_t *layer, int32_t x, int32_t y, int32_t half_w, int32_t h, lv_color_t c)
+{
+    for (int32_t r = 0; r < h && half_w - r >= 0; r++) fill(layer, x - half_w + r, y - r, x + half_w - r, y - r, c, LV_OPA_COVER);
+}
+
+/* tri_up with a 1 px outline (base row and both edges), as the wave-cache
+ * strip burns a zoom memory cue (ui_overview_renderer). */
+static void tri_up_outlined(lv_layer_t *layer, int32_t x, int32_t y, int32_t half_w, int32_t h,
+                            lv_color_t c, lv_color_t edge)
+{
+    tri_up(layer, x, y, half_w, h, edge);
+    for (int32_t r = 1; r < h - 1 && half_w - r - 1 >= 0; r++)
+        fill(layer, x - half_w + r + 1, y - r, x + half_w - r - 1, y - r, c, LV_OPA_COVER);
 }
 
 /* Time under the zoom playhead: a ring strip shows the centre it was rendered
@@ -532,6 +556,10 @@ static void zoom_draw(lv_event_t *e)
         int32_t x = zoom_x(d, cx, mspp, d->loop_armed_ms);
         if (x >= a.x1 && x <= a.x2) fill(layer, x, a.y1, x, a.y2, C_WHITE, LV_OPA_COVER);
     }
+    for (int k = 0; (mk & DJ_MARK_MEMORY) && k < d->mem_n; k++) {
+        int32_t x = zoom_x(d, cx, mspp, d->mem_ms[k]);
+        if (x >= a.x1 && x <= a.x2) tri_up_outlined(layer, x, a.y2, MEMCUE_HALF_W, MEMCUE_H, C_MEMCUE, C_WHITE);
+    }
     for (int k = 0; k < DJ_HOTCUES; k++) {
         if (!(mk & DJ_MARK_HOTCUES) || !d->cue_set[k]) continue;
         int32_t x = zoom_x(d, cx, mspp, d->cue_ms[k]);
@@ -596,6 +624,8 @@ static void overview_draw(lv_event_t *e)
 
     if ((mk & DJ_MARK_LOOP) && d->loop_on && d->loop_end > d->loop_start)
         fill(layer, mini_x(d, &a, d->loop_start), a.y2 - 2, mini_x(d, &a, d->loop_end), a.y2, C_PLAYED, LV_OPA_COVER);
+    for (int k = 0; (mk & DJ_MARK_MEMORY) && k < d->mem_n; k++)
+        tri_up(layer, mini_x(d, &a, d->mem_ms[k]), a.y2, 3, 4, C_MEMCUE);
     for (int k = 0; k < DJ_HOTCUES; k++) {
         if (!(mk & DJ_MARK_HOTCUES) || !d->cue_set[k]) continue;
         int32_t x = mini_x(d, &a, d->cue_ms[k]);
@@ -734,6 +764,12 @@ static void refresh_transport(deck_t *d)
     else btn_style(d->cue, C_PANEL, C_INK, C_LINE);
     if (d->mt_on) btn_style(d->mt, C_INFO, C_DARK, C_INFO);
     else btn_style(d->mt, C_PANEL, C_DIM, C_LINE);
+    switch (d->sync_mode) {
+    case DJ_SYNC_LOCAL:       btn_style(d->sync_btn, C_INFO, C_DARK, C_INFO); break;
+    case DJ_SYNC_LINK_WAIT:   btn_style(d->sync_btn, C_PANEL, C_AMBER, C_AMBER); break;
+    case DJ_SYNC_LINK_LOCKED: btn_style(d->sync_btn, C_GREEN, C_DARK, C_GREEN); break;
+    default:                  btn_style(d->sync_btn, C_PANEL, C_DIM, C_LINE); break;
+    }
 }
 
 static void refresh_load_btns(void)
@@ -797,6 +833,7 @@ static void tgt_click(lv_event_t *e)
 static void play_click(lv_event_t *e) { if (g.cb.on_play) g.cb.on_play((uint8_t)IDX(e)); }
 static void cue_click(lv_event_t *e) { if (g.cb.on_cue) g.cb.on_cue((uint8_t)IDX(e)); }
 static void mt_click(lv_event_t *e) { if (g.cb.on_master_tempo) g.cb.on_master_tempo((uint8_t)IDX(e)); }
+static void sync_click(lv_event_t *e) { if (g.cb.on_sync) g.cb.on_sync((uint8_t)IDX(e)); }
 
 static void refresh_time(deck_t *d)
 {
@@ -993,6 +1030,18 @@ static void build_overview(lv_obj_t *pg)
         d->ft_artist = txt(f, F12, C_MUTED, "", 106, 26);
         lv_label_set_long_mode(d->ft_artist, DJ_LONG_DOT);
         lv_obj_set_width(d->ft_artist, 336);
+        /* v307: thin load bar under title/artist, hidden unless downloading */
+        d->ft_load_bar = lv_bar_create(f);
+        lv_obj_set_pos(d->ft_load_bar, 106, 43);
+        lv_obj_set_size(d->ft_load_bar, 336, 4);
+        lv_bar_set_range(d->ft_load_bar, 0, 100);
+        lv_obj_set_style_radius(d->ft_load_bar, 2, LV_PART_MAIN);
+        lv_obj_set_style_radius(d->ft_load_bar, 2, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_color(d->ft_load_bar, C_LINE, LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(d->ft_load_bar, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(d->ft_load_bar, d->color, LV_PART_INDICATOR);
+        lv_obj_add_flag(d->ft_load_bar, LV_OBJ_FLAG_HIDDEN);
+        d->load_pct = -1;
         lv_obj_t *art = box(f, 453, 6, 36, 36, C_LINE, C_BORDER2);
         lv_obj_set_style_radius(art, 3, 0);
         d->ft_art_lbl = txt(art, F12, C_MUTED, "ART", 0, 0);
@@ -1013,6 +1062,7 @@ static void build_overview(lv_obj_t *pg)
         cap(f, "TEMPO", 192, 50);
         d->ft_tempo = txt(f, F16, C_INK, "+0.0%", 192, 72);
         d->mt = btn(f, 264, 52, 54, 44, "MT", F14, C_PANEL, C_DIM, C_LINE, mt_click, UD(i));
+        d->sync_btn = btn(f, 324, 52, 62, 44, "SYNC", F14, C_PANEL, C_DIM, C_LINE, sync_click, UD(i));
         /* v275: transport column on the left, CUE over PLAY as on a CDJ */
         d->cue = btn(f, 10, 6, 56, 44, "CUE", F14, C_PANEL, C_INK, C_LINE, cue_click, UD(i));
         d->play = btn(f, 10, 54, 56, 44, LV_SYMBOL_PLAY, F20, C_PANEL, C_INK, C_LINE, play_click, UD(i));
@@ -1095,6 +1145,17 @@ static void build_library(lv_obj_t *pg)
         lv_obj_align(g.row_art[r], LV_ALIGN_LEFT_MID, 10, 0);
         lv_obj_add_flag(g.row_art[r], LV_OBJ_FLAG_HIDDEN);
         lv_obj_remove_flag(g.row_art[r], LV_OBJ_FLAG_CLICKABLE);
+        /* v307: download progress along the bottom edge, as the deck bar */
+        g.row_bar[r] = lv_bar_create(row);
+        lv_obj_set_size(g.row_bar[r], 850, 3);
+        lv_obj_align(g.row_bar[r], LV_ALIGN_BOTTOM_LEFT, 0, 0);
+        lv_bar_set_range(g.row_bar[r], 0, 100);
+        lv_obj_set_style_radius(g.row_bar[r], 0, LV_PART_MAIN);
+        lv_obj_set_style_radius(g.row_bar[r], 0, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_opa(g.row_bar[r], LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(g.row_bar[r], C_INFO, LV_PART_INDICATOR);
+        lv_obj_remove_flag(g.row_bar[r], LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(g.row_bar[r], LV_OBJ_FLAG_HIDDEN);
         g.row_badge[r] = txt(row, F12, C_INFO, "", 0, 0);
         lv_obj_set_width(g.row_badge[r], 48);
         lv_obj_set_style_text_align(g.row_badge[r], LV_TEXT_ALIGN_RIGHT, 0);
@@ -1250,9 +1311,11 @@ static void build_settings(lv_obj_t *pg)
     g.wl_lbl = txt(b, F14, C_INK, "P4 REMOTE: OFF", 180, 155);
 
     b = box(pg, 0, 294, 501, 190, C_PANEL, C_LINE);
-    cap(b, "DECK LOAD", 14, 12);
+    cap(b, "DECK LOAD & SYNC", 14, 12);
     field_box(b, DJ_F_LOAD_LOCK, 14, 36, 230, 40, "LOAD LOCK: OFF", DJ_TONE_NORMAL);
     tappable(DJ_F_LOAD_LOCK);
+    field_box(b, DJ_F_LINK_SYNC, 256, 36, 230, 40, "LINK SYNC: OFF", DJ_TONE_NORMAL);
+    tappable(DJ_F_LINK_SYNC);
     cap(b, "DECK SETUP", 14, 100);
     lv_obj_t *row = flex_row(b, 14, 124, 472, 40);
     chip(row, DJ_F_MIX_TEMPO, "TEMPO: +/-10%", DJ_TONE_NORMAL);
@@ -1401,6 +1464,26 @@ void dj_ui_show_tab(dj_tab_t tab)
     }
 }
 
+void dj_ui_set_load_progress(uint8_t deck, int16_t pct, bool db)
+{
+    if (deck >= DJ_DECKS) return;
+    deck_t *d = &g.deck[deck];
+    if (pct > 100) pct = 100;
+    if (pct < 0) pct = -1;
+    if (pct == d->load_pct && db == d->load_db) return;
+    if (pct < 0) {
+        lv_obj_add_flag(d->ft_load_bar, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        if (db != d->load_db || d->load_pct < 0) {
+            lv_obj_set_style_bg_color(d->ft_load_bar, db ? C_DIM : d->color, LV_PART_INDICATOR);
+        }
+        lv_bar_set_value(d->ft_load_bar, pct, LV_ANIM_OFF);
+        lv_obj_remove_flag(d->ft_load_bar, LV_OBJ_FLAG_HIDDEN);
+    }
+    d->load_pct = pct;
+    d->load_db = db;
+}
+
 void dj_ui_set_track(uint8_t deck, const char *title, const char *artist, const char *source,
                      uint16_t track_no, uint16_t track_count, uint32_t len_ms)
 {
@@ -1496,6 +1579,19 @@ void dj_ui_set_cue_point(uint8_t deck, bool set, uint32_t pos_ms)
     surf_dirty(d, DJ_WAVE_MINI);
 }
 
+void dj_ui_set_memory_cues(uint8_t deck, const uint32_t *pos_ms, uint8_t count)
+{
+    if (deck >= DJ_DECKS) return;
+    deck_t *d = &g.deck[deck];
+    if (!pos_ms) count = 0;
+    if (count > DJ_MEMORY_CUES) count = DJ_MEMORY_CUES;
+    if (d->mem_n == count && (!count || !memcmp(d->mem_ms, pos_ms, count * sizeof(uint32_t)))) return;
+    d->mem_n = count;
+    if (count) memcpy(d->mem_ms, pos_ms, count * sizeof(uint32_t));
+    surf_dirty(d, DJ_WAVE_ZOOM);
+    surf_dirty(d, DJ_WAVE_MINI);
+}
+
 void dj_ui_set_loop(uint8_t deck, bool active, uint32_t start_ms, uint32_t end_ms)
 {
     if (deck >= DJ_DECKS) return;
@@ -1560,6 +1656,13 @@ void dj_ui_set_master_tempo(uint8_t deck, bool on)
 {
     if (deck >= DJ_DECKS || g.deck[deck].mt_on == on) return;
     g.deck[deck].mt_on = on;
+    refresh_transport(&g.deck[deck]);
+}
+
+void dj_ui_set_sync(uint8_t deck, dj_sync_t sync)
+{
+    if (deck >= DJ_DECKS || g.deck[deck].sync_mode == sync) return;
+    g.deck[deck].sync_mode = sync;
     refresh_transport(&g.deck[deck]);
 }
 
@@ -1793,6 +1896,12 @@ void dj_ui_library_set_rows(const dj_track_t *rows, uint8_t count)
                                    (unsigned long)(t->len_ms / 1000 % 60));
         lv_label_set_text(g.row_badge[r], t->badge ? t->badge : "");
         g.badge_tone[r] = t->badge_tone;
+        if (t->has_progress) {
+            lv_bar_set_value(g.row_bar[r], t->progress > 100 ? 100 : t->progress, LV_ANIM_OFF);
+            lv_obj_remove_flag(g.row_bar[r], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(g.row_bar[r], LV_OBJ_FLAG_HIDDEN);
+        }
         art_show(g.row_art[r], &g.row_art_dsc[r], t->art, ART_ROW_PIXELS);
         refresh_row(r);
         lv_obj_remove_flag(g.row[r], LV_OBJ_FLAG_HIDDEN);

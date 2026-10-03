@@ -29,6 +29,8 @@ typedef struct {
     uint16_t bpm_state;    /* 0x90: 0x8000 rekordbox, 0x7fff unknown, 0 cd */
     uint16_t bpm100;       /* 0x92: 0xffff = no track */
     uint8_t master_meaningful; /* 0x9e: 0 no, 1 master w/ rekordbox, 2 nominal */
+    uint8_t master_handoff; /* 0x9f (Mh): player the tempo master yields to,
+                             * 0xff = none; build writes 0 as 0xff */
     uint32_t beat;         /* 0xa0: beat counter, 0xffffffff = unavailable */
     uint8_t beat_in_bar;   /* 0xa6 */
 } djlink_status_t;
@@ -66,6 +68,17 @@ typedef struct {
  * the end of a short packet are zeroed and has_flag_bits tells you what was
  * available. */
 djlink_err_t djlink_status_parse(const uint8_t *buf, size_t len, djlink_status_t *out);
+
+/* Build a nexus-generation CDJ status (0xd4 bytes, revision 3) from the
+ * fields of `in` that a player fills: name (padded field, see
+ * djlink_name_from_str), device_number, active, source_device / source_slot /
+ * rekordbox_id, play_state, flags, pitch_raw, bpm100 (0xffff = no track),
+ * master_meaningful, master_handoff, beat (0xffffffff = unknown), beat_in_bar. revision,
+ * lenr, bpm_state and has_flag_bits are set here. `packet_counter` goes at
+ * 0xc8. Returns the byte count or a negative DJLINK_ERR_*. */
+#define DJLINK_STATUS_PACKET_LEN 0xd4u
+int djlink_status_build(const djlink_status_t *in, uint32_t packet_counter,
+                        uint8_t *out, size_t cap);
 
 /* --- Keep-alive (virtual CDJ announcement) -------------------------------
  * Port 50000, type 0x06, 0x36 bytes, broadcast every ~2 s (mixers ~1.5 s).

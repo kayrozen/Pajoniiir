@@ -119,6 +119,7 @@ CAPTURES=(
     overview_bridge
     overview_bridge_scroll
     overview_bridge_elapsed
+    overview_bridge_download
 )
 
 declare -A ACTUAL

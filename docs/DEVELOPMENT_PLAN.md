@@ -2974,6 +2974,943 @@ Validated on hardware (v117, 2026-09-21):
   inside its box (`settings_layout_check`).
   Still open: full HIL acceptance (two-deck perf, zoom, tab switches,
   screensaver, blackout, hotplug).
+- v297 DJ Link keep-alive peers. A rekordbox library source (rekordbox,
+  vynull in Rekordbox mode, device #17, type 0x03) only sends port-50000
+  keep-alives, 0x29 status and a 0x16 after a 0x46. It never sends 0x0a or
+  0x28. Before v297 the peer table built peers only from 0x0a/0x28/0x0b and
+  listed numbers 1..6, so the deck showed "no players". The table now also
+  ingests 0x06 keep-alives from players (type 0x02) and rekordbox (type
+  0x03); mixers are left out, and `dj_link.c` drops our own. A rekordbox
+  peer is a `collection` player: the Library SOURCE reads `RB <name> #17`,
+  and the dbserver is browsed in slot 4 (collection). A rekordbox source has
+  no `export.pdb`, so LOAD gets the file path from dbserver track info 0x2102
+  instead. The request is a `PATH` phase in `dj_link_db`, sent ahead of any
+  pending row metadata. The path item has type 0x0000, label1 holds the path
+  from the NFS export root, and the parent field holds the file size. The
+  fetch then downloads over NFS: portmapper UDP 50111 (vynull's, not 111),
+  export `/C/`, and the usual `/sd/djlcache` cache. If the path is unknown,
+  or the dbserver fails or does not answer within 10 s, the fetch fails with
+  a reason on the Library status line. Host tests: `test_keepalive_sources`
+  and `test_track_info_path` (dj_link/test/host).
+  The dbserver codec (`djlink_db_msg_parse`) now accepts a type-tag blob as
+  short as the argument count. vynull sends one tag byte per argument,
+  where players always send 12, so every vynull reply looked truncated and
+  the Library failed with `TIMEOUT SETUP`. Host test: `djlink_test2`.
+  Known limit: vynull's NFS LOOKUP treats a name as UTF-16LE only when it is
+  4 bytes or longer and byte 1 is 0. So a one-character path component, or
+  one whose first character is not Latin-1, may not resolve.
+  Still open: HIL with vynull (Library listing, LOAD and playback).
+- v298 DJ Link: two players, one per deck. vynull (and CDJs) only list a
+  device in their players grid once it broadcasts CDJ status 0x0a on port
+  50002. Each deck now joins as its own player from our one MAC/IP, as an
+  XDJ-XZ does. Deck 1 claims first (preference 4, 3, 2, 1, 5, 6). Deck 2
+  starts once deck 1 is active, and treats deck 1's number as taken
+  (`sibling_number`). Each keep-alive counts the sibling as a peer. Deck 1 is
+  the library player: it answers media queries, and our USB tracks report
+  source = deck 1's number, slot USB. Every `DJ_LINK_STATUS_MS` (200 ms),
+  each joined deck broadcasts a 0xd4-byte nexus status
+  (`djlink_status_build`). The status carries:
+  - track source and rekordbox id;
+  - play state (playing, paused, no track);
+  - pitch and track BPM;
+  - flags for playing, sync and master, with a packet counter.
+
+  The data comes from a `dj_link_deck_report_t` that `ui_update()` copies at
+  most every 100 ms (`dj_link_set_deck_report`, under `s_mux`). The audio path
+  is never touched. A peer track reports its peer and slot (USB, or 4 for a
+  rekordbox collection). A load-track 0x19 goes to the deck named at byte
+  0x40, if that deck is not playing; otherwise the UI picks a deck as before.
+  A 0x19 for a track on another player's media (vynull loading its own
+  collection: source #17, slot 4) is no longer refused as REMOTE_SOURCE. The
+  UI downloads it over NFS, exactly as LOAD on that row would, and the deck
+  loads when the file is complete. The ack is sent once the download starts.
+  This requires that player to be the source our Library browses and the
+  track to be listed, since the row provides the metadata and the audio
+  check. A duplicate 0x19 for the same download is accepted without
+  starting a second one. Only deck 1's USB holds tracks among our own
+  numbers.
+  dbserver codec fix: the length of a string field (0x26) counts UTF-16
+  code units, NUL included, not bytes, as in beat-link and vynull. We read
+  it as bytes, so the first title from vynull desynced the parse and SOURCE
+  on vynull showed `ERROR: BAD REPLY`. `put_field` and `skip_field` now
+  convert. The fix is tested on a menu item captured from vynull and
+  replayed against vynull's handler with our exact requests.
+  The 0x1a ack comes from the targeted deck's number. Packets from our own IP
+  are dropped up front. Settings reads `ON P4+P3`.
+  Host tests:
+  - `test_status_build` (djlink);
+  - `test_session_two_decks` and `test_session_status` (dj_link).
+
+  Not sent yet:
+  - beat 0x28 and position 0x0b packets (sent since v301);
+  - the beat counter (0xffffffff, unknown);
+  - the on-air flag.
+
+  Still open: HIL with vynull, which should list two PAJONIIIR players with
+  title, BPM and play state. Also check coexistence with real CDJs and a DJM
+  mixer when two numbers come from one MAC/IP.
+- v300 DJ Link peer waveform (bug fix). A track loaded from vynull played
+  but showed no waveform: peer loads published no ANLZ. After the audio
+  download, the fetch job now asks the browse dbserver for the wave detail
+  (`0x2904`) and the beat grid (`0x2204`). The client streams these blobs,
+  which exceed the 4 KiB RX buffer, into PSRAM. `dj_link_anlz` writes them
+  as `<key>.DAT` / `<key>.EXT` beside the cached audio. The load worker
+  parses those with the local `anlz_parse_dat` / `anlz_parse_ext`, so a
+  peer track gets the same overview, scrolling waveform, beat grid and
+  duration path as a USB track. A cached `<key>.DAT` skips the step. The
+  step has a 10 s timeout, and the track loads anyway on a timeout or
+  failure. Details and the CDJ 19-byte risk are in `docs/DJ_LINK_SPEC.md`
+  Phase 2c. No cues or PVBR for peer tracks yet.
+  The same step fetches the artwork, which was also missing. The title item
+  carries the artwork id (argument 8). After the grid, `0x2003` returns the
+  JPEG (`0x4002`), which is written as `<key>.JPG`. `ui_artwork` reads it
+  under `sd_io_gate` when the catalog has no cover for a deck key. vynull's
+  "not found" reply declares a blob it never sends, and the client handles
+  it.
+  Host tests:
+  - `test_analysis_blobs` (`test_dj_link_db`): streaming above the RX size,
+    cap truncation, no-data replies, cancel and stop;
+  - `test_artwork` (`test_dj_link_db`): the artwork id from list and
+    metadata items, the JPEG stream, oversize dropped, and the vynull
+    phantom "not found" followed by a correctly framed next reply;
+  - `test_dj_link_anlz`: grid parse, preview, and a DAT/EXT round trip
+    through the real `rekordbox_anlz.c` parser.
+- v301 DJ Link beat and position emission. Each deck with a track that has
+  joined as a player now broadcasts on 50001:
+  - an absolute position `0x0b` every 30 ms;
+  - a beat `0x28` each time its playhead crosses a beat of its ANLZ grid.
+
+  The CDJ status `0x0a` has been broadcast on 50002 every 200 ms since
+  v298. The UI's 100 ms deck report now also carries:
+  - the engine playhead and duration;
+  - the speed (0 while scratching);
+  - a 16-beat grid window.
+
+  dj_link stamps each report, extrapolates the playhead for up to 1 s, and
+  wakes its task for the next position or beat. The change is purely
+  additive: it uses the existing codec builders and does not touch the
+  audio path. Details are in `docs/DJ_LINK_SPEC.md` Phase 3.
+  Host tests in `test_dj_link_state`:
+  - `test_report_beats`;
+  - `test_deck_playhead`;
+  - `test_session_position`;
+  - `test_session_beat` (beat distances, once per beat, seek re-arm,
+    window end, pause).
+- v302 DJ Link peer seek table and artwork fixes, after the v301 HIL run.
+  The waveform was fine, but there was no cover on the deck and the
+  waveform/audio offset grew after seeks.
+  - Peer MP3s had no PVBR, so every seek used the byte-linear estimate,
+    which is wrong on VBR files. `audio_pvbr_build` now rebuilds the
+    Rekordbox table from the frame headers, cached as `<key>.VBR`, and the
+    engine seeks it like a USB track.
+  - Artwork:
+    - A cached DAT no longer skips the JPG (`dj_link_anlz_plan`).
+    - A peer load forgets a stale "no cover" (`ui_artwork_forget`).
+    - A refused JPEG logs why (`ui_artwork_jpeg_probe`). vynull's
+      PNG-sourced covers are 4:4:4 with 1x2 sampling, which TJpgDec
+      rejects; fix this on the vynull side (`-pix_fmt yuvj420p`).
+  - A residual constant offset of about 51 ms between vynull's ffmpeg
+    analysis and our decoder (Xing frame plus encoder delay) is documented
+    in `docs/DJ_LINK_SPEC.md`, not corrected.
+
+  Host tests:
+  - `test_pvbr_build` (`audio_track_length_jc1060`);
+  - `test_plan` (`test_dj_link_anlz`; `test_commit` since v303);
+  - `ui_artwork_jpeg_jc1060`.
+
+- v303 DJ Link source refresh, after the v302 HIL run. Offset and cover
+  were fixed, but beat grid and cue edits made in vynull never reached the
+  deck.
+  - Causes:
+    - The track key (FNV-1a of IP, player and id) has no date or size.
+    - A cached `<key>.DAT` was never asked for again.
+    - Peer cues were never fetched.
+    - Seeded hot cues were saved as if set by hand.
+  - The analysis (wave, grid and the cue list `0x2b04`) is now asked on
+    every peer LOAD. A cached DAT is replaced only by a complete answer
+    (`dj_link_anlz_commit`), with a 4 s deadline on a cache hit.
+  - Cues are written as PCOB lists in the DAT.
+  - `hot_cue_store` tracks which cues came from the source, so they follow
+    edits while pads and CUE set by hand stay (`hot_cue_store_merge_source`,
+    in the NVS-free `hot_cue_store_merge.c`).
+  - `PEER.PDB` (CDJ / non-collection peers) is reused only while the
+    peer's NFS size and mtime match. vynull in rekordbox mode never uses it.
+
+  Host tests:
+  - `test_dj_link_anlz`, `test_dj_link_db`, `test_dj_link_pdb`
+    (`test_stamp`);
+  - `djlink_nfs_test`;
+  - `hot_cue_store_jc1060`;
+  - `deck_core_pfl_led_jc1060`, which now links the real merge.
+
+- v304 DJ Link network sync (Phase 1 sync, `docs/DJ_LINK_SPEC.md`), after
+  the v303 HIL run.
+  - `dj_link_table_beat_clock` picks the master's beat clock from the
+    received `0x28` and `0x0a`. The dj_link task hands it to `deck_core`
+    through the `beat_clock` hook.
+  - `deck_net_sync.c` matches tempo and holds phase with pitch trims, and
+    snaps the bar with a seek on PLAY.
+  - Behind Settings LINK SYNC (`dj_link_sync`, default OFF).
+  - UI:
+    - a touch SYNC button per deck (OFF, local, LINK WAIT, LINK LOCKED);
+    - the top-bar master beat;
+    - the Settings field in DECK LOAD & SYNC.
+  - Master takeover (`2a`, `26`/`27`) comes next.
+
+  Host tests:
+  - `deck_net_sync` (new);
+  - `test_beat_clock` (`test_dj_link_state`);
+  - `deck_core_pfl_led_jc1060`, which now links `deck_net_sync.c`.
+
+- v305 DJ Link tempo master and sync control (Phase 4,
+  `docs/DJ_LINK_SPEC.md`), behind the same LINK SYNC switch.
+  - Codec: Mh (`0x9f`) is parsed and built.
+  - `dj_link_master.c` negotiates master: it asserts when no peer is
+    master, otherwise it sends `26` and waits for Mh. On a `26` it yields
+    with `27` and Mh, and it takes an unsolicited Mh handoff.
+  - `2a` goes to a deck chosen by a documented policy (refused when
+    ambiguous).
+  - deck_core receives requests through `deck_core_net_command()` and
+    applies them like the buttons.
+  - LINK SYNC OFF keeps the v301 master flag.
+
+  Host tests:
+  - `test_dj_link_master` (new, dj_link `make run`);
+  - djlink codec Mh round trip;
+  - `deck_core_pfl_led_jc1060` (network master commands).
+
+- v306 beat-grid downbeat one beat early (hardware report on v304, track
+  from vynull).
+  - PQTZ and the dbserver beatgrid number the beats 1..4, with 1 = downbeat
+    (vynull `analysis/beatgrid.go`, rekordbox). `dj_link_anlz` copies the
+    number unchanged, and deck_net_sync / ui_library already read it as
+    1..4.
+  - The JC1060 UI, however, read `beat_phase % 4 == 0` as the downbeat,
+    which is beat 4 of the previous bar, one beat to the left. This hit the
+    zoom grid, the overview downbeat columns and the beat indicator.
+  - The same reading applies to local USB tracks, since they use the same
+    parser.
+  - New helpers `anlz_beat_is_downbeat()` / `anlz_beat_bar_index()` in
+    `rekordbox_anlz.h`. Unknown (0) is never the downbeat.
+  - Upstream `main-deck-p4` keeps the old reading. The JC1060 diverges
+    because the PQTZ format defines beat 1 as the downbeat.
+
+  Host tests:
+  - `beatgrid_downbeat_jc1060` (new): a vynull grid with the downbeat on
+    the third beat. A check that runs the original UI files against it
+    makes all three fail;
+  - `test_dj_link_anlz` round trip: downbeat kept through the DAT;
+  - the UI simulator fixture now uses beat numbers 1..4, and its baselines
+    are unchanged.
+
+- v307 DJ Link load: artist and progress bar (hardware report on v305).
+  - "Unknown Artist" on tracks loaded from vynull. The codec parsing was
+    correct. The cause was that vynull lists rows as `0x0d04` (title,
+    "BPM - key"), so they carry no artist. Only the metadata request
+    `0x2002` carries it, and that request was sent only for the rows of the
+    visible page.
+  - LOAD snapshotted the row before its metadata arrived. A network
+    load-track (v298) row is rarely on the visible page, so its metadata
+    never came.
+  - Fix:
+    - `dj_link_browse_want_detail_row()` sends the metadata request for the
+      row being loaded ahead of the page, through the pure
+      `dj_link_db_pick_detail()`;
+    - the download refreshes the artist, BPM and duration from the reply
+      when it loads;
+    - a reply that lands after the load updates the deck's artist
+      (`set_deck_artist` action).
+  - Local USB tracks are unchanged: they take the artist from the
+    export.pdb Artists join.
+  - Load progress bars:
+    - `dj_ui_set_load_progress()` drives a 4 px bar in the deck footer.
+      It is dim while the DB phase reads the export.pdb, then uses the deck
+      colour;
+    - `dj_track_t.has_progress` / `.progress` drives a thin bar on the
+      fetching row;
+    - both are fed by the existing fetch status poll
+      (`ui_library_deck_load_progress()` → `ui_djui_deck_view_t.load_*`),
+      with no new task, lock or allocation.
+
+  Host tests: dj_link `test_dj_link_db`:
+  - a vynull-faithful mock: list `0x0d04` and the 16 metadata items of
+    `dbserver/track.go`. Row artists stay empty (a check that takes label 2
+    as the artist fails them), and the metadata of an off-page row gives the
+    artist, not the original artist or remixer;
+  - `test_pick_detail`.
+
+- v308 DJ Link: the decks were swapped in vynull (hardware report on v306):
+  deck 1 showed as player 4 and deck 2 as player 3.
+  - Cause: since v298 deck 1 claims first and took the highest free number
+    (preference 4, 3, 2, 1, 5, 6), so deck 2 got 3. vynull sorts its
+    players grid by device number (`api/api.go`, "Sort by device number for
+    stable rendering"), not by arrival order, so the claim order alone
+    cannot fix it.
+  - Fix in `dj_link_session.c` (`dj_link_session_set_pair()`):
+    - deck 1 (`DJ_LINK_PAIR_LOW`) claims the low number of the first free
+      pair 3/4, 2/3, 1/2, 5/6, 4/5;
+    - deck 2 (`DJ_LINK_PAIR_HIGH`) takes the nearest free number above
+      deck 1;
+    - a re-claim keeps that order. Only when no ordered number is free does
+      a deck fall back to the old order, still never on its sibling's
+      number.
+  - Alone on the network the decks are 3/4, as two CDJs. The same network
+    always gives the same numbers, including after a dj_link restart. They
+    are not stored in NVS.
+  - Load routing is unchanged. `dj_link_load_target_deck()` maps `0x40` + 1
+    to the numbers each session actually holds, so player 3 is deck 1 and
+    player 4 is deck 2. Deck 1 remains the library player. Settings now
+    reads `ON P3+P4`.
+  - A single session (`DJ_LINK_PAIR_NONE`) keeps the 4, 3, 2, 1, 5, 6
+    preference.
+
+  Host tests: dj_link `test_dj_link_state`:
+  - `test_session_pair_numbers`: six network layouts, determinism across a
+    restart, the reset of the role, and ordered and fallback re-claims;
+  - `test_session_two_decks` now uses the production pair (3/4), with a
+    conflict re-claim, plus routing of player 3 → deck 1 and player 4 →
+    deck 2;
+  - running the old picker against these tests fails 14 checks.
+
+- v309 Memory cues (navigation, add / remove, waveform).
+  - Before: the ANLZ parser kept only the earliest memory cue, as the load
+    cue point. There was no list, no CALL / MEMORY / DELETE, and nothing on
+    the waveform. The DDJ-400 CALL buttons were mapped to loop halve /
+    double and SHIFT + CALL to beat jump.
+  - Analysis: `anlz_metadata_t.memory_cues[16]` / `memory_cue_count`, by
+    time, the earliest 16 kept (`ANLZ_MAX_MEMORY_CUES`). Memory loops keep
+    their end. The SD track cache is v6, so v5 entries are parsed again.
+    DJ Link peers already wrote every memory cue into their DAT (v303).
+  - Storage (`hot_cue_store`, NVS key `mc<track key>`, separate from the
+    hot cue blob): only the deck's edits, with at most 32. LOCAL = added
+    with MEMORY. HIDDEN = an analysis cue removed with DELETE, matched by
+    start and end. On every load `hot_cue_store_memory_merge()` builds the
+    list (local + analysis - hidden). It drops a hidden edit that the
+    analysis no longer has, and a local edit that the analysis now has. A
+    deleted rekordbox cue stays hidden on the P4. The USB and the peer are
+    never written.
+  - deck_core (actor task, static buffers, no allocation, nothing on the
+    audio path):
+    - `CTRL_DECK_EXT_ACTION_MEMORY_CALL_PREV` / `NEXT`: inside an active
+      loop, halve / double as before. Otherwise, go to the previous / next
+      memory cue (50 ms tolerance). It becomes the runtime cue point (not
+      saved; the load cue is unchanged). A playing deck keeps playing; a
+      memory loop is set.
+    - `MEMORY_STORE`: stores the active loop, else the playhead.
+    - `MEMORY_DELETE`: removes the cue within 50 ms of the playhead (call it
+      first).
+    - The list is published through the snapshot seqlock
+      (`deck_core_get_memory_cues()`, revision counter). A deck holding the
+      same track follows the edits. A failed save leaves the list as it was.
+      A store read error makes the list read-only for that load.
+  - DDJ-400 profile: `90/91 51` and `53` → `memory_call_prev` / `next`;
+    `90/91 3E` and `3D` (SHIFT + CALL) → `memory_delete` / `memory_store`.
+    Beat jump stays on the Beat Jump pad mode. `compile_profile.py` knows the
+    four actions (7..10), and `profile.s3bin` was recompiled. The FLX4
+    profile and the built-in `flx4_map` are unchanged, because the FLX4
+    golden parity test ties them together.
+  - UI:
+    - zoom strip: `ui_overview_wave_cache_set_memory_cues()` and
+      `ui_overview_renderer_draw_memory_rgb565_column_span()` burn an
+      11 x 6 px red triangle with a white outline on the bottom edge. The
+      outline tells it from the plain red downbeat caps that a HIGH strip
+      also draws there. The PPA direct path blits the same strip;
+    - overview and non-strip zoom: `dj_ui_set_memory_cues()` /
+      `DJ_MARK_MEMORY`;
+    - `ui.c` takes the deck_core list, and the analysis list until the
+      actor has read it.
+  - Upstream `main-deck-p4` has no memory cues. This is a JC1060
+    divergence, as are the rekordbox hot cues.
+
+  Host tests:
+  - `hot_cue_store_jc1060`: merge, MEMORY / DELETE, pruning, full list,
+    find / step, decode;
+  - `deck_memory_cue_jc1060` (new, real deck_core): load, CALL in and out of
+    a loop, MEMORY of a point and a loop, DELETE, reload, two decks on one
+    track, failed save, empty deck. Mapping CALL back to halve / double
+    makes it fail;
+  - `test_dj_link_anlz`: memory list order, cap, loop and duplicate;
+  - UI simulator: triangles checked on both zooms and both minis.
+    Removing the cues from the view fails all 5 checks. Baselines for
+    `overview_bridge`, `overview_bridge_scroll` and
+    `overview_bridge_elapsed` were updated after visual review.
+
+- v310 DJ Link Library sort (tracks from a DJ Link player, e.g. vynull).
+  - Before: the peer list came in the player's default order (the sort
+    argument of `0x1004` was 0), and the sort columns showed "SORT: LOCAL
+    ONLY".
+  - `dj_link_db`: `sort` field, `dj_link_db_set_sort()` (`0x1004`
+    argument 1, `DJ_LINK_DB_SORT_*` = the CDJ codes vynull applies), and the
+    pure `dj_link_db_row_index()` / `dj_link_db_next_sort()`.
+  - `dj_link`: `dj_link_browse_set_sort(sort, descending)` lists the
+    selected player again, in a new generation. A descending list is stored
+    reversed: the client index maps through `dj_link_db_row_index` in the
+    track and next-detail hooks. Its rows are published once listing is
+    done, so the page never shows holes. The status carries `sort` /
+    `sort_desc`. Selecting another player resets the order; a retry keeps
+    it.
+  - UI (`ui_library.c`): in a peer view the 4 sort columns call
+    `ui_library_djui_on_peer_sort()` (ascending, descending, then the
+    player's order). The lit column comes from the served status. The LOAD
+    BUSY guard is unchanged. The layout is unchanged.
+  - Not changed: local USB sort, and playlists, which keep the rekordbox
+    order with no sort (settled v270-v279). DJ Link playlists come in v311.
+
+  Host tests: `test_dj_link_db`: the sort argument reaches the mock
+  dbserver (default 0 for the plain browse, BPM when set), plus row mapping
+  and the column cycle. UI simulator gate unchanged (no layout change).
+
+- v311 DJ Link playlists (navigation by levels).
+  - Before: a DJ Link player only offered all tracks; PLAYLISTS showed
+    "PLAYLISTS: LOCAL ONLY".
+  - `dj_link_db`: `dj_link_db_set_menu()` (`DJ_LINK_DB_MENU_ALL_TRACKS` /
+    `FOLDER` / `PLAYLIST`). Folders and playlists use `0x1105` `[DMST, 0,
+    id, folder]`. `dj_link_peer_track_t.kind` marks folder (`0x0001`) and
+    playlist (`0x0008`) rows. Their id is the menu id, `has_detail` is set
+    (no metadata request) and they are metadata-only (never downloaded).
+  - `dj_link`: `dj_link_browse_open(menu, id)` lists that level in a new
+    generation. All tracks keeps the v310 sort; folders and playlists
+    always use the player's order. The status carries `menu` / `menu_id`.
+    Another player starts on all tracks.
+  - UI: `ui_peer_nav` (pure, host-tested) holds the levels: all tracks,
+    then the root, folders and a playlist, with the selection to give back
+    on the way out.
+    - PLAYLISTS opens the root. A tap or LOAD on a folder or playlist row
+      opens it. The button goes one level back ("ALL TRACKS" from the root,
+      "BACK" deeper).
+    - The header names the level.
+    - The sort is refused inside playlists ("SORT: ALL TRACKS ONLY").
+    - The network load-track (v298) only matches track rows.
+    - A new list (sort or level) restarts the player's dbserver session,
+      which a peer download also uses for the path, analysis and artwork.
+      It is refused with "DOWNLOAD BUSY" while one runs. This also covers
+      the v310 sort, whose LOAD BUSY guard did not see a running download.
+  - Not changed: local USB playlists (settled v270-v279), the layout.
+
+  Host tests: `test_dj_link_db` `test_playlist_menus`:
+  - mock dbserver `0x1105`: folder 12 lists a folder and a playlist,
+    playlist 40 lists two tracks in its order;
+  - checks the arguments (sort 0, id, folder flag) and the row kinds;
+  - checks that no metadata is asked and no download allowed for folder or
+    playlist rows, and that playlist track rows get their metadata;
+  - treating folder rows as tracks fails 5 checks.
+
+  `ui_peer_nav_jc1060` (new): the walk and back, labels, restored
+  selections, the depth cap, names, NULL safety. UI simulator gate
+  unchanged.
+
+- v312 USB overview from PWV3 (hardware report on v311). The same track
+  showed a nearly flat overview from the rekordbox USB and a full one from
+  vynull.
+  - Not a v309 regression. The C parser of v311 reads the same PWAV bytes
+    as a raw read of the files.
+  - Cause: two sources.
+    - The USB mini draws rekordbox's PWAV (`library_apply_meta_to_track`).
+    - A DJ Link peer's DAT gets a PWAV that `dj_link_anlz_preview` builds
+      from the wave detail: the loudest entry of each column.
+    - On a real rekordbox export (8 tracks of
+      `apta-beatgrid/RBEXPORT`), PWAV heights reach 2 to 21 of 31, with a
+      mean of 2.0 to 8.9. The PWV3-built preview reaches 31, with a mean of
+      9.4 to 25.0.
+  - Fix: `anlz_preview_from_high()` (library, the same rule as
+    `dj_link_anlz_preview`) builds the USB overview from PWV3 when the
+    track has one. PWAV is the fallback.
+    - It runs once per deck load in the library load path, outside the
+      audio path, with no allocation.
+    - The zoom (PWV3 / PWAV renderers) is unchanged.
+    - dj_link does not depend on library, so the rule is written twice. A
+      host test keeps the two byte-identical.
+
+  Host test: `test_dj_link_anlz` `test_usb_preview_matches_peer`. The USB
+  and peer previews are identical for 28660 / 401 / 400 / 3 / 1 entries.
+  Also checked: the loudest-entry rule and NULL / empty input. Checked
+  outside the suite on the 8 real tracks with the C parser.
+
+- v313 Colour mini waveform from rekordbox PWV4 (user request after v312).
+  - Format (`.EXT` PWV4): header entry size 6, count 1200; 6-byte entries.
+    The local references disagree (vynull `analysis/render.go` reads byte
+    0 as the height, `tools/wavecompare` reads byte 1). Measured on 6 real
+    tracks: byte 0 follows the PWV3 height (r 0.89..0.97, peaks 66..79),
+    byte 1 is a luminance near 255 (r about 0). Bytes 3 / 4 / 5 are the
+    bass / mid / treble intensities.
+  - `rekordbox_anlz`:
+    - `parse_pwv4()` reads PWV4 in `anlz_parse_ext` into
+      `anlz_metadata_t.color_preview` (heap, 7200 bytes at most);
+    - an odd or broken PWV4 is dropped and the PWV3 kept;
+    - `anlz_clone` / `anlz_free` handle it;
+    - `anlz_color_preview_column()` gives the loudest byte 0 and the band
+      mix scaled to 255, and `anlz_color_preview_peak()` the track peak;
+    - the track cache is v7 and stores the PWV4 after the PWV3.
+  - Bridge (`render_mini`): with a colour preview, the column height is
+    byte 0 / track peak and the colour the band mix (the deck colour when
+    the bands are silent). Without one, it is mono as in v312. The mini
+    re-renders when the preview pointer, length or a content sum changes.
+    It renders on track change only, in the LVGL task.
+  - The deck snapshots keep the PWV4, COMPACT included (7 KB per deck).
+  - DJ Link peers have no PWV4 yet (the fetch job writes PWV3 only):
+    their mini stays mono.
+  - The shared test stub `anlz_clone_stub.c` copies and frees the preview
+    under `#ifdef ANLZ_COLOR_PREVIEW_ENTRY` (the field is JC1060-only).
+    The P4 test that uses it still builds and passes.
+
+  Host test: `test_dj_link_anlz` `test_color_preview`: the PWV4 is read
+  from a written .EXT; column height and colour at 400 / 2400 columns;
+  silent bands; peak; clone is a deep copy; free; another entry size is
+  ignored and keeps the PWV3. The parser was also run outside the suite on
+  8 real tracks (all 7200 bytes; peaks 12..79). UI simulator: deck 1 has a
+  PWV4 fixture (bass half, treble half). The mini is checked red then blue,
+  and deck 2 mono pink. Removing the fixture fails the deck 1 checks.
+  Baselines updated after visual review.
+
+- v314 Colour mini for DJ Link peer tracks (PWV4 over DJ Link).
+  - Request: dbserver `0x2c04` `[DMST, id, 0x34565750 ('PWV4'
+    byte-reversed), 0x00545845 ('EXT')]` (beat-link AnlzTagFinder).
+    Reply: `0x4f02` `[0x2c04, status, len, blob, 1]`. The blob is a
+    little-endian u32 section length, then the whole PWV4 section (vynull
+    `dbserver/track.go`, `analysis.ReadANLZSection` / `WrapANLZ`).
+    "Not found" (status 0x32) declares a blob it never sends, as for
+    artwork.
+  - `dj_link_db`: `DJ_LINK_DB_TYPE_ANLZ_TAG_REQUEST` is a `want_blob`
+    request, with 4 arguments and the 0x4f02 reply type.
+  - `dj_link_anlz`:
+    - `dj_link_anlz_color_entries()` validates the blob: tag, length,
+      entry size 6, at most 7200 bytes;
+    - `dj_link_anlz_write_ext()` takes the entries and writes a PWV4
+      section after the PWV3 (head 24: entry size, count, 0);
+    - the library parser (v313) reads it back as `color_preview`.
+  - Fetch job (`dj_link.c`): after the cue list, when the track has a wave
+    detail, it asks for the PWV4 into a 7228-byte PSRAM buffer (freed with
+    the job). Then the artwork. The analysis log shows `colour N B`.
+    An analysis cached before v314 has no PWV4, so the next load fetches
+    the analysis again (the existing v303 refresh on every load) and
+    rewrites the EXT.
+
+  Host tests:
+  - `test_dj_link_db` `test_anlz_tag_pwv4`: the mock answers track 101
+    with a 7228-byte blob and checks the 4 arguments; a missing track
+    gives len 0 and the session stays framed. Rejecting the 0x4f02 reply
+    type fails 3 checks;
+  - `test_dj_link_anlz` `test_peer_color_preview`: blob validation (good,
+    truncated, another tag, another entry size, empty, NULL). The EXT
+    written with a PWV4 is read back by `anlz_parse_ext` with the same
+    7200 bytes; without colour it is PWV3 only.
+
+- v315 Crackles during a DJ Link download (hardware report on v314).
+  - Log (`/tmp/serial_all.log`, download of id 1125 into deck 2, 886.6 to
+    911.7 s, deck 1 playing a /sd/djlcache track): it is not an SD read
+    starvation.
+    - Deck 1's file is fully in RAM (`done=1`). The PCM never runs out:
+      `pcm_under D1=0`, `runway_min` 81920 to 92800.
+    - ae_output misses its 5.33 ms deadlines: 187 blocks/s before, then
+      185 / 181 / 173; `behind` 0-5 before, 9-13 during; `pace_wait max`
+      6-8 ms before, 16-22 ms during; `mix max` up to 11 ms (1.6-3.1 ms
+      before). `dec_max D1` (decode from RAM) also doubles, to 9.6 ms.
+    - The mix probe shows preemption, not slowness: in the worst blocks one
+      to three 16-frame groups take 1.5-5.2 ms while the others stay at
+      about 90 us (908 s: `369 5217 379 2123 ... 1623`). Before the
+      download no group is above 0.5 ms, except during the vynull list
+      browse (881-884 s, network too).
+  - Cause (likely; no per-task CPU figures in the log):
+    - `eth_bringup_start()` is called from app_main on CPU0, so the EMAC
+      interrupt is allocated on CPU0 (`esp_eth_mac_new_esp32`,
+      `esp_intr_alloc` on the calling core).
+    - It wakes `emac_rx` (prio 15, no affinity) and lwIP `tcpip` (prio 18,
+      no affinity), which preempt the interrupt's core first. For every
+      NFS frame of the download they ran ahead of ae_output (prio 6) and
+      ae_decode (prio 5) on the audio core.
+    - The download's SD writes run in dj_link (CPU1, prio 1) and cannot
+      preempt the audio.
+  - Fix, with no change on the audio path:
+    - `eth_bringup_start()` runs the unchanged bring-up in a task pinned to
+      CPU1 (`eth_up`, waited on by app_main), with
+      `ETH_MAC_FLAG_PIN_TO_CORE` so `emac_rx` follows;
+    - `CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU1` in `sdkconfig.defaults`;
+    - the network now shares CPU1 with LVGL (prio 4): the UI may lose a few
+      ms during a download, the audio does not.
+  - Also: `[HEAP] alloc FAILED size=8192 caps=0x8` came 5 times a second
+    during a download, 182 lines in 3 s at its end. This is the IDF SD
+    driver probing an internal DMA bounce buffer for unaligned writes
+    (`sdmmc_write_sectors`), which then halves and retries. It is harmless
+    to the audio (CPU1) but flooded the log. The v292 hook now prints the
+    first failure at once, then at most one line per second with the count
+    not shown.
+  - The local `sdkconfig` keeps the old affinity until it is regenerated
+    (`sdkconfig.defaults` only applies to a new one).
+
+- v316 Re-diagnosis of the download crackles (HIL v315) and a diagnostic
+  build. v315's network move is reverted; the `[HEAP]` rate limit stays.
+  - v315 HIL (same log, 12 downloads compared):
+    - The download is not slower. With no deck playing it runs at 220-444
+      KB/s before v315 and 333 KB/s with v315. With a deck playing it is
+      153-188 KB/s before and 151-154 KB/s with v315: the same slowdown,
+      dj_link (prio 1, CPU1) running behind the UI.
+    - Audio with a deck playing during a download: before, 173-187
+      blocks/s, `behind` up to 13 (21 for id 900), worst group 5.2 ms;
+      v315, 167-187, `behind` 18-21, worst group 6.3 ms. Same profile: 1
+      to 3 groups of 1.5 to 6 ms in a block, the others at about 90 us.
+      With the network on CPU1 the CPU0 stalls remain: the v315 diagnosis
+      (network preemption) is refuted.
+    - Not an SD read starvation either: deck 1's file is fully in RAM
+      during the v315 download (`done=1`), its decode ring stays full
+      (93536), `pcm_under` 0.
+  - Remaining suspect, not proven: the download's SD writes (32 KB
+    fwrites from a PSRAM stage, about 5/s). Each one goes through the IDF
+    SD driver's internal DMA bounce buffer and PSRAM cache maintenance;
+    on the P4, L2 is shared by both cores. The log cannot tell preemption
+    from a memory stall because the probe isolation was off.
+  - Diagnostic build (two compile switches, both to be set back to 0):
+    - mode A, `DJ_LINK_FETCH_DIAG_NO_SD_WRITE 1` (`dj_link.c`): a peer
+      track's audio is received and staged but never opened or written on
+      SD, and the fetch ends FAILED, so nothing empty is cached. export.pdb
+      and analysis files are still written. Crackles gone = the SD write;
+      still there = the network side;
+    - probe B, `AE_MIX_PROBE_ISOLATE 1` (`audio_engine.c`, the v209-v226
+      diagnostic): one scheduler-suspended and one interrupts-masked
+      16-frame group per block. A long irqoff group means a memory /
+      cache stall; long groups only outside it mean preemption. It masks
+      CPU0 interrupts for about 70 us per 5.3 ms block during the test.
+  - Next (v317), depending on the result: if the SD write, write from a
+    small internal DMA-aligned buffer instead of the 32 KB PSRAM stage
+    (no bounce buffer, no PSRAM cache maintenance, short transfers), with
+    pacing if needed.
+
+- v317 Download SD writes through an internal DMA buffer (HIL v316).
+  - v316 result: with mode A (download received, never written) only one
+    crackle at the download start, then clean audio. The SD writes of the
+    download are the cause; the network reception is sound.
+  - Fix (`dj_link.c`, dj_link task only, nothing on the audio path):
+    - each fetch allocates a 4 KB internal, DMA-capable, 64-byte aligned
+      buffer (`s_fetch_dma`), freed with the fetch. Internal RAM had at
+      least 48 KB free and a 23 KB largest block in the logs;
+    - the temp file (`dj_link_fetch_open_tmp`) is unbuffered, so newlib
+      does not copy through its own buffer;
+    - `dj_link_fetch_flush` copies the 32 KB PSRAM stage 4 KB at a time
+      into that buffer and writes each piece in its own `sd_io_gate` hold.
+      Every piece but a file's last starts and ends on a sector, so FATFS
+      sends it straight from the internal buffer to the card: no IDF
+      bounce-buffer probe, no PSRAM cache maintenance for the DMA;
+    - a 1-tick wait between pieces. The task is CPU1, prio 1; it caps the
+      write rate at 4 MB/s, far above the network's 150-440 KB/s;
+    - without the buffer (allocation failed) the fetch writes from PSRAM
+      as before, with a warning.
+  - The v316 switches are back to 0 (`DJ_LINK_FETCH_DIAG_NO_SD_WRITE`,
+    `AE_MIX_PROBE_ISOLATE`); the mode A code stays for later diagnosis.
+  - Not addressed: the single crackle at the download start seen in mode A
+    (before any audio write: path, export.pdb or browse traffic).
+
+- v318 SD transfers by direct DMA from aligned PSRAM (HIL v317).
+  - v317 HIL (log from line 33148, three downloads):
+    - Correction of v315/v316: a deck's `done=1` does not mean its file is
+      in RAM. The loader reads it in 32 KB pages into a rotating 256 KB
+      PSRAM cache for the whole track (`loaded` keeps growing), so a deck
+      playing a /sd/djlcache track reads the card continuously.
+    - Deck playing from USB during a download: worst group at most
+      1.3 ms (3-4 ms once), `behind` at most 8; no `[HEAP]` line during
+      the download itself, so v317's write buffer works.
+    - Deck playing from /sd/djlcache during a download (id 48): groups of
+      3-9 ms, `behind` 17, mix up to 24.5 ms. The same deck without a
+      download: at most 1.1 ms. So it is the SD write and the SD read
+      together.
+    - End-of-download burst: the peer seek-table rebuild re-reads the
+      whole file (4-6 s): worst group 1.8-3.1 ms, `behind` 12.
+    - Start-of-download burst: in this log it only coincides with deck 1
+      starting to play (30-33 s); the starts of downloads id 44 and id 48
+      are clean.
+  - `[HEAP] alloc FAILED size=8192 caps=0x8`: the IDF SD driver
+    (`allocate_dma_buf`, `sdmmc_cmd.c`) asks 16 sectors of internal DMA RAM
+    to bounce a transfer whose buffer is not 64-byte aligned, then halves
+    to 4096. In v317 they came from SD reads into unaligned PSRAM: about
+    100/s during the seek-table rebuild and about 1/s while a deck streams
+    from SD. They fail with "largest=23552" because the internal figure
+    includes RTCRAM (`CONFIG_ESP_SYSTEM_ALLOW_RTC_FAST_MEM_AS_HEAP`), which
+    has no `MALLOC_CAP_DMA` on the P4.
+  - Likely mechanism (IDF source, not measured): after every write, IDF
+    polls the card's busy state with CMD13 without yielding for up to
+    100 ms (`sdmmc_wait_for_idle`). Each command ends in an SDMMC
+    interrupt, allocated on the core that created the controller
+    (ESP-Hosted at boot, CPU0). v317's 4 KB writes multiplied these phases
+    by 8.
+  - Fix (no change to the decode loop or audio timing):
+    - `dj_link.c`: the fetch stage is a separate 64 KB, 64-byte aligned
+      PSRAM block (`s_fetch_stage`), written in one fwrite to an
+      unbuffered FILE. The P4 SDMMC DMAs from PSRAM
+      (`SOC_SDMMC_PSRAM_DMA_CAPABLE`): no bounce, 16 card writes per MB
+      instead of 256 (v317) or 32 bounced (before). One tick between
+      writes;
+    - `ui_library.c` peer seek table: the 32 KB buffer is aligned, the
+      FILE unbuffered, each chunk starts at a 4 KB file offset (the sector
+      part lands aligned), a tick between chunk reads;
+    - `audio_engine.c` loader: the 256 KB page cache comes from
+      `heap_caps_aligned_alloc(64, ...)` and the source FILE is unbuffered,
+      so each 32 KB page is one direct DMA read. Load time only, freed with
+      `heap_caps_free` as before;
+    - `app_main.c`: the `[HEAP]` line also prints free / largest for the
+      requested caps.
+  - Checked: the new seek-table reader gives the same PVBR table as the
+    old one on a 23 MB synthetic VBR MP3 (703 chunk reads against 687).
+  - If crackles remain with a deck streaming from SD during a download,
+    the next lever is the SDMMC interrupt core (created by ESP-Hosted on
+    CPU0); measure SDMMC interrupts per heartbeat first.
+
+- v319 Measurement build for the remaining crackles (HIL v318).
+  - v318 HIL (boot at line 36023, download id 20, 50.3-80.7 s, deck 2
+    playing /sd/djlcache):
+    - the bus is serialized: a 32 KB loader page read takes 12.5 ms on
+      average, 72 ms at worst (`diag preload`). But the decode never runs
+      short: deck 2's runway stays at or above 90213 frames (1.88 s),
+      ring full, `pcm_under` 0. A bigger runway (option a) would not help;
+    - the crackles are in the mix (ae_output, CPU0, IRAM, no I/O): one
+      group of 16 frames per bad block goes from ~62 us to 3.0-4.7 ms,
+      above the ~3 ms of slack in a 5.33 ms block (over 1-2, behind
+      12-18). Deck 2's decode on the same core rises from ~3 to
+      5.3-8.7 ms;
+    - `[HEAP]` 56 -> 2: the two left come at the open of a cached track,
+      with `caps free=22515 largest=8192` (internal DMA RAM is nearly
+      exhausted).
+  - Open question: which SD transfer coincides with the stall. The stall
+    (3-4.7 ms) is of the order of a 64 KB write. A candidate is the
+    L2-cache maintenance of each PSRAM DMA (`esp_cache_msync` on the whole
+    buffer); the L2 cache is shared by both cores. Not measured.
+  - Measurement (no behaviour change):
+    - `sd_io_gate`: `sd_io_gate_diag_begin/_end(kind)` (task context) and
+      `sd_io_gate_diag_overlaps(kind, since_us)` (inline, two atomic
+      loads);
+    - dj_link marks and times each download fwrite (gate wait and write),
+      logged per fetch (audio and analysis);
+    - the deck loader marks each page fread (`ae_fw_cache_read_at`, also
+      for /usb reads);
+    - the mix probe classifies only groups above 1 ms (`> 1000 us`
+      compare otherwise), counted per heartbeat as write / read / both /
+      none with the worst group of each; `PROBE sdio` line.
+  - Next (v320), by the result:
+    - mostly `wr`: smaller writes, 16 KB (or 8 KB) with 10 ms pauses
+      (expected stall about 1 ms; write rate still 1.6 MB/s, far above the
+      network);
+    - mostly `rd`: smaller loader reads (8 KB per read, cache unchanged),
+      to be proposed separately (deck read path);
+    - mostly `none`: another source (SDMMC interrupt on CPU0, L2 cache);
+      measure further before acting.
+
+- v320 Shorter SD transfers (HIL v319).
+  - v319 HIL (boot at line 38266):
+    - stalled mix groups (> 1 ms) are almost all `rd`: up to 53 of 55 in
+      one window, worst 6.7 ms; a few `none` (1.3-4.2 ms), `wr` about 0.
+      They appear only while a download runs;
+    - download writes (64 KB): 95 and 213 writes, avg 28-33 ms, max
+      96-100 ms, all over 2 ms (about 2-2.3 MB/s); gate wait max 43.6 ms;
+      loader page reads up to 213 ms behind them;
+    - likely mechanism (IDF source, not measured): after each page read
+      into PSRAM the driver invalidates its 32 KB of L2 cache in a
+      critical section on the reading core (CPU0, the mix's), and that
+      spinlock is shared with CPU1's cache maintenance for the download
+      writes and the display;
+    - the `ring=31104` after a load is the new deck's ring filling up, not
+      a drop; the playing deck kept 92000+ frames, `pcm_under` 0;
+    - a separate defect: after loading a /sd/djlcache track the USB audio
+      output falls to 34-41 blocks/s and stays there (UAC ring full,
+      `over` +128000 per window, no USB error, mix fast). Also seen in
+      two earlier boots (v318 at 57.8 s, v319 at 88-90 s). Left for v321
+      (measurement first);
+    - `[HEAP] 8192`: the SD driver's temporary bounce buffer, not the
+      aligned allocations (those are PSRAM). Internal DMA free fell from
+      22.1 KB (largest 8 KB) to 17.7 KB (largest 6 KB).
+  - Fix:
+    - `audio_engine.c` `ae_fw_cache_read_at`: a cache page is read in
+      `AE_FW_READ_PIECE` (8 KB) freads. Same cache, pages, offsets and
+      media gate hold; the pieces stay sector- and 64-byte aligned. Each
+      SD transfer and its cache invalidate is a quarter as long (expected
+      worst stall about 1.7 ms instead of 6.7 ms). Loader task, not the
+      mix;
+    - `dj_link.c`: the 64 KB stage is written in 16 KB pieces
+      (`DJ_LINK_FETCH_WRITE_PIECE`), each in its own gate hold, with
+      `DJ_LINK_FETCH_WRITE_GAP_MS` (10 ms) after it. About 7-8 ms per
+      write, up to about 1.1 MB/s;
+    - `bsp_sd.c`: an 8 KB internal DMA, 64-byte aligned buffer taken once
+      at the first mount and set as `host.dma_aligned_buffer`.
+      `sdmmc_read_sectors` / `sdmmc_write_sectors` (IDF 6.0.2
+      `sdmmc_cmd.c`) use it before allocating, so no per-transfer 8 KB
+      allocation. 8 KB of internal RAM kept for good;
+    - the v319 measurement stays, to check the effect.
+  - Not flashed: superseded by v321.
+
+- v321 Root cause of the download crackles: the IDF CMD13 poll storm.
+  - Step back (web and upstream search before going further):
+    - esp-idf #19034 (closed 2026-09-07): `sdmmc_wait_for_idle()` polls
+      CMD13 back-to-back with no yield for the first 100 ms after every
+      write; consumer cards stay busy 1-45 ms, so each write is a storm of
+      hundreds of host commands, and on the ESP32-P4 that storm slows CPU
+      work on both cores 3-50x (a same-core spin does not reproduce it).
+      Fixed on master, release/v6.1, release/v6.0 (`a2b2b36a57`) and
+      release/v5.5 with a back-off (`sdmmc_poll_delay_and_backoff`,
+      `CONFIG_SD_READY_POLL_PERIOD_START_US`), but in no v6.0.x release
+      yet (v6.0.3 is from 2026-09-02); we are pinned to v6.0.2;
+    - p3a (fabkury, ESP32-P4 animation player that downloads to SD while
+      rendering), `docs/jitter/REPORT.md`: from 37.7 stalls >= 100 ms per
+      hour to 0 over 3 h with a link-time wrap of `sdmmc_wait_for_idle`
+      that polls once per tick (their fix 8), plus aligned buffers to cut
+      the command count. They ruled out PSRAM bandwidth and cache sync;
+    - upstream dvucinozd: nothing on this (it does not write to the SD
+      during playback); its decoder-cache fixes (prefetch before AE_LOCK,
+      LRU touch `c21ad86`) are already in the JC1060.
+  - It accounts for v314-v320:
+    - v315 (network on CPU1) changed nothing, because the storm slows
+      both cores;
+    - v317 (4 KB writes) multiplied the storms;
+    - v319's `rd` stalls: IDF 6.0.2 `sdmmc_read_sectors_dma` also calls
+      `sdmmc_wait_for_idle` (sdmmc_cmd.c:751), and a read that comes
+      while the card is still busy from a download write meets the
+      storm. It only happens during downloads.
+  - Fix:
+    - new component `components/sd_idle_wait`: `__wrap_sdmmc_wait_for_idle`
+      (Apache-2.0, adapted from p3a with its notice) polls CMD13 once, then
+      once per FreeRTOS tick (1 ms here), no busy-wait. Linked with
+      `-Wl,--wrap=sdmmc_wait_for_idle` and `WHOLE_ARCHIVE`, like
+      `usb_storage`'s DWC wrap; required by `bsp_jc1060p470` (SD mount)
+      and `dj_link` (stats). Both callers are in `sdmmc_cmd.c`, so every
+      SD-mode wait goes through it; SPI hosts keep the original. p3a's
+      variant rather than Espressif's v2, which busy-waits up to ~1.5 ms in
+      the calling task (here possibly the deck loader on the audio core).
+      Counters (`sd_idle_wait_take_stats`) are logged by dj_link after each
+      fetch;
+    - v320's splitting is removed. Download: one 64 KB `write(2)` per
+      stage on the file descriptor, a tick after it. Deck loader: one
+      `read(2)` per 32 KB page. Seek table: `read(2)` per 32 KB chunk.
+      No stdio and no `_IONBF` on these paths: p3a found newlib
+      `_IONBF` reads byte by byte, and we are on picolibc, whose behaviour
+      was not checked;
+    - kept: the aligned buffers (v318), the 8 KB SD bounce buffer (v320),
+      the v319 measurement (`PROBE sdio`, SD write timings).
+  - Divergence from upstream (it has neither DJ Link downloads nor SD
+    writes during playback). Remove `sd_idle_wait` once the tree moves to
+    an IDF release that carries the fix (v6.0.4 or later), then re-check
+    the same HIL.
+  - Checked: syntax of the five changed files, and on a host mock-up that
+    `--wrap` redirects a call from another object of a static library.
+
+- v322 USB output stop after a download: A/B diagnostic (HIL v321).
+  - v321 HIL: no more crackles. But from about 63 s, before the deck load
+    at 65.5 s and during the last download writes, the UAC ring stays full
+    (`uac_low=2048` for a whole window), every block is rejected (`drop`
+    +500, `over` +128000 per window) and the HB window grows from 2664 to
+    14674 ms (34 blocks/s). `dup`, `trim`, `lost`, `under`, `fail`,
+    `xfer_fail`, `pkt_fail` and `faulted` do not move, `streaming=1`.
+  - Pace chain: working as designed. `ae_output_pace_sinkless` waits up to
+    `AE_PACE_MAX_LAG` (4) periods for room in the ring (the 22 ms
+    `pace_wait`), then falls back to the period deadline: about 27-29 ms
+    per block. Neither the speed calculation nor a missed UAC packet: the
+    isochronous OUT consumer stopped draining, with no error callback, and
+    the engine slows down following it.
+  - Trigger: none of the 11 boots up to v317 shows it, 4 of the 5 since
+    v318 do, each right after a download. v318 made the SD DMA directly to
+    and from PSRAM (aligned download stage, loader pages, seek-table
+    buffer). The USB-DWC DMA buffers are in PSRAM since v232-v240
+    (`CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=y`, default n; upstream
+    does not set it; internal DMA RAM free 6.9 KB at boot).
+  - Web search (esp-idf, esp-usb, usb CHANGELOG, upstream): no public case
+    of an isochronous OUT stream that stops silently.
+    - esp-idf #18235 (P4: USB DWC DMA corrupts memory under concurrent DMA):
+      root cause a lost cache writeback under memory load, fixed by
+      `fff1564266`. Already in our v6.0.2
+      (`esp_rom_cache_writeback_esp32p4.c`, double sync).
+    - esp-idf #19111 (BNA assert): already wrapped by `usb_storage`. A BNA
+      would flush the pipe and call each URB back with an error, which
+      faults the stream; `faulted` and `xfer_fail` stayed 0.
+    - esp-usb #581 (P4 HCD spinlock under high-bandwidth isochronous IN)
+      and #538 (RX FIFO): other symptoms.
+  - A/B diagnostic (reversible):
+    - `bsp_sd.c` `BSP_SD_DIAG_NO_PSRAM_DMA 1`: a `host.check_buffer_alignment`
+      that reports every PSRAM buffer unaligned, so `sdmmc_read_sectors` /
+      `sdmmc_write_sectors` bounce through the 8 KB internal buffer
+      (v320). Only the SD card host is affected (ESP-Hosted's SDIO slot
+      has its own host); requires the bounce buffer, else unchanged;
+    - `HB UAC` line: `isoc_cb` (isochronous URB callbacks in the window,
+      from `controller_usb_host_get_work`) and `bna` (BNA recoveries since
+      boot, weak reference to the `usb_storage` counter).
+  - Expected: if the stop is gone and the crackles stay away, the cause is
+    concurrent SD and USB DMA in PSRAM; then make it permanent (or move the
+    USB-DWC buffers back to internal RAM if memory allows) and document a
+    reproduction for Espressif. If the stop remains, `isoc_cb` and `bna`
+    tell whether the stream stops or slows, and whether a BNA is involved.
+  - HIL v322: no USB output stop in any window (no `rate=34`, `win`
+    about 2.67 s, `isoc_cb` 632-702 per window = 250/s), 0 `[HEAP] alloc
+    FAILED`, `behind` max 3 outside the first window, decoder runway 82-93
+    KB. Cause confirmed: concurrent SD and USB-DWC DMA in PSRAM. Residual
+    crackles, barely audible.
+
+- v323 no-PSRAM SD DMA made permanent, isochronous cadence probe (HIL v322).
+  - `bsp_sd.c`: the `BSP_SD_DIAG_NO_PSRAM_DMA` switch is removed; the
+    `check_buffer_alignment` hook is installed whenever the 8 KB bounce
+    buffer exists. Boot log: `no SD DMA to PSRAM (bounced via 8192 B
+    internal)`. Divergence from upstream `main-deck-p4`: it keeps the
+    USB-DWC buffers in internal RAM and writes nothing to SD during
+    playback. Moving our USB buffers back to internal RAM is not an option
+    (6.9 KB internal DMA free at boot, the v239 NO_MEM on UAC restart).
+  - Espressif reproduction: local draft
+    `docs/validation/SD_USB_PSRAM_DMA_REPRO.md`, not published.
+  - Residual crackles, v322 log (boot of the v322 A/B, four downloads):
+    - every engine and UAC counter is clean in every window: `under`,
+      `dup`, `trim`, `lost`, `pkt_fail`, `xfer_fail`, `fail`, `lim`
+      unchanged, `peak` below the limiter knee, `pcm_under` 0, UAC ring
+      low water 834 frames (never near 0), mix `elapsed` max 5.0 ms
+      (period 5.33 ms; the ring absorbs it);
+    - SD writes now bounce in 8 KB commands: 64 KB writes avg 96-111 ms,
+      max 487-525 ms (28-33 ms with direct DMA), card busy waits up to
+      215 ms, gate wait max 136 ms; decoder runway stays at 82-93 KB;
+    - the only irregularity: `isoc_cb` per window alternates 702/632,
+      680/653, 688/642 around downloads, i.e. completions bunched by up to
+      ~140 ms between two prints. The queue in flight is 3 URBs x 4 ms; a
+      completion more than ~8 ms late leaves the bus without a packet,
+      which the device plays as a click and no host counter sees.
+  - Probe (counters only, isoc callback, controller task): gap between
+    completed URBs, longest per window, gaps of 6 ms or more, and of those
+    how many overlapped an SD download write / deck loader read
+    (`sd_io_gate_diag_overlaps`). `HB UAC` gains `gap_max=…us late=… wr=…
+    rd=…`. No change to pacing, priorities or the audio path.
+  - Next, depending on HIL v323: late gaps tied to `wr` → pace the
+    download writes (smaller `write()` calls with a yield, or a larger
+    bounce buffer); `gap_max` steady at ~4 ms → the crackle is not a
+    transport gap (look at the content or the device side).
+  - HIL v323: no crackle at all. 0 USB stop, 0 `[HEAP] alloc FAILED`,
+    `bna=0`, `gap_max` steady at about 4000 us with no late completion,
+    decoder runway full. The SD/USB saga is closed: the no-PSRAM SD DMA
+    workaround is validated on hardware and stays.
+  - Expected, not a defect: during downloads `behind` reads 13-17 per
+    500-block window with `pace_wait` max 6.8 ms and runway full at 92 KB.
+    `behind` counts blocks for which the UAC ring already had room when the
+    loop reached the pace check (no pace sleep: the loop came back late,
+    the mix itself staying under one period; attributed to the decode
+    preload work running while the slower bounced SD writes go on). The ring absorbs it (`uac_low` far from 0, `u_under` 0),
+    `pace_wait` stays about one period plus a tick, and nothing is audible.
+    Only `u_under` > 0 or `uac_low` near 0 would matter.
+
+- v324 probes behind the diagnostics switch, Espressif repro completed.
+  - One build switch: `idf.py -DPAJONIIIR_DIAGNOSTICS=1 build` (top-level
+    `CMakeLists.txt`, cached, `=0` to go back) adds
+    `UI_DIAGNOSTICS_ENABLED=1` to every component. `ui_diagnostics.h` (UI
+    stall probe, v293) and `sd_io_gate.h` (`SD_IO_DIAG_ENABLED`) read it;
+    default 0 as before.
+  - Diagnostics builds only: the `sd_io_gate_diag_*` marks (no-op in
+    production, `sd_io_gate_diag_overlaps` false), the mix `PROBE sdio`
+    classes, the isochronous cadence probe (now its own `HB isoc
+    gap_max=…us late=… wr=… rd=…` line, removed from `HB UAC`), the
+    per-download `SD writes` and `SD card busy waits` lines.
+  - Kept in every build (counters, no hot-path cost): `HB UAC isoc_cb=`
+    and `bna=`, the watch for a return of the v318-v321 stop; the
+    `sd_idle_wait` counters (read only by the diagnostics log); the boot
+    line `no SD DMA to PSRAM (bounced via 8192 B internal)`; `PROBE
+    spikes/worst` (v209, unchanged).
+  - `docs/validation/SD_USB_PSRAM_DMA_REPRO.md`: esp-usb fork commit
+    (`dvucinozd/esp-usb` `cc65dc26`, `host/usb` 1.5.0) and the local
+    patches, FS/HS port split, v323 result. Chip revision: the image
+    targets v1.x (`REV_MIN_FULL=100`, `SELECTS_REV_LESS_V3`); the exact
+    ECO is in no captured log (bootloader log level 0, app WARN) and must
+    be read with `esptool.py chip_id` before any publication. Still not
+    published.
+  - Checked: syntax of the changed files with the switch at 0 and at 1.
+
+  UI simulator: `overview_bridge_download` (new) and the deck / row bars
+  checked by object. The `library_busy` and `library_bridge_peer` baselines
+  were updated after visual review.
 
 ### Phase 3: DDJ-400 Integration (planned)
 

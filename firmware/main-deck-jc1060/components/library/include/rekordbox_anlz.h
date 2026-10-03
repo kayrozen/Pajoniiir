@@ -63,12 +63,17 @@ extern "C" {
 #define ANLZ_TAG_PWV2  0x50575632u  /* 'PWV2' — waveform tiny          */
 #define ANLZ_TAG_PCOB  0x50434F42u  /* 'PCOB' — cue objects container  */
 #define ANLZ_TAG_PWV3  0x50575633u  /* 'PWV3' — waveform high-res      */
+#define ANLZ_TAG_PWV4  0x50575634u  /* 'PWV4' — colour preview (v313)  */
 
 /* ── Sizes ────────────────────────────────────────────────────────────────── */
 #define ANLZ_WAVEFORM_LOW_LEN    400u   /* PWAV: always 400 bytes          */
 #define ANLZ_WAVEFORM_TINY_LEN   100u   /* PWV2: always 100 nibble entries */
 #define ANLZ_VBR_TABLE_LEN       400u   /* PVBR: 400 × uint32_t offsets    */
 #define ANLZ_MAX_CUES              8u   /* hot cues 0–7                    */
+#define ANLZ_MAX_MEMORY_CUES      16u   /* v309: earliest memory cues kept */
+/* v313: PWV4 colour preview in .EXT: 1200 entries of 6 bytes. */
+#define ANLZ_COLOR_PREVIEW_ENTRY    6u
+#define ANLZ_COLOR_PREVIEW_MAX   7200u  /* bytes: 1200 entries */
 #define ANLZ_WAVEFORM_HIGH_MAX 131072u  /* PWV3: up to 128 KB (observed max ~62 KB) */
 #define ANLZ_PATH_MAX            512u   /* audio path buffer               */
 #define ANLZ_WAVEFORM_HIGH_PER_S 150u   /* PWV3: entries per second of audio */
@@ -93,10 +98,24 @@ static inline uint32_t anlz_precise_duration_ms(uint32_t pdb_ms, uint32_t pwv3_l
 
 /* ── Beat grid entry (8 bytes, big-endian in file) ────────────────────────── */
 typedef struct {
-    uint16_t beat_phase;   /* phase within the bar (0–3 for beats 1–4)    */
+    uint16_t beat_phase;   /* PQTZ beat number in the bar: 1..4, 1 = downbeat
+                            * (rekordbox, dbserver beatgrid, vynull); 0 = unknown */
     uint16_t bpm_x100;     /* BPM × 100  (e.g. 12850 → 128.50 BPM)       */
     uint32_t time_ms;      /* absolute position from start of track (ms)  */
 } anlz_beat_t;
+
+/* v306: beat_phase is the 1-based beat number, not a 0-based phase. Reading
+ * `beat_phase % 4 == 0` as the downbeat put it on beat 4, one beat early. */
+static inline bool anlz_beat_is_downbeat(uint16_t beat_phase)
+{
+    return beat_phase == 1u;
+}
+
+/* 0..3 position in the bar (0 = downbeat); 0 when the number is unknown. */
+static inline uint8_t anlz_beat_bar_index(uint16_t beat_phase)
+{
+    return beat_phase >= 1u && beat_phase <= 4u ? (uint8_t)(beat_phase - 1u) : 0u;
+}
 
 /* ── Cue type ─────────────────────────────────────────────────────────────── */
 typedef enum {
@@ -111,6 +130,13 @@ typedef struct {
     uint32_t        start_ms;
     uint32_t        end_ms; /* loop end; 0 for single cues                 */
 } anlz_cue_t;
+
+/* v309: one memory cue (type-0 PCOB entry): a point, or a loop when end_ms
+ * is above start_ms (0 for a point). */
+typedef struct {
+    uint32_t start_ms;
+    uint32_t end_ms;
+} anlz_memory_cue_t;
 
 /* ── Parsed metadata for one track ──────────────────────────────────────────
  *
@@ -137,6 +163,13 @@ typedef struct anlz_metadata {
      * memory_cue_ms is 0 when has_memory_cue is false. */
     uint32_t memory_cue_ms;
     bool     has_memory_cue;
+    /* v309: the memory cues by time, earliest ANLZ_MAX_MEMORY_CUES only;
+     * memory_cues[0] is the memory cue above when there is one. */
+    anlz_memory_cue_t memory_cues[ANLZ_MAX_MEMORY_CUES];
+    uint8_t  memory_cue_count;
+    /* v303: a PCOB list (memory or hot cues) was read, even an empty one:
+     * the analysis speaks for the track's cues. */
+    bool     has_cue_lists;
 
     /* VBR seek table (from PVBR) — 400 file-byte offsets */
     uint32_t vbr[ANLZ_VBR_TABLE_LEN];
@@ -149,6 +182,14 @@ typedef struct anlz_metadata {
     /* High-resolution waveform (from PWV3 in .EXT) — heap */
     uint8_t  *waveform_high;     /* heap; NULL until anlz_parse_ext() called */
     uint32_t  waveform_high_len; /* number of valid bytes in waveform_high   */
+
+    /* v313: colour preview (PWV4 in .EXT, optional) — heap, raw entries of
+     * ANLZ_COLOR_PREVIEW_ENTRY bytes. Measured on rekordbox exports: byte 0
+     * follows the PWV3 height (r 0.89..0.97, peaks ~65..80), byte 1 a
+     * luminance (~255), bytes 3/4/5 the bass / mid / treble intensities
+     * (vynull tools/wavecompare). NULL / 0 when absent. */
+    uint8_t  *color_preview;
+    uint32_t  color_preview_len; /* bytes, a multiple of the entry size */
 } anlz_metadata_t;
 
 /* ── Public API ───────────────────────────────────────────────────────────── */
@@ -187,6 +228,30 @@ esp_err_t anlz_clone(const anlz_metadata_t *src, anlz_metadata_t *out);
  * Safe to call multiple times (idempotent).
  */
 void anlz_free(anlz_metadata_t *meta);
+
+/* v312: a 400-column overview preview from the PWV3 detail: the loudest
+ * entry (height in bits 4:0) of each column, colour bits kept. It is the
+ * rule dj_link_anlz_preview uses to write a DJ Link peer's PWAV, so a track
+ * shows the same overview from the USB and from a peer. rekordbox's own
+ * PWAV is much lower (an average: heights often 2..16 of 31, some tracks
+ * nearly flat). False (out zeroed) without detail. */
+bool anlz_preview_from_high(const uint8_t *high, size_t len,
+                            uint8_t out[ANLZ_WAVEFORM_LOW_LEN]);
+
+/* v313: one column of a PWV4 colour preview drawn `cols` columns wide.
+ * height: the loudest entry's byte 0 over the column's entries (scale it
+ * by anlz_color_preview_peak). r/g/b: the mean bass / mid / treble of those
+ * entries, scaled so the strongest is 255; all 0 when the bands are silent
+ * (the caller picks a colour). False when there is no preview. */
+typedef struct {
+    uint8_t height;
+    uint8_t r, g, b;
+} anlz_color_column_t;
+
+bool anlz_color_preview_column(const uint8_t *preview, uint32_t len, uint32_t col,
+                               uint32_t cols, anlz_color_column_t *out);
+/* The loudest byte 0 of the whole preview (0 = none). */
+uint8_t anlz_color_preview_peak(const uint8_t *preview, uint32_t len);
 
 #ifdef __cplusplus
 }

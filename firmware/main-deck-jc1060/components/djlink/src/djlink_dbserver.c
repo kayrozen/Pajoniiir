@@ -67,7 +67,12 @@ static int put_field(uint8_t *out, size_t cap, uint8_t type, uint32_t num, const
         need = 5;
         break;
     case DJLINK_DB_FIELD_BINARY:
+        need = 5 + data_len;
+        break;
     case DJLINK_DB_FIELD_STRING:
+        if (data_len & 1u) {
+            return DJLINK_ERR_BOUNDS; /* UTF-16BE: whole code units only */
+        }
         need = 5 + data_len;
         break;
     default:
@@ -91,14 +96,17 @@ static int put_field(uint8_t *out, size_t cap, uint8_t type, uint32_t num, const
         out[pos++] = (uint8_t)(num >> 8);
         out[pos++] = (uint8_t)num;
         break;
-    default:
-        out[pos++] = (uint8_t)(data_len >> 24);
-        out[pos++] = (uint8_t)(data_len >> 16);
-        out[pos++] = (uint8_t)(data_len >> 8);
-        out[pos++] = (uint8_t)data_len;
+    default: {
+        /* A string's length counts UTF-16 code units, a blob's bytes. */
+        size_t wire_len = type == DJLINK_DB_FIELD_STRING ? data_len / 2u : data_len;
+        out[pos++] = (uint8_t)(wire_len >> 24);
+        out[pos++] = (uint8_t)(wire_len >> 16);
+        out[pos++] = (uint8_t)(wire_len >> 8);
+        out[pos++] = (uint8_t)wire_len;
         memcpy(&out[pos], data, data_len);
         pos += data_len;
         break;
+    }
     }
     return (int)pos;
 }
@@ -136,6 +144,14 @@ static const uint8_t *skip_field(const uint8_t *buf, const uint8_t *end, uint8_t
             return NULL;
         }
         vlen = djlink_rd32(&p[1]);
+        if (type == DJLINK_DB_FIELD_STRING) {
+            /* The length counts UTF-16 code units (NUL included), not bytes;
+             * *data_len is in bytes. */
+            if (vlen > 0x7fffffffu) {
+                return NULL;
+            }
+            vlen *= 2u;
+        }
         if ((size_t)(end - p - 5) < vlen) {
             return NULL;
         }
@@ -298,8 +314,9 @@ djlink_err_t djlink_db_msg_parse(const uint8_t *buf, size_t len, djlink_db_msg_t
     if (p == end || *p != DJLINK_DB_FIELD_BINARY) {
         return DJLINK_ERR_TRUNCATED;
     }
+    /* Players always send 12 tag bytes; vynull sends one per argument. */
     p = skip_field(p, end, DJLINK_DB_FIELD_BINARY, &data, &data_len);
-    if (p == NULL || data_len < DJLINK_DB_MAX_ARGS) {
+    if (p == NULL || data_len < out->arg_count) {
         return DJLINK_ERR_TRUNCATED;
     }
     for (i = 0; i < out->arg_count; ++i) {

@@ -169,12 +169,12 @@ ui_beat_indicator_state_t ui_beat_indicator_calculate(uint32_t position_ms,
     }
 
     uint32_t elapsed = position_ms > beat_start ? position_ms - beat_start : 0;
-    uint8_t phase = (uint8_t)(beats[idx].beat_phase % 4u);
+    uint8_t phase = anlz_beat_bar_index(beats[idx].beat_phase);
 
     return (ui_beat_indicator_state_t){
         .valid = true,
         .phase = phase,
-        .downbeat = (phase == 0),
+        .downbeat = anlz_beat_is_downbeat(beats[idx].beat_phase),
         .progress_permille = clamp_progress(elapsed, beat_len_ms),
     };
 }

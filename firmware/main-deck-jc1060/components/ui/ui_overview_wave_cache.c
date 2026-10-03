@@ -277,6 +277,33 @@ void ui_overview_wave_cache_set_cues(ui_overview_wave_cache_t *cache,
     cache->valid = false;
 }
 
+void ui_overview_wave_cache_set_memory_cues(ui_overview_wave_cache_t *cache,
+                                            const anlz_memory_cue_t *cues,
+                                            uint8_t count)
+{
+    if (!cache) {
+        return;
+    }
+    if (!cues) {
+        count = 0u;
+    } else if (count > ANLZ_MAX_MEMORY_CUES) {
+        count = (uint8_t)ANLZ_MAX_MEMORY_CUES;
+    }
+    bool same = cache->memory_count == count;
+    for (uint8_t i = 0; same && i < count; i++) {
+        same = cache->memory[i].start_ms == cues[i].start_ms &&
+               cache->memory[i].end_ms == cues[i].end_ms;
+    }
+    if (same) {
+        return;
+    }
+    cache->memory_count = count;
+    for (uint8_t i = 0; i < count; i++) {
+        cache->memory[i] = cues[i];
+    }
+    cache->valid = false;
+}
+
 static bool source_matches(const ui_overview_wave_cache_t *cache,
                            const ui_waveform_source_t *source,
                            uint32_t duration_ms,
@@ -358,6 +385,19 @@ static void draw_columns(ui_overview_wave_cache_t *cache,
                                                            cache->loop_end_ms,
                                                            cues,
                                                            cue_count);
+    ui_overview_renderer_draw_memory_rgb565_column_span(pixels,
+                                                        stride_px,
+                                                        cache->height_px,
+                                                        dest_x,
+                                                        logical_x,
+                                                        column_count,
+                                                        cache->strip_width_px,
+                                                        strip_center_ms(cache),
+                                                        strip_window_ms(cache),
+                                                        cache->palette,
+                                                        cache->palette_count,
+                                                        cache->memory,
+                                                        cache->memory_count);
 }
 
 static void render_physical_span(ui_overview_wave_cache_t *cache,

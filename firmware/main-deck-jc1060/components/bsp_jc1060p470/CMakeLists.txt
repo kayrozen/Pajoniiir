@@ -28,6 +28,9 @@ idf_component_register(
         fatfs
     PRIV_REQUIRES
         esp_hw_support
+        # v321: the SD card this BSP mounts waits for card-busy through the
+        # yielding sd_idle_wait (link-time wrap of sdmmc_wait_for_idle).
+        sd_idle_wait
 )
 
 # Add compile definitions for board-specific settings

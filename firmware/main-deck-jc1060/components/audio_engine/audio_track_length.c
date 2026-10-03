@@ -314,6 +314,44 @@ size_t audio_pvbr_base(audio_track_read_fn read, void *ctx, const uint32_t *pvbr
     return !shifted && raw ? 0u : id3_size;
 }
 
+bool audio_pvbr_build(audio_track_read_fn read, void *ctx, size_t file_size,
+                      uint32_t *pvbr, uint32_t len)
+{
+    if (!read || !pvbr || len == 0u) return false;
+    /* The engine's reading of the start of the file (ae_resolve_track_length). */
+    uint8_t head[1024];
+    size_t got = read(ctx, 0u, head, file_size < 10u ? file_size : 10u);
+    size_t base = audio_id3v2_size(head, got);
+    if (base >= file_size) base = 0u;
+    const size_t want = file_size - base;
+    got = read(ctx, base, head, want < sizeof head ? want : sizeof head);
+    audio_mp3_first_frame_t ff;
+    if (!audio_mp3_first_frame(head, got, &ff) || ff.count == 0u) return false;
+    const uint32_t frames = ff.count + 1u;
+
+    /* The frames as audio_mp3_scan walks them: resync over junk, one rate. */
+    size_t pos = base;
+    uint32_t hz = 0u, frame = 0u, idx = 0u;
+    uint8_t hb[4];
+    while (idx < len && pos + 4u <= file_size) {
+        mpeg_l3_header_t h;
+        if (read(ctx, pos, hb, 4u) != 4u) return false;
+        if (!parse_l3_header(hb, &h) || h.frame_bytes == 0u || (hz && h.hz != hz)) {
+            size_t at;
+            if (!scan_sync(read, ctx, pos + 1u, file_size, hz, &at, &h)) break;
+            pos = at;
+        }
+        if (pos + h.frame_bytes > file_size) break;   /* truncated last frame */
+        hz = h.hz;
+        while (idx < len && audio_pvbr_entry_frame(idx, frames, len) == frame) {
+            pvbr[idx++] = (uint32_t)(pos - base);
+        }
+        frame++;
+        pos += h.frame_bytes;
+    }
+    return idx == len;
+}
+
 audio_track_length_decision_t audio_track_length_decide(const audio_track_length_inputs_t *in)
 {
     audio_track_length_decision_t d = {0};

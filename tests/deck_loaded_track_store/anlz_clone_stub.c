@@ -21,6 +21,10 @@ esp_err_t anlz_clone(const anlz_metadata_t *src, anlz_metadata_t *out)
     *out = *src;
     out->beats = NULL;
     out->waveform_high = NULL;
+#ifdef ANLZ_COLOR_PREVIEW_ENTRY   /* jc1060 header: v313 colour preview */
+    out->color_preview = NULL;
+    out->color_preview_len = 0u;
+#endif
     if (src->beat_count > 0u && src->beats) {
         size_t bytes = (size_t)src->beat_count * sizeof(*src->beats);
         out->beats = malloc(bytes);
@@ -40,6 +44,19 @@ esp_err_t anlz_clone(const anlz_metadata_t *src, anlz_metadata_t *out)
         memcpy(out->waveform_high, src->waveform_high,
                src->waveform_high_len);
     }
+#ifdef ANLZ_COLOR_PREVIEW_ENTRY
+    if (src->color_preview_len > 0u && src->color_preview) {
+        out->color_preview = malloc(src->color_preview_len);
+        if (!out->color_preview) {
+            free(out->beats);
+            free(out->waveform_high);
+            memset(out, 0, sizeof(*out));
+            return ESP_ERR_NO_MEM;
+        }
+        memcpy(out->color_preview, src->color_preview, src->color_preview_len);
+        out->color_preview_len = src->color_preview_len;
+    }
+#endif
     return ESP_OK;
 }
 
@@ -50,6 +67,9 @@ void anlz_free(anlz_metadata_t *meta)
     }
     free(meta->beats);
     free(meta->waveform_high);
+#ifdef ANLZ_COLOR_PREVIEW_ENTRY
+    free(meta->color_preview);
+#endif
     memset(meta, 0, sizeof(*meta));
     anlz_free_stub_calls++;
 }

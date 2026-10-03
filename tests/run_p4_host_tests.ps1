@@ -1313,7 +1313,20 @@ $tests = @(
             "-I../../firmware/main-deck-jc1060/components/hot_cue_store/include",
             "-o", "test_hot_cue_store_jc1060.exe",
             "test_hot_cue_store_jc1060.c",
-            "../../firmware/main-deck-jc1060/components/hot_cue_store/hot_cue_store.c"
+            "../../firmware/main-deck-jc1060/components/hot_cue_store/hot_cue_store.c",
+            "../../firmware/main-deck-jc1060/components/hot_cue_store/hot_cue_store_merge.c"
+        )
+    },
+    @{
+        Name = "ui_peer_nav_jc1060"
+        Dir = "tests/ui_peer_nav_jc1060"
+        Target = "test_ui_peer_nav.exe"
+        Args = @(
+            "-Wall", "-Wextra", "-Wpedantic", "-Werror", "-std=c99",
+            "-I../../firmware/main-deck-jc1060/components/ui/include",
+            "-o", "test_ui_peer_nav.exe",
+            "test_ui_peer_nav.c",
+            "../../firmware/main-deck-jc1060/components/ui/ui_peer_nav.c"
         )
     },
     @{
@@ -1388,6 +1401,10 @@ $tests = @(
             "test_deck_core_pfl_led_jc1060.c",
             "../deck_core_dual/control_link_stub.c",
             "../deck_core_dual/hot_cue_store_stub.c",
+            # v309: the memory cue edits in RAM.
+            "../deck_memory_cue_jc1060/hot_cue_memory_stub.c",
+            # v303: the real cue merge (no NVS) beside the in-memory store.
+            "../../firmware/main-deck-jc1060/components/hot_cue_store/hot_cue_store_merge.c",
             "../deck_loaded_track_store/anlz_clone_stub.c",
             "../../firmware/main-deck-jc1060/components/library/anlz_snapshot.c",
             "../../firmware/main-deck-jc1060/components/beat_jump/beat_jump.c",
@@ -1397,7 +1414,61 @@ $tests = @(
             "../../firmware/main-deck-jc1060/components/deck_core/deck_cue_park.c",
             "../../firmware/main-deck-jc1060/components/deck_core/deck_hot_cue_recall.c",
             "../../firmware/main-deck-jc1060/components/deck_core/deck_jog_scrub.c",
-            "deck_core_test_snapshot_wrapper.c"
+            "../../firmware/main-deck-jc1060/components/deck_core/deck_net_sync.c",
+            "deck_core_test_snapshot_wrapper.c",
+            "-lm"
+        )
+    },
+    @{
+        Name = "deck_memory_cue_jc1060"
+        Dir = "tests/deck_memory_cue_jc1060"
+        Target = "test_deck_memory_cue_jc1060.exe"
+        Args = @(
+            "-Wall", "-Wextra", "-Wpedantic", "-Werror=implicit-function-declaration", "-std=c99",
+            "-Wno-unused-variable", "-Wno-unused-parameter",
+            "-DDECK_CORE_PC_TEST",
+            "-I../deck_core_pfl_led_jc1060/stubs",
+            "-I../deck_core_dual/stubs",
+            "-I../support/stubs",
+            "-I../../firmware/main-deck-jc1060/components/audio_engine/include",
+            "-I../../firmware/main-deck-jc1060/components/beat_jump/include",
+            "-I../../firmware/main-deck-jc1060/components/deck_core/include",
+            "-I../../firmware/main-deck-jc1060/components/control_link/include",
+            "-I../../firmware/main-deck-jc1060/components/hot_cue_store/include",
+            "-I../../firmware/main-deck-jc1060/components/library/include",
+            "-o", "test_deck_memory_cue_jc1060.exe",
+            "test_deck_memory_cue_jc1060.c",
+            "hot_cue_memory_stub.c",
+            "../deck_core_dual/control_link_stub.c",
+            "../deck_core_dual/hot_cue_store_stub.c",
+            "../../firmware/main-deck-jc1060/components/hot_cue_store/hot_cue_store_merge.c",
+            "../deck_loaded_track_store/anlz_clone_stub.c",
+            "../../firmware/main-deck-jc1060/components/library/anlz_snapshot.c",
+            "../../firmware/main-deck-jc1060/components/beat_jump/beat_jump.c",
+            "../../firmware/main-deck-jc1060/components/control_link/flx4_led_snapshot.c",
+            "../../firmware/main-deck-jc1060/components/deck_core/deck_loaded_track_store.c",
+            "../../firmware/main-deck-jc1060/components/deck_core/deck_load_lock.c",
+            "../../firmware/main-deck-jc1060/components/deck_core/deck_cue_park.c",
+            "../../firmware/main-deck-jc1060/components/deck_core/deck_hot_cue_recall.c",
+            "../../firmware/main-deck-jc1060/components/deck_core/deck_jog_scrub.c",
+            "../../firmware/main-deck-jc1060/components/deck_core/deck_net_sync.c",
+            "../deck_core_pfl_led_jc1060/deck_core_test_snapshot_wrapper.c",
+            "-lm"
+        )
+    },
+    @{
+        Name = "deck_net_sync"
+        Dir = "tests/deck_net_sync"
+        Target = "test_deck_net_sync.exe"
+        Args = @(
+            "-Wall", "-Wextra", "-Wpedantic", "-std=c99",
+            "-DANLZ_STANDALONE_TEST",
+            "-I../../firmware/main-deck-jc1060/components/deck_core/include",
+            "-I../../firmware/main-deck-jc1060/components/library/include",
+            "-o", "test_deck_net_sync.exe",
+            "test_deck_net_sync.c",
+            "../../firmware/main-deck-jc1060/components/deck_core/deck_net_sync.c",
+            "-lm"
         )
     },
     @{
@@ -1437,9 +1508,31 @@ $tests = @(
         )
     },
     @{
+        # JC1060 v306: the beat grid's downbeat is PQTZ beat number 1
+        # (rekordbox, dbserver, vynull), not phase 0 - zoom grid, overview
+        # columns and beat indicator.
+        Name = "beatgrid_downbeat_jc1060"
+        Dir = "tests/beatgrid_downbeat_jc1060"
+        Target = "test_beatgrid_downbeat.exe"
+        Args = @(
+            "-Wall", "-Wextra", "-Wpedantic", "-std=c99",
+            "-DANLZ_STANDALONE_TEST",
+            "-I../../firmware/main-deck-jc1060/components/ui/include",
+            "-I../../firmware/main-deck-jc1060/components/library/include",
+            "-o", "test_beatgrid_downbeat.exe",
+            "test_beatgrid_downbeat.c",
+            "../../firmware/main-deck-jc1060/components/ui/ui_overview_grid.c",
+            "../../firmware/main-deck-jc1060/components/ui/ui_beat_indicator.c",
+            "../../firmware/main-deck-jc1060/components/ui/ui_overview_renderer.c",
+            "../../firmware/main-deck-jc1060/components/ui/ui_waveform_model.c",
+            "-lm"
+        )
+    },
+    @{
         # JC1060 v271-v273: decoded file length past the Rekordbox analysis
         # span; PVBR entries after the ID3v2 tag at their exact frame times
-        # (real Rekordbox tables), Xing count kept as the length.
+        # (real Rekordbox tables), Xing count kept as the length. v302: the
+        # table built from the frame headers for DJ Link peer tracks.
         Name = "audio_track_length_jc1060"
         Dir = "tests/audio_track_length_jc1060"
         Target = "test_audio_track_length.exe"
@@ -1450,6 +1543,20 @@ $tests = @(
             "test_audio_track_length.c",
             "../../firmware/main-deck-jc1060/components/audio_engine/audio_track_length.c",
             "../../firmware/main-deck-jc1060/components/audio_engine/audio_seek_skip.c"
+        )
+    },
+    @{
+        # JC1060 v302: why a cover JPEG is refused (TJpgDec frame-header
+        # rules); vynull's PNG-sourced covers are 4:4:4 at 1x2 sampling.
+        Name = "ui_artwork_jpeg_jc1060"
+        Dir = "tests/ui_artwork_jpeg_jc1060"
+        Target = "test_ui_artwork_jpeg.exe"
+        Args = @(
+            "-Wall", "-Wextra", "-Wpedantic", "-Werror", "-std=c99",
+            "-I../../firmware/main-deck-jc1060/components/ui/include",
+            "-o", "test_ui_artwork_jpeg.exe",
+            "test_ui_artwork_jpeg.c",
+            "../../firmware/main-deck-jc1060/components/ui/ui_artwork_jpeg.c"
         )
     },
     @{

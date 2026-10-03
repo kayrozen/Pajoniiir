@@ -131,6 +131,22 @@ bool audio_mp3_frame_at(audio_track_read_fn read, void *ctx, size_t pos, size_t 
 size_t audio_pvbr_base(audio_track_read_fn read, void *ctx, const uint32_t *pvbr,
                        uint32_t len, size_t id3_size, size_t file_size);
 
+/*
+ * v302: the table Rekordbox would have written, for a file it never
+ * analysed here (a DJ Link peer track: the peer serves no PVBR, vynull an
+ * all-zero one). Without it every seek was seek_estimate's byte-linear guess,
+ * which lands off on VBR files while the engine reports the target, so the
+ * waveform and the beat grid ran apart from the audio after each cue, hot
+ * cue, loop or beat jump. Walks the frame headers from the end of the ID3v2
+ * tag, frame 0 being the Xing/Info frame, and stores the offset of frame
+ * audio_pvbr_entry_frame(k, N, len) in entry k, N = Xing count + 1: the
+ * engine then seeks it exactly like an exported table. False without a frame
+ * count (CBR files without one seek right by estimate) or when the frames
+ * run out before the last entry.
+ */
+bool audio_pvbr_build(audio_track_read_fn read, void *ctx, size_t file_size,
+                      uint32_t *pvbr, uint32_t len);
+
 typedef struct {
     uint32_t span_ms;             /* analysis */
     uint32_t xing_ms;             /* 0 = no header */

@@ -263,7 +263,14 @@ static void library_apply_meta_to_track(library_track_t *track, const anlz_metad
     if (track->duration_ms == 0u && meta->beat_count > 0 && meta->beats) {
         track->duration_ms = meta->beats[meta->beat_count - 1].time_ms;
     }
-    if (meta->has_waveform_low) {
+    /* v312: the overview comes from the PWV3 detail when there is one, as
+     * for a DJ Link peer track (dj_link_anlz_preview): rekordbox's PWAV is a
+     * low average and drew some tracks nearly flat. PWAV is the fallback. */
+    if (meta->waveform_high && meta->waveform_high_len > 0u &&
+        anlz_preview_from_high(meta->waveform_high, meta->waveform_high_len,
+                               track->waveform_low)) {
+        track->has_waveform = 1;
+    } else if (meta->has_waveform_low) {
         memcpy(track->waveform_low, meta->waveform_low, ANLZ_WAVEFORM_LOW_LEN);
         track->has_waveform = 1;
     }

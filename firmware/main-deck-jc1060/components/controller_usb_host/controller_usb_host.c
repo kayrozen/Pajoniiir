@@ -1744,6 +1744,12 @@ void controller_usb_host_get_work(controller_usb_host_work_t *work_out)
                                          &work_out->isoc_submit_cycles);
 }
 
+void controller_usb_host_take_isoc_cadence(uint32_t *gap_max_us, uint32_t *late,
+                                           uint32_t *late_wr, uint32_t *late_rd)
+{
+    controller_usb_audio_stream_take_cadence(gap_max_us, late, late_wr, late_rd);
+}
+
 void controller_usb_host_get_diagnostics(
     controller_usb_host_diagnostics_t *diag_out)
 {

@@ -65,6 +65,26 @@ bool sd_io_gate_recorder_active(void)
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "stdatomic.h"
+#include "esp_timer.h"
+
+uint32_t g_sd_io_diag_active[SD_IO_DIAG_KINDS];
+uint32_t g_sd_io_diag_end_us[SD_IO_DIAG_KINDS];
+
+void sd_io_gate_diag_begin(sd_io_diag_kind_t kind)
+{
+    if (SD_IO_DIAG_ENABLED && (unsigned)kind < SD_IO_DIAG_KINDS) {
+        (void)__atomic_add_fetch(&g_sd_io_diag_active[kind], 1u, __ATOMIC_RELAXED);
+    }
+}
+
+void sd_io_gate_diag_end(sd_io_diag_kind_t kind)
+{
+    if (SD_IO_DIAG_ENABLED && (unsigned)kind < SD_IO_DIAG_KINDS) {
+        __atomic_store_n(&g_sd_io_diag_end_us[kind], (uint32_t)esp_timer_get_time(),
+                         __ATOMIC_RELAXED);
+        (void)__atomic_sub_fetch(&g_sd_io_diag_active[kind], 1u, __ATOMIC_RELAXED);
+    }
+}
 
 static const char *TAG = "sd_io_gate";
 static SemaphoreHandle_t s_gate;

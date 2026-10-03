@@ -260,6 +260,8 @@ typedef struct {
     uint8_t  fh[DJLINK_NFS_FHSIZE];
     size_t   path_pos;                   /* next element in path[] */
     uint32_t size;                       /* file size from LOOKUP */
+    djlink_nfs_fattr_t attr;             /* the file's LOOKUP attributes, valid
+                                          * from io.open on (size, mtime) */
     uint32_t next_xid;
 
     /* Single request in flight (every phase but READ). */

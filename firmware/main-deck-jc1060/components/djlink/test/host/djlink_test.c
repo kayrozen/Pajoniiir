@@ -187,12 +187,82 @@ static void test_status_parse(void)
     CHECK_EQ(s.bpm100, 12000);
     CHECK_EQ(s.beat, 65);
     CHECK_EQ(s.beat_in_bar, 2);
+    CHECK_EQ(s.master_handoff, 0x00);   /* raw byte, not rewritten */
+    pkt[0x9f] = 0xff;
+    CHECK_EQ(djlink_status_parse(pkt, sizeof(pkt), &s), DJLINK_OK);
+    CHECK_EQ(s.master_handoff, 0xff);
+    pkt[0x9f] = 4;
+    CHECK_EQ(djlink_status_parse(pkt, sizeof(pkt), &s), DJLINK_OK);
+    CHECK_EQ(s.master_handoff, 4);
+    CHECK_EQ(djlink_status_parse(pkt, 0x9f, &s), DJLINK_OK);
+    CHECK_EQ(s.master_handoff, 0xff);   /* not present = none */
 
     /* Older/shorter players: missing fields zeroed, no crash. */
     CHECK_EQ(djlink_status_parse(pkt, 0x40, &s), DJLINK_OK);
     CHECK(s.active);
     CHECK(!s.has_flag_bits);
     CHECK_EQ(s.bpm100, 0);
+}
+
+/* Build -> parse round trip, plus the offsets vynull's parser reads. */
+static void test_status_build(void)
+{
+    djlink_status_t in, s;
+    uint8_t pkt[DJLINK_STATUS_PACKET_LEN];
+    memset(&in, 0, sizeof(in));
+    djlink_name_from_str("PAJONIIIR", in.name);
+    in.device_number = 3;
+    in.active = true;
+    in.source_device = 17;
+    in.source_slot = DJLINK_SLOT_LAPTOP;
+    in.rekordbox_id = 0x1234;
+    in.play_state = DJLINK_PLAY_PLAYING;
+    in.flags = DJLINK_FLAG_PLAYING | DJLINK_FLAG_SYNC;
+    in.pitch_raw = 0x00100000 + 0x0147ae; /* +8% */
+    in.bpm100 = 12800;
+    in.beat = 0xffffffffu;
+    CHECK_EQ(djlink_status_build(&in, 7, pkt, sizeof(pkt) - 1u), DJLINK_ERR_BOUNDS);
+    CHECK_EQ(djlink_status_build(NULL, 7, pkt, sizeof(pkt)), DJLINK_ERR_NULL);
+    CHECK_EQ(djlink_status_build(&in, 7, pkt, sizeof(pkt)), (int)DJLINK_STATUS_PACKET_LEN);
+    CHECK(djlink_packet_is_valid(pkt, sizeof(pkt)));
+    CHECK_EQ(djlink_status_parse(pkt, sizeof(pkt), &s), DJLINK_OK);
+    CHECK(memcmp(s.name, in.name, DJLINK_NAME_LEN) == 0);
+    CHECK_EQ(s.revision, 0x03);
+    CHECK_EQ(s.device_number, 3);
+    CHECK_EQ(s.lenr, 0xb0);
+    CHECK(s.active);
+    CHECK_EQ(s.source_device, 17);
+    CHECK_EQ(s.source_slot, DJLINK_SLOT_LAPTOP);
+    CHECK_EQ(s.rekordbox_id, 0x1234);
+    CHECK_EQ(s.play_state, DJLINK_PLAY_PLAYING);
+    CHECK_EQ(s.flags, DJLINK_FLAG_PLAYING | DJLINK_FLAG_SYNC);
+    CHECK_EQ(s.pitch_raw, 0x00100000 + 0x0147ae);
+    CHECK_EQ(s.bpm_state, 0x8000);
+    CHECK_EQ(s.bpm100, 12800);
+    CHECK_EQ(s.beat, 0xffffffffu);
+    CHECK_EQ(pkt[0x24], 3);              /* vynull: device number */
+    CHECK_EQ(pkt[0x27], 1);              /* vynull: active */
+    CHECK_EQ(pkt[0x2a], 0x01);           /* rekordbox track */
+    CHECK_EQ(pkt[0x8b], 0x7a);           /* P2 playing */
+    CHECK_EQ(pkt[0x9d], 0x09);           /* P3 playing */
+    CHECK_EQ(djlink_rd32(&pkt[0xc8]), 7u);
+    CHECK_EQ(pkt[0x9f], 0xff);           /* Mh: 0 builds as none */
+    CHECK_EQ(s.master_handoff, 0xff);
+    in.master_handoff = 2;
+    CHECK_EQ(djlink_status_build(&in, 7, pkt, sizeof(pkt)), (int)DJLINK_STATUS_PACKET_LEN);
+    CHECK_EQ(pkt[0x9f], 2);
+    CHECK_EQ(djlink_status_parse(pkt, sizeof(pkt), &s), DJLINK_OK);
+    CHECK_EQ(s.master_handoff, 2);
+    in.master_handoff = 0;
+
+    /* No track: P3 0, track type 0. */
+    in.play_state = DJLINK_PLAY_NO_TRACK;
+    in.flags = 0;
+    in.bpm100 = 0xffff;
+    CHECK_EQ(djlink_status_build(&in, 8, pkt, sizeof(pkt)), (int)DJLINK_STATUS_PACKET_LEN);
+    CHECK_EQ(pkt[0x2a], 0x00);
+    CHECK_EQ(pkt[0x8b], 0x7e);
+    CHECK_EQ(pkt[0x9d], 0x00);
 }
 
 static void test_keepalive(void)
@@ -236,6 +306,7 @@ int main(void)
     test_beat_roundtrip();
     test_position_roundtrip();
     test_status_parse();
+    test_status_build();
     test_keepalive();
     if (failures == 0) {
         printf("all djlink tests passed\n");

@@ -7,6 +7,7 @@
 #include "freertos/queue.h"
 #include "control_link.h"
 #include "deck_loaded_track_types.h"
+#include "deck_net_sync.h"
 
 struct anlz_metadata;
 
@@ -44,6 +45,7 @@ typedef struct {
     ctrl_pad_mode_t pad_mode;
     bool          sync_enabled;
     bool          sync_master;
+    uint8_t       sync_net;       // v304: deck_net_sync_status_t, OFF = local/no sync
     bool          quantize_enabled;
     deck_core_loop_adjust_mode_t loop_adjust_mode;
     bool          censor_active;
@@ -127,6 +129,27 @@ bool deck_core_get_jog_cdj_mode(void);
 void deck_core_set_load_lock(bool on);
 bool deck_core_get_load_lock(void);
 bool deck_core_load_allowed(uint8_t deck);
+/* v304: LINK SYNC Settings switch, off by default. On, SYNC follows the DJ
+ * Link beat clock while one is fresh (deck_net_sync.h) instead of the other
+ * deck; off drops every network-synced deck. Any task may set it. */
+void deck_core_set_net_sync_enabled(bool on);
+bool deck_core_get_net_sync_enabled(void);
+/* v305: SYNC / SYNC MASTER changes the DJ Link network asks for (sync control
+ * 0x2a, tempo master handoff). Queued to the deck task without waiting, from
+ * any task; the deck task applies them like the buttons. */
+typedef enum {
+    DECK_CORE_NET_SYNC_ON = 1,
+    DECK_CORE_NET_SYNC_OFF,
+    DECK_CORE_NET_MASTER_TAKE,
+    DECK_CORE_NET_MASTER_DROP,
+} deck_core_net_cmd_t;
+void deck_core_net_command(uint8_t deck, deck_core_net_cmd_t cmd);
+/* v304: the DJ Link beat clock, from the dj_link task (seqlock, never
+ * blocks). The getter is for the UI (top bar beat-in-bar). */
+void deck_core_set_net_clock(const deck_net_clock_t *clock);
+void deck_core_get_net_clock(deck_net_clock_t *out);
+/* v304: the clock deck_net_sync compares anchors with (esp_timer ms). */
+uint32_t deck_core_net_clock_now_ms(void);
 /* v275: tempo fader range (6/10/16 %, anything else -> 10) shared by both
  * decks; the faders are rescaled on the deck task. Shift+TEMPO RANGE cycles
  * it too, and the UI task persists whatever the getter returns. */
@@ -207,6 +230,27 @@ bool deck_core_get_hot_cues(uint8_t deck, deck_core_hot_cues_t *out);
 /* Bumped on every change of the published hot-cue view (any deck), so the UI
  * can refresh cue displays without polling the slots every frame. */
 uint32_t deck_core_hot_cues_revision(void);
+
+/* v309: memory cues of the loaded track by time (the analysis' plus the ones
+ * added with MEMORY), as held by the deck actor. known false until the actor
+ * has read them for the loaded track. */
+#define DECK_CORE_MEMORY_CUE_MAX 16u
+
+typedef struct {
+    uint32_t pos_ms;
+    uint32_t end_ms;    /* memory loop end; 0 = a point */
+    bool     local;     /* added on the deck (MEMORY), not from the analysis */
+} deck_core_memory_cue_t;
+
+typedef struct {
+    bool     known;
+    uint8_t  count;
+    deck_core_memory_cue_t cues[DECK_CORE_MEMORY_CUE_MAX];
+} deck_core_memory_cues_t;
+
+bool deck_core_get_memory_cues(uint8_t deck, deck_core_memory_cues_t *out);
+/* Bumped on every change of the published memory cues (any deck). */
+uint32_t deck_core_memory_cues_revision(void);
 
 /*
  * Drain controller-originated UI commands. ui_update() is the sole firmware

@@ -40,6 +40,8 @@ static uint32_t count[2], len_ms[2], pos_ms[2], cue_ms[2];
 static float tempo[2] = { 1.2f, -0.4f };
 static float bpm[2];
 static bool playing[2] = { true, false }, mt_on[2] = { true, false }, cue_held[2];
+/* v304: deck 1 follows a DJ Link master, deck 2 is free. */
+static dj_sync_t sync_on[2] = { DJ_SYNC_LINK_LOCKED, DJ_SYNC_OFF };
 static uint8_t fx_beat = 1;
 static bool fx_on = true;
 
@@ -93,7 +95,12 @@ static void push_library(void)
 {
     for (int i = 0; i < 8; i++) order[i] = (uint8_t)i;
     qsort(order, 8, 1, cmp_sort);
-    for (int r = 0; r < 8; r++) page[r] = lib_src[order[r]];
+    for (int r = 0; r < 8; r++) {
+        page[r] = lib_src[order[r]];
+        /* v307: the row being downloaded carries its progress bar */
+        page[r].has_progress = load_deck >= 0 && order[r] == load_id;
+        page[r].progress = load_pct;
+    }
     dj_ui_library_set_rows(page, 8);
     for (int d = 0; d < 2; d++) {
         int8_t row = -1;
@@ -276,10 +283,14 @@ static void load_step(lv_timer_t *t)
         dj_ui_library_set_progress(load_pct);
         snprintf(b, sizeof b, "D%d LOAD %u%%", load_deck + 1, load_pct);
         dj_ui_set_status(b, DJ_TONE_INFO);
+        dj_ui_set_load_progress((uint8_t)load_deck, load_pct, false);
+        push_library();
         return;
     }
     uint8_t d = (uint8_t)load_deck;
     lv_timer_pause(load_timer);
+    dj_ui_set_load_progress(d, -1, false);
+    load_deck = -1;
     loaded_id[d] = (int8_t)load_id;
     load_track(d, load_id);
     push_library();
@@ -290,7 +301,6 @@ static void load_step(lv_timer_t *t)
     dj_ui_library_set_load_enabled(true);
     dj_ui_set_status("TRACK LOADED", DJ_TONE_OK);
     if (d == 0) push_fx();
-    load_deck = -1;
 }
 
 static void on_lib_load(uint8_t deck, uint8_t row)
@@ -302,6 +312,8 @@ static void on_lib_load(uint8_t deck, uint8_t row)
     dj_ui_library_set_load_enabled(false);
     dj_ui_library_set_status("LOADING FROM #3", DJ_TONE_INFO);
     dj_ui_library_set_progress(0);
+    dj_ui_set_load_progress(deck, 0, true);
+    push_library();
     lv_timer_resume(load_timer);
 }
 
@@ -358,6 +370,11 @@ static void on_cue(uint8_t d)
 }
 
 static void on_master_tempo(uint8_t d) { mt_on[d] = !mt_on[d]; dj_ui_set_master_tempo(d, mt_on[d]); }
+static void on_sync(uint8_t d)
+{
+    sync_on[d] = sync_on[d] == DJ_SYNC_OFF ? DJ_SYNC_LOCAL : DJ_SYNC_OFF;
+    dj_ui_set_sync(d, sync_on[d]);
+}
 
 static void on_seek(uint8_t d, uint32_t ms, dj_wave_t wave)
 {
@@ -419,6 +436,7 @@ void dj_ui_demo_start(void)
         .on_hotcue = on_hotcue, .on_fx_beat = on_fx_beat, .on_fx_toggle = on_fx_toggle,
         .on_lib_load = on_lib_load, .on_lib_sort = on_lib_sort, .on_lib_source = on_lib_source,
         .on_play = on_play, .on_cue = on_cue, .on_master_tempo = on_master_tempo, .on_seek = on_seek,
+        .on_sync = on_sync,
         .on_target = on_target, .on_field = on_field, .on_link = on_link, .on_record = on_record,
         .on_wake = on_wake,
     };
@@ -444,6 +462,7 @@ void dj_ui_demo_start(void)
     for (uint8_t d = 0; d < 2; d++) {
         dj_ui_set_transport(d, playing[d], false);
         dj_ui_set_master_tempo(d, mt_on[d]);
+        dj_ui_set_sync(d, sync_on[d]);
     }
 
     push_library();

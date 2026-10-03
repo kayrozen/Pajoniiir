@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "djlink/beat.h"
+#include "djlink/claim.h"
 #include "djlink/status.h"
 
 #define DJ_LINK_BPM100_NO_TRACK 0xffffu
@@ -42,6 +43,7 @@ static dj_link_peer_t *peer_slot(dj_link_table_t *table,
     memset(p, 0, sizeof(*p));
     p->in_use = true;
     p->device_number = device_number;
+    p->master_handoff = 0xffu;
     djlink_name_to_str(name, p->name);
     p->last_seen_ms = now_ms;
     return p;
@@ -71,6 +73,7 @@ static dj_link_rx_t ingest_beat(dj_link_table_t *table, const uint8_t *buf,
     p->beat_in_bar = beat.beat_in_bar;
     p->beat_interval_ms = beat.next_beat_ms;
     float bpm = bpm_from_track(beat.bpm100, beat.pitch_raw);
+    p->beat_bpm = bpm > 0.0f ? bpm : 0.0f;
     if (bpm > 0.0f) {
         p->bpm = bpm;
         p->pitch_pct = djlink_pitch_raw_to_percent(beat.pitch_raw);
@@ -120,6 +123,7 @@ static dj_link_rx_t ingest_status(dj_link_table_t *table, const uint8_t *buf,
         p->playing = (st.flags & DJLINK_FLAG_PLAYING) != 0u;
         p->synced  = (st.flags & DJLINK_FLAG_SYNC) != 0u;
     }
+    p->master_handoff = st.master_handoff;
     if (st.bpm100 == DJ_LINK_BPM100_NO_TRACK) {
         p->bpm = 0.0f;
     } else {
@@ -128,6 +132,27 @@ static dj_link_rx_t ingest_status(dj_link_table_t *table, const uint8_t *buf,
             p->bpm = bpm;
             p->pitch_pct = djlink_pitch_raw_to_percent(st.pitch_raw);
         }
+    }
+    return DJ_LINK_RX_ACCEPTED;
+}
+
+/* v297: keep-alive 0x06 (port 50000): number 0x24, type 0x21, IPv4 0x2c,
+ * name 0x0c..0x1f like the rest of the claim family. */
+static dj_link_rx_t ingest_keepalive(dj_link_table_t *table, const uint8_t *buf,
+                                     size_t len, uint32_t src_ip, uint32_t now_ms)
+{
+    if (len < DJLINK_KEEPALIVE_PACKET_LEN || buf[0x24] == 0u ||
+        (buf[0x21] != DJLINK_DEVICE_TYPE_CDJ &&
+         buf[0x21] != DJ_LINK_DEVICE_TYPE_REKORDBOX)) {
+        return DJ_LINK_RX_DROPPED;
+    }
+    dj_link_peer_t *p = peer_slot(table, buf[0x24], &buf[0x0c], now_ms);
+    p->device_type = buf[0x21];
+    uint32_t ip = djlink_rd32(&buf[0x2c]);
+    if (src_ip) {
+        p->ip = src_ip;
+    } else if (ip) {
+        p->ip = ip;
     }
     return DJ_LINK_RX_ACCEPTED;
 }
@@ -149,7 +174,9 @@ dj_link_rx_t dj_link_table_ingest_from(dj_link_table_t *table, uint16_t port,
     dj_link_rx_t rx = DJ_LINK_RX_DROPPED;
     if (len <= DJLINK_MAX_PACKET && djlink_packet_is_valid(buf, len)) {
         int type = djlink_packet_type(buf, len);
-        if (port == DJLINK_PORT_BEAT && type == (int)DJLINK_TYPE_BEAT) {
+        if (port == DJLINK_PORT_DISCOVERY && type == (int)DJLINK_TYPE_KEEPALIVE) {
+            rx = ingest_keepalive(table, buf, len, src_ip, now_ms);
+        } else if (port == DJLINK_PORT_BEAT && type == (int)DJLINK_TYPE_BEAT) {
             rx = ingest_beat(table, buf, len, src_ip, now_ms);
         } else if (port == DJLINK_PORT_BEAT && type == (int)DJLINK_TYPE_ABS_POSITION) {
             rx = ingest_position(table, buf, len, src_ip, now_ms);
@@ -204,8 +231,9 @@ void dj_link_table_summarize(const dj_link_table_t *table,
             continue;
         }
         out->peer_count++;
-        if (p->ip && p->device_number >= 1u &&
-            p->device_number <= DJ_LINK_MAX_PLAYER_NUMBER) {
+        bool collection = p->device_type == DJ_LINK_DEVICE_TYPE_REKORDBOX;
+        if (p->ip && (collection || (p->device_number >= 1u &&
+                                     p->device_number <= DJ_LINK_MAX_PLAYER_NUMBER))) {
             /* Insertion by number; at most DJ_LINK_MAX_PEERS entries. */
             uint8_t at = out->player_count;
             while (at > 0u && out->players[at - 1u].number > p->device_number) {
@@ -215,6 +243,7 @@ void dj_link_table_summarize(const dj_link_table_t *table,
             out->players[at].number = p->device_number;
             memcpy(out->players[at].name, p->name, sizeof(out->players[at].name));
             out->players[at].ip = p->ip;
+            out->players[at].collection = collection;
             out->player_count++;
         }
         if (p->has_status && p->master &&
@@ -235,6 +264,56 @@ void dj_link_table_summarize(const dj_link_table_t *table,
         out->master_confirmed = confirmed != NULL;
         out->master = *master;
     }
+}
+
+static bool beat_clock_candidate(const dj_link_peer_t *p, uint32_t now_ms)
+{
+    if (!p->in_use || !p->has_beat || !(p->beat_bpm > 0.0f) ||
+        (p->has_status && !p->playing)) {
+        return false;
+    }
+    const float since_ms = (float)(uint32_t)(now_ms - p->beat_rx_ms);
+    return since_ms * p->beat_bpm <= DJ_LINK_BEAT_CLOCK_STALE_BEATS * 60000.0f;
+}
+
+void dj_link_table_beat_clock(const dj_link_table_t *table, uint8_t prefer,
+                              uint32_t now_ms, dj_link_beat_clock_t *out)
+{
+    if (!out) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!table) {
+        return;
+    }
+    const dj_link_peer_t *confirmed = NULL;
+    const dj_link_peer_t *preferred = NULL;
+    const dj_link_peer_t *newest = NULL;
+    for (size_t i = 0; i < DJ_LINK_MAX_PEERS; i++) {
+        const dj_link_peer_t *p = &table->peers[i];
+        if (!beat_clock_candidate(p, now_ms)) {
+            continue;
+        }
+        if (p->has_status && p->master &&
+            (!confirmed || p->device_number < confirmed->device_number)) {
+            confirmed = p;
+        }
+        if (prefer != 0u && p->device_number == prefer) {
+            preferred = p;
+        }
+        if (!newest || (int32_t)(p->beat_rx_ms - newest->beat_rx_ms) > 0) {
+            newest = p;
+        }
+    }
+    const dj_link_peer_t *p = confirmed ? confirmed : preferred ? preferred : newest;
+    if (!p) {
+        return;
+    }
+    out->valid = true;
+    out->player = p->device_number;
+    out->beat_in_bar = p->beat_in_bar >= 1u && p->beat_in_bar <= 4u ? p->beat_in_bar : 0u;
+    out->anchor_ms = p->beat_rx_ms;
+    out->period_us = (uint32_t)(60000000.0f / p->beat_bpm + 0.5f);
 }
 
 float dj_link_peer_beat_phase(const dj_link_peer_t *peer, uint32_t now_ms)
@@ -273,10 +352,13 @@ void dj_link_format_status(const dj_link_summary_t *summary,
     default:
         break;
     }
-    /* "P4" = the player number we hold on the network; "joining" while the
-     * claim sequence is still running. */
+    /* "P4+P3" = the player numbers decks 1 and 2 hold on the network;
+     * "joining" while deck 1's claim sequence is still running. */
     char us[16];
-    if (summary->our_number != 0u) {
+    if (summary->our_number != 0u && summary->our_number_d2 != 0u) {
+        snprintf(us, sizeof(us), "ON P%u+P%u", (unsigned)summary->our_number,
+                 (unsigned)summary->our_number_d2);
+    } else if (summary->our_number != 0u) {
         snprintf(us, sizeof(us), "ON P%u", (unsigned)summary->our_number);
     } else {
         snprintf(us, sizeof(us), "ON joining");

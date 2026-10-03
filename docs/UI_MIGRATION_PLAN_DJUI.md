@@ -389,8 +389,10 @@ Le peer DJ Link n'a pas pu être testé (pas de CDJ disponible) :
 - Tri : un appui sur une nouvelle colonne trie en ascendant, un 2e appui sur
   la colonne allumée inverse. `dj_ui` ne s'allume plus tout seul
   (`dj_ui_library_set_sort(sort, desc)`, flèche haut/bas), donc un refus
-  (liste pair « SORT: LOCAL ONLY », « LOAD BUSY ») laisse les boutons
-  inchangés. Liste pair : aucune colonne allumée. Un rechargement du catalogue
+  (playlist « SORT: ALL TRACKS ONLY », « LOAD BUSY ») laisse les boutons
+  inchangés. Liste pair (v310) : le player trie lui-même ; 1er appui
+  ascendant, 2e descendant, 3e ordre du player (aucune colonne allumée). La
+  colonne suit le tri de la liste servie. Un rechargement du catalogue
   (nouvelle génération, ordre de chargement) éteint le tri. Les boutons legacy
   (flag OFF) gardent leurs bascules par colonne.
 - Pagination : PREV / NEXT grisés (opacité 40 %) en première / dernière page ;

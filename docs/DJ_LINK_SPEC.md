@@ -77,6 +77,47 @@ Phase 1 — passive observer (highest value, lowest risk):
   Without Phase 2 keep-alives the CDJs may send no `0a` status, so the master
   is then inferred from beats (shown with `?`). Broadcasts are only heard on
   the P4's own subnet (no AutoIP / link-local yet).
+- Status (v304, JC1060, not yet hardware-tested): bar position and the sync
+  feed are done. The P4 follows the network master; taking master
+  (`2a` / `26` / `27`) is Phase 4, v305.
+  - Beat clock (`dj_link_table_beat_clock`):
+    - the source is a confirmed status master, otherwise the player
+      already followed while its beats are fresh, otherwise the newest
+      beat;
+    - a candidate needs a beat `0x28` no older than 2.5 beats and must not
+      report "stopped" in its `0x0a`;
+    - the clock is the rx time of the last beat, the beat in bar, and the
+      period from the packet's track BPM ×100 and pitch. `0x0b` BPM ×10 is
+      too coarse to drive the period.
+  - The dj_link task hands the clock to `deck_core` on every change through
+    the `beat_clock` hook. The store is a seqlock, never a wait. Both sides
+    stamp with `esp_timer` ms.
+  - Top bar: the master's beat in bar is lit per UI frame from that clock
+    (`deck_net_clock_beat_in_bar`).
+  - Sync (`deck_net_sync.c`, pure, host-tested):
+    - Settings LINK SYNC (`dj_link_sync`, NVS `djlink_sync`, default OFF)
+      makes a SYNC press, from the controller or the new touch SYNC button,
+      follow the network master when its clock is fresh. Otherwise SYNC is
+      the local BEAT SYNC, as before.
+    - Every 40 ms the deck task matches the tempo (master effective BPM over
+      the local grid BPM, within ±20 %) and adds a proportional phase trim:
+      10 % per beat, ±1 % max, 0.004-beat deadband.
+    - The pitch goes through `audio_engine_deck_set_pitch_percent`, an
+      atomic store. No audio-path change, no allocation.
+    - The bar is snapped by an ordinary seek on PLAY, on engage while
+      playing, or when the error stays above 0.25 beat for 1 s (at most one
+      snap per 2 s, then 300 ms without trim).
+    - A paused deck never seeks; a held jog keeps the pitch; a stopped or
+      lost master leaves the deck at its last tempo (WAIT).
+    - Button colour: amber = WAIT/ALIGNING, green = LOCKED (< 0.05 beat),
+      blue = local sync. A net-synced deck never reports itself as master in
+      its `0x0a`.
+  - Limits:
+    - half/double tempo (over ±20 %) is out of reach: WAIT;
+    - no output-latency compensation; the offset must be measured on
+      hardware;
+    - the master's own beats are timed with the jitter of its packets and of
+      the dj_link task.
 
 Phase 2 — virtual CDJ:
 - Send keep-alives + stage claims on 50000 (device number configurable,
@@ -88,6 +129,18 @@ Phase 2 — virtual CDJ:
   auto number in the order 4,3,2,1,5,6, skipping numbers heard in the last
   5 s. We re-claim on `08` or on a keep-alive carrying our number; we never
   defend it. Device type CDJ, keep-alive `06` every 2.0 s.
+- Since v308 our two decks (v298, one MAC/IP) claim in deck order, because
+  vynull and beat-link list players by number, not by arrival. Deck 1
+  (`DJ_LINK_PAIR_LOW`) takes the low number of the first free pair 3/4, 2/3,
+  1/2, 5/6, 4/5. Deck 2 (`DJ_LINK_PAIR_HIGH`) starts once deck 1 is active
+  and takes the nearest free number above it. Alone on the network this is
+  3/4, as two CDJs; the same network always gives the same numbers, also
+  after a dj_link restart. A re-claim keeps the order (deck 1 below deck 2,
+  deck 2 above deck 1). Only when no ordered number is free does a deck fall
+  back to the 4,3,2,1,5,6 order, and the two decks still never share a
+  number. A load-track `19` goes to the deck whose number is `0x40` + 1, so
+  routing follows the numbers actually held (player 3 = deck 1, player 4 =
+  deck 2). The numbers are not stored in NVS.
 - Media query `05` gets a `06` reply, unicast only: our USB slot,
   "PAJONIIIR LIBRARY", track count, 500 ms per-querier limit, no reply when
   the library is empty. The advertised media cannot be browsed yet: we do not
@@ -115,6 +168,20 @@ Phase 2b — browse peer libraries (dbserver client, peer → us):
   3. Context setup with our player number.
   4. All-tracks menu `0x1004` (DMST = `our<<24 | 1<<16 | slot<<8 | 1`, USB
      slot only) → `0x4000` with the item count.
+     Argument 1 is the sort order. Since v310 the Library sort columns set
+     it: title 1, artist 2, BPM 4, key 0x0c, and 0 for the player's own order
+     (CDJ codes, applied by vynull `dbserver/menuitem.go`). The protocol
+     sorts ascending only, so descending reverses the list on the P4. Its
+     rows are published once the list is complete. Every change lists the
+     player again (new generation). Selecting another player goes back to
+     its own order.
+     Since v311 the Library also opens the player's playlists with
+     `0x1105` `[DMST, sort 0, id, folder]` (beat-link MenuLoader, vynull
+     `dbserver/playlist.go`). folder 1 lists folder `id` (0 = root): rows
+     of item type `0x0001` are folders and `0x0008` playlists, and the row
+     id is the folder or playlist id. folder 0 lists the tracks of playlist
+     `id` in its own order. Playlists are never sorted. Folder and playlist
+     rows have no metadata and are never downloaded.
   5. Render `0x3000` in batches of 64 (`0x4001` / `0x4101` items / `0x4201`).
      Each item gives rekordbox id, title and artist.
   6. Duration and BPM come from a metadata request `0x2002` per row. It is sent
@@ -146,8 +213,13 @@ Phase 2b — browse peer libraries (dbserver client, peer → us):
     refuse dbserver queries from numbers above 4 (djl-analysis); expect
     `BAD REPLY` then.
   - The artist in the list is the menu's second label and depends on the
-    peer's sort. The metadata request overwrites it with the real artist for
-    the visible rows.
+    peer's sort. It is taken only from "title + artist" items (`0x0704`).
+    vynull's default list item is `0x0d04` ("128.0 bpm - 8A"), so its rows
+    carry no artist. The metadata request brings the real artist for the
+    visible rows. Since v307 it is also sent first for the row being loaded,
+    wherever that row is listed (for example, a network load-track off the
+    visible page). The deck takes that artist at load time, or later if the
+    reply comes after the load.
   - SD / rekordbox-collection slots and playlists are not browsed yet.
 
 Audio for peer tracks (v249 decision). The dbserver never serves audio. The
@@ -205,8 +277,15 @@ Phase 2c — peer track download (NFS client, peer → us):
 - Steps of one LOAD:
   1. The job downloads `PIONEER/rekordbox/export.pdb` from the peer's USB
      export `/C/` to `/sd/djlcache/PEER.PDB`. It falls back to
-     `.PIONEER/...` for HFS+ media. The file is reused while the same peer,
-     IP and browse generation stay selected.
+     `.PIONEER/...` for HFS+ media. v303: the NFS lookup and GETATTR run
+     on every LOAD. The cached copy is kept, and nothing is read, only
+     while the peer's size and mtime match the ones it was fetched with
+     (`dj_link_pdb_stamp_t`, checked in the NFS open hook). v302 reused it
+     for as long as the peer, IP and browse generation stayed selected, so
+     a source edit under the same selection was never fetched. A server
+     without an mtime (0) always refetches. A rekordbox collection peer
+     (vynull's default mode, device type `0x03`) never uses `PEER.PDB`:
+     its path comes from the dbserver on every LOAD.
   2. `dj_link_pdb_find_track()` walks the Tracks table page by page to find
      the file path.
   3. The audio file downloads to `FETCH.TMP`. It is written under
@@ -221,6 +300,12 @@ Phase 2c — peer track download (NFS client, peer → us):
 - UI:
   - The source line shows `READING DB NN%`, then `DOWNLOAD NN%`.
   - The fetching row shows `DB` or `NN%` in place of `NET`.
+  - v307: progress bars, fed by the fetch status that `ui_update()` already
+    polls (non-blocking, no allocation, LVGL task only):
+    - a thin bar along the bottom of the fetching row;
+    - a 4 px bar in the target deck's footer, under the title and artist.
+      It is dim while the export.pdb is read and in the deck colour during
+      the download. It hides when the fetch ends.
   - The SOURCE button becomes `CANCEL` while a fetch runs. Cancelling
     deletes the partial file.
   - After loading, the UI shows `D<n> LOADED (DJ LINK)`.
@@ -235,8 +320,144 @@ Phase 2c — peer track download (NFS client, peer → us):
     requests in flight.
   - The first LOAD after a new browse selection downloads `export.pdb` first,
     which is several MB on large libraries.
-  - Peer tracks get no ANLZ, waveform, beat grid or PVBR. The engine computes
-    the duration itself.
+  - Since v300, a peer track gets its waveform and beat grid from the
+    peer's dbserver, not from the NFS export (a rekordbox collection source
+    such as vynull has no ANLZ file to fetch). Once the audio is cached, the
+    job asks the browse session (`dj_link_db_want_blob`) for:
+    - wave detail `0x2904` `[dmst, id, 0]` → `0x4a02`, blob = the PWV3 body
+      (1 byte per 1/150 s, bits 4:0 height, bits 7:5 whiteness);
+    - beat grid `0x2204` `[dmst, id]` → `0x4602`, blob = 20-byte preamble,
+      then 16 little-endian bytes per beat (u16 beat in bar 1..4, u16 BPM
+      ×100, u32 time ms, 8 bytes padding).
+
+    The replies are larger than the 4 KiB RX buffer, so the client streams
+    the blob into a PSRAM buffer (wave ≤ 128 KiB, grid ≤ 4096 beats). An
+    empty reply means "no data". `dj_link_anlz` writes them as
+    `/sd/djlcache/<key>.EXT` (PMAI + PWV3) and `<key>.DAT` (PMAI, PPTH, PQTZ,
+    PWAV = 400-column preview of the detail). The load worker parses them
+    with the same `anlz_parse_dat` / `anlz_parse_ext` as a local USB track,
+    so the deck gets its overview, scrolling waveform, beat grid and precise
+    duration. `<key>.DAT` in the cache means the analysis is done; prune
+    keeps `<key>.*`. The analysis step gives up after 10 s, or when the
+    browse session fails or changes, and the track then loads without it.
+  - Analysis refresh and source cues (v303, after v302 HIL showed beat grid
+    and cue edits made in vynull never reaching the deck):
+    - Cache keys: `dj_link_peer_track_key` is an FNV-1a of peer IP, player
+      number and rekordbox id only, with no size or date. A cached
+      `<key>.DAT` was never asked for again, and peer cues were never
+      fetched. On local USB tracks, `track_meta_cache` is keyed by the
+      DAT/EXT size and mtime, but the peer path parses the DAT directly.
+    - The job now asks for wave, grid, the cue list and (if `<key>.JPG` is
+      missing) the artwork on every LOAD, cache hit included, with a 4 s
+      deadline when the DAT is cached (10 s otherwise). The deck is told
+      the track is ready only after that, so a cache-hit load can take up to
+      4 s longer when the source is slow. It all stays in the dj_link task,
+      before the load, with nothing in the audio path.
+    - `dj_link_anlz_commit` decides what to keep. With no cached DAT,
+      whatever arrived is written. A cached DAT is replaced only when all
+      three requests got a typed reply (`io.blob` `answered`) and something
+      is non-empty, so a timeout or an unsupported request keeps the
+      cache. If the new answer has no wave, a stale `<key>.EXT` is
+      deleted.
+    - Cue list: nxs2 `0x2b04` `[dmst, id, 0]` → `0x4e02`
+      `[0x2705, 0, len, blob, count]`. The blob holds the entries back to
+      back, little-endian:
+      - u32 length (124, or 76 for legacy);
+      - u16 number at `0x04` (1..8 = hot cue A..H, other = memory cue);
+      - u16 type at `0x06` (2 = loop);
+      - u32 time ms at `0x0c`;
+      - u32 loop end at `0x20`.
+
+      vynull's empty answer is `[0x2b04, 1, 0, 0]` with a binary tag
+      declared and an int32 in its place. The client consumes that int, so
+      the next request stays framed.
+    - The cues are written in the DAT as two PCOB sections, hot cues
+      (list 1) then memory cues (list 0), with 0x38-byte PCPT entries. The
+      sections are written even when empty, but only if the cue request was
+      answered. `anlz_parse_dat` sets `has_cue_lists` when it reads such a
+      list.
+    - Since v309 `anlz_parse_dat` keeps every memory cue of list 0, by
+      time, at most the earliest 16 (`memory_cues`). Before, only the
+      earliest one was kept, as the load cue. The deck walks them with
+      CUE/LOOP CALL and draws them on the waveform. Edits made on the deck
+      (MEMORY / DELETE) stay in P4 NVS and are never sent back to the peer.
+    - Cue origin (`hot_cue_store` blob, `source_mask` / `cue_from_source`,
+      same size and version): `hot_cue_store_merge_source` applies on load.
+      - Pads and the CUE button set by the user stay local and always win.
+      - Slots and the cue point that came from the analysis follow it, and
+        are dropped when the source drops them.
+      - Without cue lists, the stored cues stay as they are.
+      - Blobs saved before v303 read back as all-local. Their seeded cues no
+        longer follow the source until cleared: shift+pad clears a hot cue
+        and shift+CUE clears the cue point, which then reseed from the
+        analysis.
+    - Not refreshed:
+      - the cached audio file, whose key does not change;
+      - `<key>.JPG` once present;
+      - `<key>.VBR`, which depends only on the audio.
+
+      A NFS LOOKUP-size check on the audio is the next step if a source
+      re-exports audio under the same id.
+  - Artwork (v300): the artwork id is argument 8 of a title item
+    (item type `& 0xff == 0x04`), both in the list render and in the
+    metadata `0x2002` reply, so the browse row carries it. After the grid,
+    the job asks for artwork `0x2003` `[dmst, artwork_id]` → `0x4002`
+    `[request, 0, len, JPEG]` into a 64 KiB PSRAM buffer (vynull downsizes
+    covers above 32 KiB). A JPEG larger than the buffer is dropped whole.
+    vynull's "not found" is `[request, 0x32, 0]` with a fourth (blob) tag
+    declared but never sent; the client stops at that tag when the status
+    is non-zero. The JPEG is written as `/sd/djlcache/<key>.JPG` before the
+    DAT. `ui_artwork` falls back to that file under `sd_io_gate` when the
+    catalog has no artwork for a deck key (deck headers only, not while
+    recording), so the cover takes the local decode and cache path. A track
+    whose artwork id is 0 in the browse row gets no cover.
+  - Artwork fixes (v302, after v301 HIL showed no cover on the deck):
+    - A cached DAT used to skip the whole step, JPG included, so tracks
+      cached before v300 never got a cover. `dj_link_anlz_plan` now fetches
+      the analysis only without a DAT, and the artwork alone when the DAT is
+      cached but the JPG is not (replaced in v303 by
+      `dj_link_anlz_commit`, below).
+    - `ui_artwork` cached "no cover" for a key. A peer load now calls
+      `ui_artwork_forget`, so the JPG fetched with the track is read.
+    - Format: vynull re-encodes every cover with ffmpeg
+      (`-c:v mjpeg -q:v 5`, 240x240). A JPEG source comes out 4:2:0 and
+      decodes. A PNG source comes out `yuvj444p` with all three components
+      sampled 1x2 (`0x12`). TJpgDec (the LVGL copy, which we do not patch)
+      only accepts Y `0x11`/`0x21`/`0x22` with Cb/Cr `0x11`, so it returns
+      `JDR_FMT3` and the deck shows no cover. `ui_artwork_jpeg_probe` names
+      the reason in the warning (`sampling 12/12/12: chroma sampling`).
+      Fix on the vynull side: add `-pix_fmt yuvj420p` to its two ffmpeg
+      artwork commands (`analysis/artwork.go`).
+  - Peer cues come from `0x2b04` since v303 (above). The plain cue list
+    `0x2104` is still not used. The engine computes the duration itself when
+    there is no wave detail.
+  - Seek table (v302): the peer serves no usable PVBR (vynull an all-zero
+    one, which we never asked for). Every peer MP3 therefore seeked by
+    `seek_estimate`'s byte-linear guess, while the engine reported the
+    target. On a VBR file every cue, hot cue, loop and beat jump landed
+    elsewhere than the waveform and grid showed (more than 10 s off in the
+    host test). The load worker now builds the table Rekordbox would have
+    written (`audio_pvbr_build`). It walks the frame headers from the end
+    of the ID3v2 tag, and entry k is frame `audio_pvbr_entry_frame(k, N)`,
+    N = Xing count + 1. It caches the table as `/sd/djlcache/<key>.VBR`
+    (`PVB1`, audio file size, 400 entries). The engine then seeks with
+    `seek_pvbr` exactly as for a USB track. Without a Xing count (CBR files
+    without a header) there is no table, and the estimate is exact anyway.
+    The build reads the file once in 32 KiB gated chunks, and is skipped
+    while recording.
+  - Residual constant offset (measured, not corrected): the vynull analysis
+    (`lazyAnalyze`) is decoded by ffmpeg, which drops the Xing frame and the
+    encoder delay. Our minimp3 output, like Rekordbox's time base, keeps
+    both. On a 20 s click MP3 the onset is at 1051 ms on our side and at
+    1000 ms for ffmpeg, about 51 ms apart. vynull shifts the grid by
+    +25 ms (`LossyEncoderDelayMs`) but not the waveform. So the grid can sit
+    about 26 ms early and the waveform about 51 ms early on vynull-analysed
+    MP3s. Tracks with imported Rekordbox ANLZ are not affected. Correct this
+    on the vynull side, or with a per-source shift after HIL confirms it.
+  - Risk (real CDJ): beat-link documents 19 leading bytes before the wave
+    detail entries in a CDJ's `0x4a02` blob. vynull sends none. We store the
+    blob as is, so on a CDJ the waveform may be shifted by 19/150 s. Check
+    this on HIL before adding a skip.
   - The SD card is required, and the download is refused while the recorder
     writes to it.
 - Hardware tests still needed with the borrowed CDJ:
@@ -253,14 +474,88 @@ Phase 2c — peer track download (NFS client, peer → us):
   6. Test an HFS+ formatted stick (`.PIONEER`).
   7. Check the player-number caveat above: we may take number 5 or 6.
 
-Phase 3 — beat emission:
-- Emit `28` beat packets from the playing P4 deck using its loaded ANLZ beat
-  grid + current pitch, and `0b` absolute position at 30 ms. Optional tempo
-  master: P4 becomes the master the CDJs can SYNC to.
+Phase 3 — beat emission (v301, `0x28` / `0x0b` sent; tempo master still
+planned):
+- Each deck already broadcasts its CDJ status `0x0a` on 50002 every 200 ms
+  (`DJ_LINK_STATUS_MS`, since v298, `dj_link_players_service`).
+- Since v301, every deck that has a track and holds a player number also
+  broadcasts on 50001:
+  - absolute position `0x0b` every 30 ms (`DJ_LINK_POSITION_MS`), playing
+    or paused. It carries the track length in s, the playhead in ms, the
+    pitch ×100 and the effective BPM ×10 (`-1` when the BPM is unknown).
+  - beat `0x28` when the playhead crosses a beat of the deck's ANLZ grid,
+    while playing. It carries the beat in bar, the track BPM ×100, the raw
+    pitch, and the next / second / fourth / eighth beat and next / second
+    bar distances. Those distances are track time at 0 % pitch, as the
+    packet defines them, and `0xffffffff` past the reported window.
+- Every 100 ms the UI reports the engine playhead (`deck_state.position_ms`)
+  for each deck, along with the duration, the speed and a window of 16 grid
+  beats around it (`dj_link_report_beats`):
+  - the speed is the engine's effective speed (pitch × jog bend), or 0
+    while the scratch position is authoritative;
+  - dj_link stamps each report on arrival.
+- dj_link extrapolates the playhead between reports
+  (`dj_link_deck_playhead`):
+  - for at most 1 s;
+  - clamped to the duration.
+- `dj_link_session_beat` sends at most one beat per pass: the latest beat
+  crossed since the last pass. A jump larger than 1 s is a seek: it re-arms
+  without sending. A report slightly behind the estimate never sends a beat
+  twice.
+- While a joined deck has a track, the dj_link task (never an audio task)
+  wakes for the next position or beat, whichever is due first. Otherwise it
+  keeps its 100 ms RX wait.
+- No audio-path change: everything is built from the UI's report, using the
+  existing codec builders (`djlink_beat_build`, `djlink_position_build`).
+- Limits:
+  - the playhead is the engine position, not the audible one (no output
+    latency compensation);
+  - beat timing has the jitter of the dj_link task's 1 ms tick and
+    scheduling;
+  - beat counters, the on-air flag and tempo master (CDJs SYNCing to the
+    P4) are still not sent.
 
 Phase 4 — control integration:
 - Decode sync-control `2a`, master handoff `26`/`27`, load-track `19` (map to
   P4 deck load — needs a policy decision: which deck, allow or ignore).
+  v304 follows the master (Phase 1 sync); `2a` and `26`/`27` are next.
+- Status (v305, JC1060, not yet hardware-tested): `2a`, `26` and `27` are
+  integrated behind the same LINK SYNC switch (`dj_link_sync`, default OFF).
+  - Codec: the CDJ status carries Mh (`0x9f`, `master_handoff`; built as
+    `0xff` when 0). Per sync.html, byte `0x27` of `2a` and `27` is the
+    sender's own number, as at `0x21`; the field names of the vendored codec
+    are kept and their comments corrected.
+  - `dj_link_master.c` (pure, `test_dj_link_master`) is the negotiation:
+    - a deck wants master while its SYNC MASTER is set and it has a track;
+    - no peer asserts master: we assert right away (a mixer is not in the
+      peer table, so a mixer master is simply taken over);
+    - a peer asserts master: `26` is sent unicast to its port 50001 (resent
+      every 500 ms). We assert once its status names our number in Mh. After
+      2 s without that the request counts as refused, and there is no retry
+      until SYNC MASTER is pressed again;
+    - `26` received while we assert: `27` answers from our master deck's
+      number, our status keeps the master flag with Mh = requester, and once
+      the requester asserts we stop and deck_core drops SYNC MASTER. After
+      3 s without that we keep master;
+    - a master naming one of our loaded decks in Mh unasked hands it over:
+      deck_core is asked to set SYNC MASTER;
+    - a peer asserting master over us without a handoff wins: we drop
+      (two masters is worse than none);
+    - while we assert, the beat clock handed to deck_core is invalid, so
+      SYNC on our other deck syncs locally to our master deck instead of a
+      peer that follows us.
+  - `2a` policy: both of our players share one IP and the packet carries no
+    target number, so the target is the only deck holding a player number,
+    else the only loaded one, else the only playing one among the loaded.
+    Anything else is refused and logged (`refused: ambiguous deck`).
+    `10` = SYNC on, `20` = SYNC off, `01` = SYNC MASTER.
+  - Network requests reach deck_core only as `deck_core_net_command()`
+    (internal deck-queue event, never waiting, no screensaver wake); the deck
+    task applies them like the buttons, so the P4 stays authoritative.
+  - LINK SYNC OFF keeps the v301 behaviour: the status shows master whenever
+    SYNC MASTER is set, and `2a` / `26` / `27` are only logged.
+  - Not done: Syncn (`0x84`) is still sent as 0, and fader start `02` /
+    on-air `03` are ignored.
 - Optional: TCP metadata query — pull track titles/waveform of CDJ-loaded
   tracks for display (P4 can also serve its own ANLZ data).
 

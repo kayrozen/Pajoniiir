@@ -141,6 +141,9 @@ bool controller_usb_host_get_identity(controller_usb_identity_t *identity_out);
 void controller_usb_host_get_diagnostics(
     controller_usb_host_diagnostics_t *diag_out);
 void controller_usb_host_get_work(controller_usb_host_work_t *work_out);
+/* v323 cadence probe, see controller_usb_audio_stream_take_cadence(). */
+void controller_usb_host_take_isoc_cadence(uint32_t *gap_max_us, uint32_t *late,
+                                           uint32_t *late_wr, uint32_t *late_rd);
 esp_err_t controller_usb_host_write_audio(const int16_t *master_samples,
                                           const int16_t *headphone_samples,
                                           size_t frame_count,

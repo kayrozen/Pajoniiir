@@ -124,6 +124,8 @@ add_executable(ui_simulator_e2e_jc1060
     "${JC1060_UI_DIR}/ui_waveform_model.c"
     "${JC1060_UI_DIR}/ui_overview_motion.c"
     "${JC1060_UI_DIR}/ui_artwork_thumb.c"
+    # v313: the bridge draws the PWV4 colour preview through the ANLZ helpers
+    "${REPO_ROOT}/firmware/main-deck-jc1060/components/library/rekordbox_anlz.c"
 )
 
 # LVGL exports its LV_BUILD_CONF_PATH (lv_conf.h, identical to

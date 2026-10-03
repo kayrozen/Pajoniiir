@@ -21,10 +21,12 @@ extern "C" {
 typedef enum { DJ_TAB_OVERVIEW, DJ_TAB_LIBRARY, DJ_TAB_HOTCUES, DJ_TAB_SETTINGS } dj_tab_t;
 typedef enum { DJ_SORT_NONE, DJ_SORT_ARTIST, DJ_SORT_NAME, DJ_SORT_BPM, DJ_SORT_KEY } dj_sort_t;
 typedef enum { DJ_TONE_NORMAL, DJ_TONE_MUTED, DJ_TONE_OK, DJ_TONE_WARN, DJ_TONE_INFO, DJ_TONE_ERROR } dj_tone_t;
+/* Deck SYNC button (v304): local BEAT SYNC, or following the DJ Link master. */
+typedef enum { DJ_SYNC_OFF, DJ_SYNC_LOCAL, DJ_SYNC_LINK_WAIT, DJ_SYNC_LINK_LOCKED } dj_sync_t;
 
 /* Status/text fields on Settings and Hot Cues screens (dj_ui_set_field).
  * DJ_F_MASTER, DJ_F_OUT_MAIN, DJ_F_UI_RENDER, DJ_F_LOCAL, DJ_F_MIX_CUE, DJ_F_MIX_JOG,
- * DJ_F_MIX_TEMPO and DJ_F_LOAD_LOCK are tappable (on_field). */
+ * DJ_F_MIX_TEMPO, DJ_F_LOAD_LOCK and DJ_F_LINK_SYNC are tappable (on_field). */
 typedef enum {
     DJ_F_MASTER, DJ_F_MASTER_HINT,
     DJ_F_OUT_MAIN, DJ_F_OUT_CUE, DJ_F_UI_RENDER, DJ_F_LOCAL,
@@ -33,6 +35,7 @@ typedef enum {
     DJ_F_MIX_JOG,                     /* "JOG: VINYL" / "JOG: CDJ" (v267) */
     DJ_F_MIX_TEMPO,                   /* "TEMPO: +/-10%", cycles 6/10/16 (v275) */
     DJ_F_LOAD_LOCK,                   /* "LOAD LOCK: OFF" / "LOAD LOCK: ON" (v293) */
+    DJ_F_LINK_SYNC,                   /* "LINK SYNC: OFF" / "LINK SYNC: ON" (v304) */
     DJ_F_HC_CUES, DJ_F_HC_LOOPS, DJ_F_HC_ANLZ, DJ_F_HC_TARGET,
     DJ_F_LINK_STATUS,                 /* "DJ LINK: ON P4 - CDJ-3000 #1 174.2 BPM ON AIR" */
     DJ_F_REC_STATUS, DJ_F_REC_DEST,   /* "REC 01:23  12 MB", "-> /sd/recordings" */
@@ -47,6 +50,8 @@ typedef struct {
     dj_tone_t badge_tone;             /* DJ_TONE_NORMAL = info blue */
     const char *bpm_text, *time_text; /* "...", "--"; NULL = formatted from bpm / len_ms */
     const uint16_t *art;              /* DJ_ART_ROW_PX^2 RGB565, copied; NULL = none */
+    bool has_progress;                /* v307: download bar along the row's bottom edge */
+    uint8_t progress;                 /* 0..100 */
 } dj_track_t;
 
 /* One DJ Link player row on Settings. Text is copied. */
@@ -75,7 +80,8 @@ typedef struct {
  *  - EXTERNAL: the caller paints the surface outside LVGL (direct PPA blit).
  *              dj_ui draws nothing inside it, never invalidates it, and the caller
  *              burns the markers itself (dj_ui_wave_ms_to_x gives the geometry).
- * Markers drawn by dj_ui (PEAKS/IMAGE): hot cues, yellow cue-point triangle,
+ * Markers drawn by dj_ui (PEAKS/IMAGE): hot cues, red memory-cue triangles
+ * (bottom edge, v309), yellow cue-point triangle,
  * loop band, armed-loop trail, playhead, played shade; dj_ui_wave_set_marks()
  * picks the layers per surface (a strip that burns some itself drops them). */
 typedef enum { DJ_WAVE_ZOOM, DJ_WAVE_MINI } dj_wave_t;
@@ -87,7 +93,8 @@ enum {
     DJ_MARK_PLAYHEAD   = 1u << 3,
     DJ_MARK_PLAYED     = 1u << 4,     /* mini shade, PEAKS zoom dimming */
     DJ_MARK_LOOP_ARMED = 1u << 5,     /* zoom: loop-in to playhead */
-    DJ_MARK_ALL        = 0x3fu,
+    DJ_MARK_MEMORY     = 1u << 6,     /* v309: memory cue triangles (bottom) */
+    DJ_MARK_ALL        = 0x7fu,
 };
 
 /* Touch events -> your app. Any pointer may be NULL. */
@@ -112,6 +119,7 @@ typedef struct {
     void (*on_play)(uint8_t deck);
     void (*on_cue)(uint8_t deck);
     void (*on_master_tempo)(uint8_t deck);
+    void (*on_sync)(uint8_t deck);                      /* SYNC: same as the controller button */
     void (*on_seek)(uint8_t deck, uint32_t pos_ms, dj_wave_t wave); /* tap on the zoom or mini waveform */
     void (*on_target)(uint8_t deck);                    /* deck badge / Hot Cues TARGET */
     void (*on_field)(dj_field_t field);                 /* tappable Settings field */
@@ -125,6 +133,9 @@ void dj_ui_set_callbacks(const dj_ui_callbacks_t *cb);
 void dj_ui_show_tab(dj_tab_t tab);
 
 /* ---- Decks (deck = 0 or 1). Call from the LVGL thread or inside lv_lock()/lv_unlock(). ---- */
+/* v307: deck load bar under the footer title (a DJ Link download into the
+ * deck). pct < 0 hides it; db = still reading the peer's export.pdb (dim). */
+void dj_ui_set_load_progress(uint8_t deck, int16_t pct, bool db);
 void dj_ui_set_track(uint8_t deck, const char *title, const char *artist, const char *source,
                      uint16_t track_no, uint16_t track_count, uint32_t len_ms);
 void dj_ui_set_key(uint8_t deck, const char *key);
@@ -140,6 +151,10 @@ void dj_ui_set_waveform(uint8_t deck, const uint8_t *peaks, const uint8_t *cores
 void dj_ui_set_hotcue(uint8_t deck, uint8_t index, bool set, uint32_t pos_ms, uint8_t color); /* color 0..7 */
 void dj_ui_set_hotcue_loop(uint8_t deck, uint8_t index, bool loop);       /* "LOOP A" instead of "CUE A" */
 void dj_ui_set_cue_point(uint8_t deck, bool set, uint32_t pos_ms);        /* yellow triangle (deck cue) */
+/* v309: memory cue starts (copied, at most DJ_MEMORY_CUES), red triangles on
+ * the bottom edge of both surfaces. count 0 clears them. */
+#define DJ_MEMORY_CUES 16
+void dj_ui_set_memory_cues(uint8_t deck, const uint32_t *pos_ms, uint8_t count);
 void dj_ui_set_loop(uint8_t deck, bool active, uint32_t start_ms, uint32_t end_ms);
 void dj_ui_set_loop_armed(uint8_t deck, bool armed, uint32_t start_ms); /* loop-in set, loop-out pending */
 void dj_ui_set_artwork(uint8_t deck, const void *src);   /* lv_image_dsc_t* or "S:/path.png", 34x34. NULL = placeholder */
@@ -147,6 +162,7 @@ void dj_ui_set_artwork_pixels(uint8_t deck, const uint16_t *px); /* DJ_ART_DECK_
 void dj_ui_set_beat_grid_visible(bool visible);
 void dj_ui_set_transport(uint8_t deck, bool playing, bool cue_lit);
 void dj_ui_set_master_tempo(uint8_t deck, bool on);
+void dj_ui_set_sync(uint8_t deck, dj_sync_t sync);
 void dj_ui_set_beat(uint8_t deck, bool valid, uint8_t phase, bool downbeat); /* phase 0..3 */
 void dj_ui_set_vu(uint8_t deck, uint8_t level);          /* 0..255, caller owns peak hold / decay */
 void dj_ui_set_target(uint8_t deck);                     /* performance target: badge + Hot Cues */

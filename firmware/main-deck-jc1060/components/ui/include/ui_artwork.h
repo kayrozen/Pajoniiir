@@ -2,8 +2,9 @@
  * and deck headers.
  *
  * One low-priority worker (core 1, below LVGL, never an audio task) reads the
- * JPEG export.pdb links to a track and decodes it (ui_artwork_thumb), at most
- * one every UI_ARTWORK_GAP_MS (ui_artwork.c). The
+ * JPEG export.pdb links to a track (v300: for a deck key the catalog does
+ * not know, the DJ Link fetch's /sd/djlcache/KEY.JPG) and decodes it
+ * (ui_artwork_thumb), at most one every UI_ARTWORK_GAP_MS (ui_artwork.c). The
  * results land in a fixed PSRAM cache of UI_ARTWORK_SLOTS entries, LRU,
  * allocated once on first use; a catalog rebuild (library generation) makes
  * every entry stale. Every function runs on the LVGL task; pixels returned by
@@ -35,6 +36,11 @@ void ui_artwork_begin_page(void);
 bool ui_artwork_poll(void);
 /* Hold USB reads while a track load owns the stick. */
 void ui_artwork_set_paused(bool paused);
+/* v302: drop what is cached for `track_key`, so the next get reads it
+ * again. A peer track's KEY.JPG can land after its key was looked up (a
+ * reload fetches the cover a first load did not), and a cached "none"
+ * would otherwise hide it until the library generation changes. */
+void ui_artwork_forget(uint32_t track_key);
 
 /* Diagnostics since the last take (LVGL task). */
 typedef struct {

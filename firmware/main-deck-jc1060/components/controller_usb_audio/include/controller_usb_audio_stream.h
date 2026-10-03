@@ -97,6 +97,13 @@ void controller_usb_audio_stream_get_work(uint32_t *callbacks,
                                           uint32_t *cycles,
                                           uint32_t *max_cycles,
                                           uint32_t *submit_cycles);
+/* v323 cadence probe: longest gap between completed isoc URBs (us), gaps
+ * of 6 ms or more, and how many of those overlapped an SD download write /
+ * deck loader read, all since the previous call. Any task. */
+void controller_usb_audio_stream_take_cadence(uint32_t *gap_max_us,
+                                              uint32_t *late,
+                                              uint32_t *late_wr,
+                                              uint32_t *late_rd);
 
 #ifdef __cplusplus
 }

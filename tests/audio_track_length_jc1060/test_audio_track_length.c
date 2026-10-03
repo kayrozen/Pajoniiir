@@ -460,6 +460,92 @@ static void test_scan_resync(void)
     assert(!audio_mp3_scan(mem_read, &f, 0u, f.size, 0u, &scan));
 }
 
+/* v302: a DJ Link peer track has no PVBR table. A VBR file: a 64 kbps
+ * intro, then 320 kbps, junk to resync over; frame i starts at s_vbr_at[i]
+ * (frame 0 = the Xing frame). */
+#define VBR_ID3 2000u
+#define VBR_FRAMES 4000u                  /* after the Xing frame: 96 s */
+#define VBR_JUNK_AFTER 1000u
+static size_t s_vbr_at[VBR_FRAMES + 1u];
+
+static mem_file_t make_vbr_file(uint32_t xing_frames, uint32_t real)
+{
+    mem_file_t f = {0};
+    f.size = VBR_ID3 + 384u + (size_t)real * 960u + 5u + 128u;
+    f.data = calloc(1, f.size);
+    assert(f.data);
+    const size_t body = VBR_ID3 - 10u;
+    memcpy(f.data, "ID3\x04\x00\x00", 6);
+    f.data[6] = (uint8_t)((body >> 21) & 0x7F); f.data[7] = (uint8_t)((body >> 14) & 0x7F);
+    f.data[8] = (uint8_t)((body >> 7) & 0x7F);  f.data[9] = (uint8_t)(body & 0x7F);
+    put_header(f.data + 100u);            /* a sync pattern inside the tag */
+    size_t pos = VBR_ID3;
+    s_vbr_at[0] = pos;
+    xing_frame(f.data + pos, 0, "Xing", xing_frames);
+    pos += 384u;
+    for (uint32_t i = 1; i <= real; i++) {
+        if (i == VBR_JUNK_AFTER + 1u) {
+            memcpy(f.data + pos, "\xFF\xFBjk", 4);  /* a false sync */
+            pos += 5u;
+        }
+        /* MPEG1 L3 48 kHz: 64 kbps = 192 B, 320 kbps = 960 B */
+        const bool quiet = i <= real / 4u;
+        uint8_t *h = f.data + pos;
+        h[0] = 0xFF; h[1] = 0xFB; h[2] = quiet ? 0x54 : 0xE4; h[3] = 0x44;
+        s_vbr_at[i] = pos;
+        pos += quiet ? 192u : 960u;
+    }
+    f.size = pos;
+    return f;
+}
+
+static void test_pvbr_build(void)
+{
+    mem_file_t f = make_vbr_file(VBR_FRAMES, VBR_FRAMES);
+    const uint32_t n = VBR_FRAMES + 1u;
+    assert(audio_pvbr_build(mem_read, &f, f.size, s_pvbr, LEN));
+    /* The Rekordbox law, counted from the end of the tag. */
+    for (uint32_t i = 0; i < LEN; i++) {
+        assert(s_pvbr[i] == s_vbr_at[audio_pvbr_entry_frame(i, n, LEN)] - VBR_ID3);
+    }
+    assert(audio_pvbr_base(mem_read, &f, s_pvbr, LEN, VBR_ID3, f.size) == VBR_ID3);
+
+    /* The engine seeks it like an exported table: every landing is a frame
+     * start at its exact time, never after the target. */
+    const audio_pvbr_geometry_t geom = {.base = VBR_ID3, .frames = n, .frame_samples = 1152u, .hz = 48000u};
+    const uint32_t span_ms = n * 24u;
+    uint32_t worst_estimate_ms = 0u;
+    for (uint32_t target = 0; target < span_ms; target += 37u) {
+        uint32_t byte = 0;
+        const uint32_t landing = audio_pvbr_locate(s_pvbr, LEN, span_ms, span_ms, f.size, &geom,
+                                                   target, &byte);
+        assert(landing % 24u == 0u && landing <= target && target - landing < 600u);
+        assert(byte == s_vbr_at[landing / 24u]);
+        /* What seek_estimate decoded instead: the frame at its linear byte. */
+        const size_t guess = VBR_ID3 + ((uint64_t)target * (f.size - VBR_ID3)) / span_ms;
+        uint32_t frame = 0;
+        while (frame < VBR_FRAMES && s_vbr_at[frame + 1u] <= guess) frame++;
+        worst_estimate_ms = abs_diff(frame * 24u, target) > worst_estimate_ms
+                                ? abs_diff(frame * 24u, target) : worst_estimate_ms;
+    }
+    assert(worst_estimate_ms > 10000u);   /* the bug: seconds off on this file */
+    free(f.data);
+
+    /* No frame count: nothing to build (CBR seeks right by estimate). */
+    f = make_vbr_file(VBR_FRAMES, VBR_FRAMES);
+    memcpy(f.data + VBR_ID3 + 36u, "abcd", 4);
+    assert(!audio_pvbr_build(mem_read, &f, f.size, s_pvbr, LEN));
+    free(f.data);
+    /* Fewer frames than the header says: the last entries are missing. */
+    f = make_vbr_file(VBR_FRAMES, VBR_FRAMES - 20u);
+    assert(!audio_pvbr_build(mem_read, &f, f.size, s_pvbr, LEN));
+    free(f.data);
+    /* Not an MP3. */
+    uint8_t zero[2048] = {0};
+    mem_file_t z = {.data = zero, .size = sizeof zero};
+    assert(!audio_pvbr_build(mem_read, &z, z.size, s_pvbr, LEN));
+}
+
 /* No way to check the header at load: the lie is caught while decoding, as
  * soon as the decoder passes the length, and EOF pins the exact end. */
 static void test_runtime_extension(void)
@@ -504,6 +590,7 @@ int main(void)
     test_cbr_without_table();
     test_scan_resync();
     test_runtime_extension();
+    test_pvbr_build();
     printf("audio_track_length_jc1060: all tests passed\n");
     return 0;
 }

@@ -46,7 +46,8 @@ typedef struct {
     uint8_t type;      /* DJLINK_DB_FIELD_* */
     uint32_t num;      /* INT8/16/32 value */
     const uint8_t *bin; /* BINARY payload or STRING as UTF-16BE bytes */
-    size_t bin_len;    /* byte length of bin */
+    size_t bin_len;    /* byte length of bin (even for a STRING, whose wire
+                        * length field counts UTF-16 code units) */
 } djlink_db_arg_t;
 
 typedef struct {
@@ -66,6 +67,7 @@ typedef struct {
 #define DJLINK_DB_TYPE_BEATGRID_REQUEST  0x2204u
 #define DJLINK_DB_TYPE_CUES_REQUEST      0x2104u
 #define DJLINK_DB_TYPE_WAVEFORM_REQUEST  0x2904u
+#define DJLINK_DB_TYPE_CUES_EXT_REQUEST  0x2b04u /* nxs2 cue/loop list */
 #define DJLINK_DB_TYPE_RENDER            0x3000u
 #define DJLINK_DB_TYPE_SUCCESS           0x4000u
 #define DJLINK_DB_TYPE_MENU_HEADER       0x4001u
@@ -76,6 +78,7 @@ typedef struct {
 #define DJLINK_DB_TYPE_BEATGRID_REPLY    0x4602u
 #define DJLINK_DB_TYPE_CUES_REPLY        0x4702u
 #define DJLINK_DB_TYPE_WAVEFORM_REPLY    0x4a02u
+#define DJLINK_DB_TYPE_CUES_EXT_REPLY    0x4e02u
 
 /* Build one message. Returns byte count or negative DJLINK_ERR_*. */
 int djlink_db_msg_build(uint32_t txid, uint16_t type, const djlink_db_arg_t *args,

@@ -5,7 +5,6 @@
 
 #include "djlink/dbserver.h"
 
-#define DJ_LINK_DB_SORT_DEFAULT 0u
 #define DJ_LINK_DB_NO_ITEMS     0xffffffffu
 
 static const char *phase_name(dj_link_db_phase_t phase)
@@ -20,6 +19,9 @@ static const char *phase_name(dj_link_db_phase_t phase)
     case DJ_LINK_DB_LIST_WAIT_RENDER:   return "RENDER";
     case DJ_LINK_DB_DETAIL_WAIT_AVAIL:  return "DETAIL";
     case DJ_LINK_DB_DETAIL_WAIT_RENDER: return "DETAIL RENDER";
+    case DJ_LINK_DB_PATH_WAIT_AVAIL:    return "PATH";
+    case DJ_LINK_DB_PATH_WAIT_RENDER:   return "PATH RENDER";
+    case DJ_LINK_DB_BLOB_WAIT:          return "ANALYSIS";
     default:                            return "?";
     }
 }
@@ -94,21 +96,77 @@ static void go_ready(dj_link_db_t *c, uint32_t now_ms)
     c->idle_since_ms = now_ms;
 }
 
-/* READY: list first, then any metadata the owner asks for. */
+static void blob_reset(dj_link_db_t *c)
+{
+    c->blob_request = 0u;
+    c->blob_id = 0u;
+    c->blob_dst = NULL;
+    c->blob_cap = 0u;
+    c->blob_body = false;
+    c->blob_typed = false;
+}
+
+/* READY: list first, then a wanted file path, then a wanted analysis blob,
+ * then any metadata the owner asks for. */
 static void start_next(dj_link_db_t *c, uint32_t now_ms)
 {
     if (c->phase != DJ_LINK_DB_READY) {
         return;
     }
-    if (!c->list_done) {
+    if (c->list_done && c->path_id != 0u) {
         djlink_db_arg_t args[2];
         memset(args, 0, sizeof(args));
         args[0].type = DJLINK_DB_FIELD_INT32;
         args[0].num = dmst(c);
         args[1].type = DJLINK_DB_FIELD_INT32;
-        args[1].num = DJ_LINK_DB_SORT_DEFAULT;
-        int n = djlink_db_msg_build(++c->txid, DJ_LINK_DB_TYPE_TRACK_MENU, args, 2,
+        args[1].num = c->path_id;
+        c->path[0] = '\0';
+        int n = djlink_db_msg_build(++c->txid, DJ_LINK_DB_TYPE_TRACK_INFO, args, 2,
                                     c->tx, sizeof(c->tx));
+        send_tx(c, n, DJ_LINK_DB_PATH_WAIT_AVAIL, now_ms);
+        return;
+    }
+    if (c->list_done && c->blob_request != 0u && c->blob_id != 0u) {
+        djlink_db_arg_t args[3];
+        memset(args, 0, sizeof(args));
+        args[0].type = DJLINK_DB_FIELD_INT32;
+        args[0].num = dmst(c);
+        args[1].type = DJLINK_DB_FIELD_INT32;
+        args[1].num = c->blob_id;
+        args[2].type = DJLINK_DB_FIELD_INT32; /* wave detail, cues: trailing 0 */
+        c->blob_len = 0u;
+        c->blob_body = false;
+        const bool trailing = c->blob_request == DJLINK_DB_TYPE_WAVEFORM_REQUEST ||
+                              c->blob_request == DJLINK_DB_TYPE_CUES_EXT_REQUEST;
+        const bool tag = c->blob_request == DJ_LINK_DB_TYPE_ANLZ_TAG_REQUEST;
+        djlink_db_arg_t all[4];
+        memset(all, 0, sizeof(all));
+        memcpy(all, args, sizeof(args));
+        if (tag) {   /* v314: [DMST, id, 'PWV4', 'EXT'], reversed fourccs */
+            all[2].type = DJLINK_DB_FIELD_INT32;
+            all[2].num = DJ_LINK_DB_ANLZ_TAG_PWV4;
+            all[3].type = DJLINK_DB_FIELD_INT32;
+            all[3].num = DJ_LINK_DB_ANLZ_FILE_EXT;
+        }
+        int n = djlink_db_msg_build(++c->txid, c->blob_request, all,
+                                    tag ? 4 : trailing ? 3 : 2, c->tx, sizeof(c->tx));
+        send_tx(c, n, DJ_LINK_DB_BLOB_WAIT, now_ms);
+        return;
+    }
+    if (!c->list_done) {
+        djlink_db_arg_t args[4];
+        memset(args, 0, sizeof(args));
+        for (size_t i = 0; i < 4u; i++) {
+            args[i].type = DJLINK_DB_FIELD_INT32;
+        }
+        args[0].num = dmst(c);
+        const bool all = c->menu == DJ_LINK_DB_MENU_ALL_TRACKS;
+        args[1].num = all ? c->sort : DJ_LINK_DB_SORT_DEFAULT;
+        args[2].num = c->menu_id;
+        args[3].num = c->menu == DJ_LINK_DB_MENU_FOLDER ? 1u : 0u;
+        int n = djlink_db_msg_build(++c->txid,
+                                    all ? DJ_LINK_DB_TYPE_TRACK_MENU : DJ_LINK_DB_TYPE_PLAYLIST_MENU,
+                                    args, all ? 2 : 4, c->tx, sizeof(c->tx));
         send_tx(c, n, DJ_LINK_DB_LIST_WAIT_AVAIL, now_ms);
         return;
     }
@@ -123,6 +181,31 @@ static void start_next(dj_link_db_t *c, uint32_t now_ms)
                                                  c->tx, sizeof(c->tx));
         send_tx(c, n, DJ_LINK_DB_DETAIL_WAIT_AVAIL, now_ms);
     }
+}
+
+bool dj_link_db_pick_detail(const dj_link_peer_track_t *rows, uint32_t count,
+                            uint32_t first, uint32_t n, uint32_t prio_index,
+                            uint32_t prio_id, uint32_t *index)
+{
+    if (!rows || !index) {
+        return false;
+    }
+    if (prio_id != 0u && prio_index < count && rows[prio_index].rekordbox_id == prio_id &&
+        !rows[prio_index].has_detail) {
+        *index = prio_index;
+        return true;
+    }
+    uint32_t end = first + n;
+    if (end < first || end > count) {
+        end = count;
+    }
+    for (uint32_t i = first; i < end; i++) {
+        if (!rows[i].has_detail && rows[i].rekordbox_id != 0u) {
+            *index = i;
+            return true;
+        }
+    }
+    return false;
 }
 
 void dj_link_db_utf16be_to_utf8(const uint8_t *in, size_t in_len, char *out, size_t cap)
@@ -213,6 +296,16 @@ static uint32_t menu_count(const djlink_db_msg_t *m)
     return m->args[1].num;
 }
 
+/* v300: argument 8 of a title item is its artwork id (0 = none). */
+static uint32_t item_artwork(const djlink_db_msg_t *m, uint32_t item_type)
+{
+    if ((item_type & 0xffu) != DJ_LINK_DB_ITEM_TITLE || m->arg_count < 9u ||
+        m->args[8].type != DJLINK_DB_FIELD_INT32) {
+        return 0u;
+    }
+    return m->args[8].num;
+}
+
 static void list_item(dj_link_db_t *c, const djlink_db_msg_t *m)
 {
     uint32_t id;
@@ -227,6 +320,20 @@ static void list_item(dj_link_db_t *c, const djlink_db_msg_t *m)
     t.rekordbox_id = id;
     t.audio = c->audio;
     dj_link_db_utf16be_to_utf8(l1->bin, l1->bin_len, t.title, sizeof(t.title));
+    /* v311: a folder or playlist row of a playlist menu: a name to open, not
+     * a track (no metadata, never downloaded). */
+    if (item_type == DJ_LINK_DB_ITEM_FOLDER || item_type == DJ_LINK_DB_ITEM_PLAYLIST) {
+        t.kind = item_type == DJ_LINK_DB_ITEM_FOLDER ? DJ_LINK_PEER_ROW_FOLDER
+                                                     : DJ_LINK_PEER_ROW_PLAYLIST;
+        t.has_detail = true;
+        t.audio = DJ_LINK_PEER_AUDIO_METADATA_ONLY;
+        if (c->io.track) {
+            c->io.track(c->io.ctx, c->render_offset + c->render_seen, &t, false);
+        }
+        c->render_seen++;
+        return;
+    }
+    t.artwork_id = item_artwork(m, item_type);
     /* The second label follows the player's sort; it is the artist only for
      * "title + artist" items. */
     if (item_type == DJ_LINK_DB_ITEM_TITLE_ARTIST) {
@@ -251,6 +358,7 @@ static void detail_item(dj_link_db_t *c, const djlink_db_msg_t *m)
     case DJ_LINK_DB_ITEM_TITLE:
         dj_link_db_utf16be_to_utf8(l1->bin, l1->bin_len, c->detail.title,
                                    sizeof(c->detail.title));
+        c->detail.artwork_id = item_artwork(m, item_type);
         break;
     case DJ_LINK_DB_ITEM_ARTIST:
         dj_link_db_utf16be_to_utf8(l1->bin, l1->bin_len, c->detail.artist,
@@ -275,6 +383,221 @@ static void finish_detail(dj_link_db_t *c, uint32_t now_ms)
     }
     go_ready(c, now_ms);
     start_next(c, now_ms);
+}
+
+/* The path request is answered (path may be ""), the session goes on. */
+static void finish_path(dj_link_db_t *c, uint32_t now_ms)
+{
+    uint32_t id = c->path_id;
+    c->path_id = 0u;
+    go_ready(c, now_ms);
+    if (c->io.path) {
+        c->io.path(c->io.ctx, id, c->path);
+    }
+    start_next(c, now_ms);
+}
+
+/* The blob request is answered (len may be 0), the session goes on. */
+static void finish_blob(dj_link_db_t *c, uint32_t now_ms)
+{
+    uint32_t id = c->blob_id;
+    uint16_t request = c->blob_request;
+    size_t len = c->blob_keep ? c->blob_len : 0u;
+    bool answered = c->blob_typed;
+    blob_reset(c);
+    go_ready(c, now_ms);
+    if (id != 0u && c->io.blob) {
+        c->io.blob(c->io.ctx, id, request, len, answered);
+    }
+    start_next(c, now_ms);
+}
+
+static void consume(dj_link_db_t *c, size_t n)
+{
+    c->rx_len -= n;
+    memmove(c->rx, &c->rx[n], c->rx_len);
+}
+
+/* Size of the integer field at buf: 0 = more bytes needed, -1 = not an
+ * integer field. */
+static int int_field_size(const uint8_t *buf, size_t len)
+{
+    if (len == 0u) {
+        return 0;
+    }
+    int size = buf[0] == DJLINK_DB_FIELD_INT8  ? 2 :
+               buf[0] == DJLINK_DB_FIELD_INT16 ? 3 :
+               buf[0] == DJLINK_DB_FIELD_INT32 ? 5 : -1;
+    return size < 0 || len >= (size_t)size ? size : 0;
+}
+
+/* v300: the head of an analysis reply, up to and including the header of
+ * its blob argument (or the whole message when it has none). 1 = parsed,
+ * 0 = more bytes needed, -1 = malformed. */
+static int blob_head(dj_link_db_t *c, size_t *head_len, uint32_t *txid, uint16_t *type,
+                     bool *has_blob, uint32_t *blob_len, uint8_t *tail)
+{
+    const uint8_t *b = c->rx;
+    size_t len = c->rx_len;
+    static const uint8_t lead[4] = { DJLINK_DB_FIELD_INT32, DJLINK_DB_FIELD_INT32,
+                                     DJLINK_DB_FIELD_INT16, DJLINK_DB_FIELD_INT8 };
+    size_t pos = 0u;
+    uint32_t status = 0u;
+    for (size_t i = 0; i < sizeof(lead); i++) {
+        int n = int_field_size(&b[pos], len - pos);
+        if (n == 0) {
+            return 0;
+        }
+        if (n < 0 || b[pos] != lead[i]) {
+            return -1;
+        }
+        pos += (size_t)n;
+    }
+    if (djlink_rd32(&b[1]) != DJLINK_DB_MAGIC) {
+        return -1;
+    }
+    *txid = djlink_rd32(&b[6]);
+    *type = djlink_rd16(&b[11]);
+    uint8_t argc = b[14];
+    if (len - pos < 5u) {
+        return 0;
+    }
+    uint32_t tags_len = djlink_rd32(&b[pos + 1u]);
+    if (b[pos] != DJLINK_DB_FIELD_BINARY || argc > DJLINK_DB_MAX_ARGS ||
+        tags_len < argc || tags_len > 64u) {
+        return -1;
+    }
+    if (len - pos < 5u + tags_len) {
+        return 0;
+    }
+    const uint8_t *tags = &b[pos + 5u];
+    pos += 5u + tags_len;
+    for (uint8_t i = 0; i < argc; i++) {
+        if (tags[i] == 0x03u && status != 0u) {
+            /* vynull's "not found": the blob is declared, never sent. Its
+             * empty cue list (v303) still puts a zero int32 in its place. */
+            if (*type == DJLINK_DB_TYPE_CUES_EXT_REPLY) {
+                int n = int_field_size(&b[pos], len - pos);
+                if (n == 0) {
+                    return 0;
+                }
+                if (n < 0) {
+                    return -1;
+                }
+                pos += (size_t)n;
+            }
+            break;
+        }
+        if (tags[i] == 0x03u) { /* binary */
+            if (len - pos < 5u) {
+                return 0;
+            }
+            if (b[pos] != DJLINK_DB_FIELD_BINARY) {
+                return -1;
+            }
+            *blob_len = djlink_rd32(&b[pos + 1u]);
+            *has_blob = true;
+            *tail = (uint8_t)(argc - i - 1u);
+            *head_len = pos + 5u;
+            return 1;
+        }
+        int n = int_field_size(&b[pos], len - pos);
+        if (n == 0) {
+            return 0;
+        }
+        if (n < 0) {
+            return -1; /* a string is no analysis reply */
+        }
+        if (i == 1u) {
+            status = n == 5 ? djlink_rd32(&b[pos + 1u])
+                   : n == 3 ? djlink_rd16(&b[pos + 1u]) : b[pos + 1u];
+        }
+        pos += (size_t)n;
+    }
+    *has_blob = false;
+    *blob_len = 0u;
+    *tail = 0u;
+    *head_len = pos;
+    return 1;
+}
+
+/* One step through an analysis reply: 1 = progress, 0 = more bytes needed
+ * (or the session ended). */
+static int blob_step(dj_link_db_t *c, uint32_t now_ms)
+{
+    if (!c->blob_body) {
+        size_t head_len = 0u;
+        uint32_t txid = 0u;
+        uint16_t type = 0u;
+        bool has_blob = false;
+        uint32_t blob_len = 0u;
+        uint8_t tail = 0u;
+        int r = blob_head(c, &head_len, &txid, &type, &has_blob, &blob_len, &tail);
+        if (r == 0) {
+            return 0;
+        }
+        if (r < 0) {
+            fail(c, "BAD REPLY");
+            return 0;
+        }
+        if (txid != c->txid) {
+            fail(c, "BAD TXID");
+            return 0;
+        }
+        consume(c, head_len);
+        c->blob_keep = type == (c->blob_request == DJLINK_DB_TYPE_WAVEFORM_REQUEST
+                                    ? DJLINK_DB_TYPE_WAVEFORM_REPLY
+                                    : c->blob_request == DJLINK_DB_TYPE_ARTWORK_REQUEST
+                                    ? DJLINK_DB_TYPE_ARTWORK
+                                    : c->blob_request == DJLINK_DB_TYPE_CUES_EXT_REQUEST
+                                    ? DJLINK_DB_TYPE_CUES_EXT_REPLY
+                                    : c->blob_request == DJ_LINK_DB_TYPE_ANLZ_TAG_REQUEST
+                                    ? DJ_LINK_DB_TYPE_ANLZ_TAG_REPLY
+                                    : DJLINK_DB_TYPE_BEATGRID_REPLY);
+        c->blob_typed = c->blob_keep;
+        if (c->blob_request == DJLINK_DB_TYPE_ARTWORK_REQUEST && blob_len > c->blob_cap) {
+            c->blob_keep = false; /* a cut JPEG is no picture */
+        }
+        if (!has_blob) {
+            /* "No data": three integers and nothing else. */
+            c->blob_keep = false;
+            finish_blob(c, now_ms);
+            return 1;
+        }
+        c->blob_body = true;
+        c->blob_left = blob_len;
+        c->blob_tail = tail;
+        return 1;
+    }
+    if (c->blob_left > 0u) {
+        size_t n = c->rx_len < c->blob_left ? c->rx_len : c->blob_left;
+        if (n == 0u) {
+            return 0;
+        }
+        size_t room = c->blob_dst && c->blob_cap > c->blob_len ? c->blob_cap - c->blob_len : 0u;
+        size_t keep = n < room ? n : room;
+        if (c->blob_keep && keep > 0u) {
+            memcpy(&c->blob_dst[c->blob_len], c->rx, keep);
+            c->blob_len += keep;
+        }
+        c->blob_left -= (uint32_t)n;
+        consume(c, n);
+        return 1;
+    }
+    while (c->blob_tail > 0u) {
+        int n = int_field_size(c->rx, c->rx_len);
+        if (n == 0) {
+            return 0;
+        }
+        if (n < 0) {
+            fail(c, "BAD REPLY");
+            return 0;
+        }
+        consume(c, (size_t)n);
+        c->blob_tail--;
+    }
+    finish_blob(c, now_ms);
+    return 1;
 }
 
 static void handle_msg(dj_link_db_t *c, const djlink_db_msg_t *m, uint32_t now_ms)
@@ -355,6 +678,32 @@ static void handle_msg(dj_link_db_t *c, const djlink_db_msg_t *m, uint32_t now_m
             fail(c, "BAD RENDER REPLY");
         }
         return;
+    case DJ_LINK_DB_PATH_WAIT_AVAIL:
+        /* An unknown id is an answer, not a broken session. */
+        if (m->type != DJLINK_DB_TYPE_SUCCESS || menu_count(m) == 0u) {
+            finish_path(c, now_ms);
+            return;
+        }
+        request_render(c, 0, menu_count(m) < DJ_LINK_DB_RENDER_BATCH
+                                 ? menu_count(m) : DJ_LINK_DB_RENDER_BATCH,
+                       DJ_LINK_DB_PATH_WAIT_RENDER, now_ms);
+        return;
+    case DJ_LINK_DB_PATH_WAIT_RENDER:
+        if (m->type == DJLINK_DB_TYPE_MENU_ITEM) {
+            uint32_t num;
+            uint32_t item_type;
+            const djlink_db_arg_t *l1;
+            const djlink_db_arg_t *l2;
+            if (item_fields(m, &num, &l1, &l2, &item_type) &&
+                item_type == DJ_LINK_DB_ITEM_FILE_PATH) {
+                dj_link_db_utf16be_to_utf8(l1->bin, l1->bin_len, c->path, sizeof(c->path));
+            }
+        } else if (m->type == DJLINK_DB_TYPE_MENU_FOOTER) {
+            finish_path(c, now_ms);
+        } else if (m->type != DJLINK_DB_TYPE_MENU_HEADER) {
+            fail(c, "BAD RENDER REPLY");
+        }
+        return;
     default:
         return;
     }
@@ -399,7 +748,9 @@ static void process(dj_link_db_t *c, uint32_t now_ms)
         case DJ_LINK_DB_LIST_WAIT_AVAIL:
         case DJ_LINK_DB_LIST_WAIT_RENDER:
         case DJ_LINK_DB_DETAIL_WAIT_AVAIL:
-        case DJ_LINK_DB_DETAIL_WAIT_RENDER: {
+        case DJ_LINK_DB_DETAIL_WAIT_RENDER:
+        case DJ_LINK_DB_PATH_WAIT_AVAIL:
+        case DJ_LINK_DB_PATH_WAIT_RENDER: {
             int n = dj_link_db_msg_size(c->rx, c->rx_len);
             if (n == 0) {
                 return;
@@ -420,6 +771,14 @@ static void process(dj_link_db_t *c, uint32_t now_ms)
             c->deadline_ms = now_ms + c->step_timeout_ms;
             continue;
         }
+        case DJ_LINK_DB_BLOB_WAIT:
+            if (blob_step(c, now_ms) == 0) {
+                return;
+            }
+            if (has_connection(c)) {
+                c->deadline_ms = now_ms + c->step_timeout_ms;
+            }
+            continue;
         default:
             c->rx_len = 0; /* unsolicited bytes while idle */
             return;
@@ -447,6 +806,8 @@ void dj_link_db_start(dj_link_db_t *c, uint32_t peer_ip, uint8_t peer_number,
     c->slot = slot;
     c->our_number = our_number;
     c->list_done = false;
+    c->path_id = 0u;
+    blob_reset(c);
     c->list_total = 0;
     c->list_target = 0;
     c->error[0] = '\0';
@@ -458,12 +819,101 @@ void dj_link_db_start(dj_link_db_t *c, uint32_t peer_ip, uint8_t peer_number,
     connect_to(c, c->discovery_port, DJ_LINK_DB_DISC_CONNECTING, now_ms);
 }
 
+void dj_link_db_set_sort(dj_link_db_t *c, uint8_t sort)
+{
+    if (c) {
+        c->sort = sort;
+    }
+}
+
+void dj_link_db_set_menu(dj_link_db_t *c, dj_link_db_menu_t menu, uint32_t id)
+{
+    if (c) {
+        c->menu = (uint8_t)menu;
+        c->menu_id = menu == DJ_LINK_DB_MENU_ALL_TRACKS ? 0u : id;
+    }
+}
+
+uint32_t dj_link_db_row_index(uint32_t rows, bool descending, uint32_t index)
+{
+    return descending && index < rows ? rows - 1u - index : index;
+}
+
+uint8_t dj_link_db_next_sort(uint8_t sort, bool descending, uint8_t tapped,
+                             bool *next_descending)
+{
+    bool desc = false;
+    uint8_t next = tapped;
+    if (tapped != DJ_LINK_DB_SORT_DEFAULT && sort == tapped) {
+        if (descending) {
+            next = DJ_LINK_DB_SORT_DEFAULT;
+        } else {
+            desc = true;
+        }
+    }
+    if (next_descending) {
+        *next_descending = desc;
+    }
+    return next;
+}
+
 void dj_link_db_stop(dj_link_db_t *c)
 {
     close_connection(c);
     c->phase = DJ_LINK_DB_IDLE;
     c->peer_number = 0;
     c->list_done = false;
+    c->path_id = 0u;
+    blob_reset(c);
+}
+
+bool dj_link_db_want_path(dj_link_db_t *c, uint32_t rekordbox_id, uint32_t now_ms)
+{
+    if (!c || rekordbox_id == 0u || c->peer_number == 0u || c->phase == DJ_LINK_DB_FAILED) {
+        return false;
+    }
+    c->path_id = rekordbox_id;
+    start_next(c, now_ms);
+    return true;
+}
+
+bool dj_link_db_want_blob(dj_link_db_t *c, uint16_t request, uint32_t rekordbox_id,
+                          uint8_t *dst, size_t cap, uint32_t now_ms)
+{
+    if (!c || rekordbox_id == 0u || !dst || cap == 0u || c->peer_number == 0u ||
+        c->phase == DJ_LINK_DB_FAILED || c->blob_request != 0u ||
+        (request != DJLINK_DB_TYPE_WAVEFORM_REQUEST &&
+         request != DJLINK_DB_TYPE_BEATGRID_REQUEST &&
+         request != DJLINK_DB_TYPE_CUES_EXT_REQUEST &&
+         request != DJ_LINK_DB_TYPE_ANLZ_TAG_REQUEST &&
+         request != DJLINK_DB_TYPE_ARTWORK_REQUEST)) {
+        return false;
+    }
+    c->blob_request = request;
+    c->blob_id = rekordbox_id;
+    c->blob_dst = dst;
+    c->blob_cap = cap;
+    c->blob_len = 0u;
+    c->blob_keep = false;
+    c->blob_typed = false;
+    start_next(c, now_ms);
+    return true;
+}
+
+void dj_link_db_cancel_blob(dj_link_db_t *c)
+{
+    if (!c || c->blob_request == 0u) {
+        return;
+    }
+    if (c->phase == DJ_LINK_DB_BLOB_WAIT) {
+        /* In flight: drain the reply, answer nobody. */
+        c->blob_id = 0u;
+        c->blob_dst = NULL;
+        c->blob_cap = 0u;
+        c->blob_keep = false;
+    } else {
+        blob_reset(c);
+    }
 }
 
 void dj_link_db_on_connected(dj_link_db_t *c, uint32_t now_ms)
@@ -482,13 +932,23 @@ void dj_link_db_on_data(dj_link_db_t *c, const uint8_t *buf, size_t len, uint32_
     if (!has_connection(c) || !buf || len == 0) {
         return;
     }
-    if (len > sizeof(c->rx) - c->rx_len) {
-        fail(c, "REPLY TOO LARGE");
-        return;
+    /* v300: in pieces, so a streamed analysis blob larger than rx passes. */
+    while (len > 0u) {
+        size_t room = sizeof(c->rx) - c->rx_len;
+        if (room == 0u) {
+            fail(c, "REPLY TOO LARGE");
+            return;
+        }
+        size_t n = len < room ? len : room;
+        memcpy(&c->rx[c->rx_len], buf, n);
+        c->rx_len += n;
+        buf += n;
+        len -= n;
+        process(c, now_ms);
+        if (!has_connection(c)) {
+            return;
+        }
     }
-    memcpy(&c->rx[c->rx_len], buf, len);
-    c->rx_len += len;
-    process(c, now_ms);
 }
 
 void dj_link_db_on_closed(dj_link_db_t *c, uint32_t now_ms)
@@ -508,9 +968,11 @@ void dj_link_db_poll(dj_link_db_t *c, uint32_t now_ms)
     uint32_t id;
     switch (c->phase) {
     case DJ_LINK_DB_IDLE:
-        /* Reconnect only when the owner wants metadata for a listed row. */
-        if (c->peer_number != 0u && c->list_done && c->io.next_detail &&
-            c->io.next_detail(c->io.ctx, &index, &id)) {
+        /* Reconnect only when the owner wants a path or metadata for a
+         * listed row. */
+        if (c->peer_number != 0u && c->list_done &&
+            (c->path_id != 0u || (c->blob_request != 0u && c->blob_id != 0u) ||
+             (c->io.next_detail && c->io.next_detail(c->io.ctx, &index, &id)))) {
             connect_to(c, c->discovery_port, DJ_LINK_DB_DISC_CONNECTING, now_ms);
         }
         return;

@@ -148,6 +148,17 @@ static uint8_t load_lock_toggle(void)
     return next;
 }
 
+/* v304: persisted LINK SYNC, applied to deck_core at once (deck_net_sync.h). */
+static uint8_t link_sync_toggle(void)
+{
+    uint8_t next = app_settings_get().dj_link_sync ? 0u : 1u;
+    app_settings_set_dj_link_sync(next);
+    deck_core_set_net_sync_enabled(next != 0u);
+    dj_link_set_sync_control(next != 0u);   /* v305: tempo master negotiation */
+    ESP_LOGI(TAG, "Link sync saved: %s", next ? "ON (SYNC follows the DJ Link master)" : "OFF");
+    return next;
+}
+
 static const char *tempo_range_name(uint8_t pct)
 {
     switch (pct) {
@@ -239,6 +250,7 @@ void ui_settings_djui_init(void)
     v->jog_cdj = cfg.jog_cdj_mode != 0u;
     v->tempo_range_pct = cfg.tempo_range_pct;
     v->load_lock = cfg.load_lock != 0u;
+    v->link_sync = cfg.dj_link_sync != 0u;
     v->controller_name = s_djui_controller;
     v->sd_state = UI_DJUI_SD_CHECKING;
 
@@ -315,7 +327,8 @@ static void ui_settings_djui_poll_link(ui_djui_settings_view_t *v, uint32_t now_
     }
     v->link_peer_count = count;
 
-    /* Top bar. Polled at 2 Hz, so the beat-in-bar would lag: left unknown. */
+    /* Top bar. Polled at 2 Hz; the beat-in-bar comes per frame from the
+     * deck_core net clock (ui_settings_djui_link_beat). */
     v->link_master_valid = summary->state != DJ_LINK_STATE_OFF;
     v->link_master = (dj_ui_link_master_t){
         .player = summary->has_master ? summary->master.device_number : 0,
@@ -323,6 +336,19 @@ static void ui_settings_djui_poll_link(ui_djui_settings_view_t *v, uint32_t now_
         .beat = 0,
         .confirmed = summary->master_confirmed,
     };
+}
+
+/* v304: the master's beat in bar from the clock the dj_link task feeds
+ * deck_core with packet timestamps, so it moves with the beats rather than
+ * with the 2 Hz summary. Only when that clock is the shown master's. */
+static void ui_settings_djui_link_beat(ui_djui_settings_view_t *v)
+{
+    deck_net_clock_t clock;
+    deck_core_get_net_clock(&clock);
+    const uint8_t player = v->link_master_valid ? v->link_master.player : 0u;
+    v->link_master.beat = player && clock.player == player
+        ? deck_net_clock_beat_in_bar(&clock, deck_core_net_clock_now_ms())
+        : 0u;
 }
 
 static void ui_settings_djui_poll_controller(ui_djui_settings_view_t *v)
@@ -391,6 +417,7 @@ void ui_settings_djui_update(const ui_frame_context_t *ctx)
 
     v->tempo_range_pct = tempo_range_sync();
     ui_settings_djui_poll_link(v, ctx->now_ms);
+    ui_settings_djui_link_beat(v);
     ui_settings_djui_poll_controller(v);
     if (s_djui_settings_visible &&
         ui_settings_should_poll(ctx->now_ms, s_djui_poll_ms, false, 1000u)) {
@@ -492,6 +519,9 @@ void ui_settings_djui_on_field(dj_field_t field)
         break;
     case DJ_F_LOAD_LOCK:
         v->load_lock = load_lock_toggle() != 0u;
+        break;
+    case DJ_F_LINK_SYNC:
+        v->link_sync = link_sync_toggle() != 0u;
         break;
     default:
         break;   /* DJ_F_LOCAL: build-time route, nothing to toggle */

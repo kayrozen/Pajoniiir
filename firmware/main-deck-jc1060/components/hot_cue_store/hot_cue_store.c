@@ -3,7 +3,6 @@
 #include <stdio.h>
 #include <string.h>
 
-#define HOT_CUE_STORE_VERSION    2u
 #define HOT_CUE_STORE_VERSION_V1 1u
 
 /* v1 layout, before the cue point. */
@@ -14,37 +13,20 @@ typedef struct {
 } hot_cue_store_blob_v1_t;
 
 #if !defined(HOT_CUE_STORE_STANDALONE_TEST)
-static esp_err_t make_key(uint32_t track_key, char out[16])
+static esp_err_t make_key_prefixed(const char *prefix, uint32_t track_key, char out[16])
 {
     if (track_key == 0 || !out) {
         return ESP_ERR_INVALID_ARG;
     }
-    snprintf(out, 16, "hc%08lx", (unsigned long)track_key);
+    snprintf(out, 16, "%s%08lx", prefix, (unsigned long)track_key);
     return ESP_OK;
 }
-#endif
 
-static void normalize_blob(hot_cue_store_blob_t *blob)
+static esp_err_t make_key(uint32_t track_key, char out[16])
 {
-    blob->version = HOT_CUE_STORE_VERSION;
-    blob->valid_mask &= 0xFFu;
-    for (uint32_t i = 0; i < HOT_CUE_STORE_SLOT_COUNT; i++) {
-        if ((blob->valid_mask & (1u << i)) == 0) {
-            memset(&blob->slots[i], 0, sizeof(blob->slots[i]));
-            continue;
-        }
-        if (blob->slots[i].type != HOT_CUE_STORE_TYPE_LOOP) {
-            blob->slots[i].type = HOT_CUE_STORE_TYPE_SINGLE;
-            blob->slots[i].end_ms = 0;
-        }
-        memset(blob->slots[i].reserved, 0, sizeof(blob->slots[i].reserved));
-    }
-    blob->has_cue = blob->has_cue ? 1u : 0u;
-    if (!blob->has_cue) {
-        blob->cue_point_ms = 0;
-    }
-    memset(blob->reserved, 0, sizeof(blob->reserved));
+    return make_key_prefixed("hc", track_key, out);
 }
+#endif
 
 esp_err_t hot_cue_store_decode(const void *raw, size_t len, hot_cue_store_blob_t *out_blob)
 {
@@ -67,8 +49,36 @@ esp_err_t hot_cue_store_decode(const void *raw, size_t len, hot_cue_store_blob_t
     } else {
         return ESP_ERR_INVALID_SIZE;
     }
-    normalize_blob(&blob);
+    hot_cue_store_normalize(&blob);
     *out_blob = blob;
+    return ESP_OK;
+}
+
+esp_err_t hot_cue_store_memory_decode(hot_cue_store_memory_blob_t *blob, size_t len)
+{
+    if (!blob) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (len != sizeof(*blob) || blob->version != HOT_CUE_STORE_MEMORY_VERSION ||
+        blob->count > HOT_CUE_STORE_MEMORY_EDITS_MAX) {
+        memset(blob, 0, sizeof(*blob));
+        return ESP_ERR_INVALID_SIZE;
+    }
+    /* Keep only well-formed edits, in order. */
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < blob->count; i++) {
+        hot_cue_store_memory_t e = blob->edits[i];
+        if (e.flags != HOT_CUE_STORE_MEMORY_LOCAL && e.flags != HOT_CUE_STORE_MEMORY_HIDDEN) {
+            continue;
+        }
+        if (e.end_ms <= e.pos_ms) {
+            e.end_ms = 0;
+        }
+        memset(e.reserved, 0, sizeof(e.reserved));
+        blob->edits[kept++] = e;
+    }
+    memset(&blob->edits[kept], 0, (HOT_CUE_STORE_MEMORY_EDITS_MAX - kept) * sizeof(blob->edits[0]));
+    blob->count = kept;
     return ESP_OK;
 }
 
@@ -121,8 +131,54 @@ esp_err_t hot_cue_store_save(uint32_t track_key, const hot_cue_store_blob_t *blo
         return ESP_ERR_INVALID_ARG;
     }
     hot_cue_store_blob_t normalized = *blob;
-    normalize_blob(&normalized);
+    hot_cue_store_normalize(&normalized);
     return hot_cue_store_test_put_raw(track_key, &normalized, sizeof(normalized));
+}
+
+static struct {
+    uint32_t key;
+    hot_cue_store_memory_blob_t blob;
+    int valid;
+} s_memory_entries[8];
+
+esp_err_t hot_cue_store_memory_load(uint32_t track_key, hot_cue_store_memory_blob_t *out_blob)
+{
+    if (track_key == 0 || !out_blob) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(out_blob, 0, sizeof(*out_blob));
+    for (size_t i = 0; i < sizeof(s_memory_entries) / sizeof(s_memory_entries[0]); i++) {
+        if (s_memory_entries[i].valid && s_memory_entries[i].key == track_key) {
+            *out_blob = s_memory_entries[i].blob;
+            return hot_cue_store_memory_decode(out_blob, sizeof(*out_blob));
+        }
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t hot_cue_store_memory_save(uint32_t track_key, const hot_cue_store_memory_blob_t *blob)
+{
+    if (track_key == 0 || !blob || blob->count > HOT_CUE_STORE_MEMORY_EDITS_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    for (size_t i = 0; i < sizeof(s_memory_entries) / sizeof(s_memory_entries[0]); i++) {
+        if (s_memory_entries[i].valid && s_memory_entries[i].key == track_key) {
+            memset(&s_memory_entries[i], 0, sizeof(s_memory_entries[i]));
+        }
+    }
+    if (blob->count == 0) {
+        return ESP_OK;
+    }
+    for (size_t i = 0; i < sizeof(s_memory_entries) / sizeof(s_memory_entries[0]); i++) {
+        if (!s_memory_entries[i].valid) {
+            s_memory_entries[i].key = track_key;
+            s_memory_entries[i].blob = *blob;
+            s_memory_entries[i].blob.version = HOT_CUE_STORE_MEMORY_VERSION;
+            s_memory_entries[i].valid = 1;
+            return ESP_OK;
+        }
+    }
+    return ESP_FAIL;
 }
 
 esp_err_t hot_cue_store_clear(uint32_t track_key)
@@ -181,7 +237,7 @@ esp_err_t hot_cue_store_save(uint32_t track_key, const hot_cue_store_blob_t *blo
     ESP_RETURN_ON_ERROR(make_key(track_key, key), TAG, "key");
 
     hot_cue_store_blob_t normalized = *blob;
-    normalize_blob(&normalized);
+    hot_cue_store_normalize(&normalized);
 
     nvs_handle_t h;
     ESP_RETURN_ON_ERROR(nvs_open(NS, NVS_READWRITE, &h), TAG, "nvs_open");
@@ -204,6 +260,53 @@ esp_err_t hot_cue_store_clear(uint32_t track_key)
     nvs_handle_t h;
     ESP_RETURN_ON_ERROR(nvs_open(NS, NVS_READWRITE, &h), TAG, "nvs_open");
     esp_err_t rc = nvs_erase_key(h, key);
+    if (rc == ESP_ERR_NVS_NOT_FOUND) {
+        rc = ESP_OK;
+    }
+    if (rc == ESP_OK) {
+        rc = nvs_commit(h);
+    }
+    nvs_close(h);
+    return rc;
+}
+
+esp_err_t hot_cue_store_memory_load(uint32_t track_key, hot_cue_store_memory_blob_t *out_blob)
+{
+    if (track_key == 0 || !out_blob) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(out_blob, 0, sizeof(*out_blob));
+    char key[16];
+    ESP_RETURN_ON_ERROR(make_key_prefixed("mc", track_key, key), TAG, "key");
+
+    nvs_handle_t h;
+    esp_err_t rc = nvs_open(NS, NVS_READONLY, &h);
+    if (rc != ESP_OK) {
+        return rc == ESP_ERR_NVS_NOT_FOUND ? ESP_ERR_NOT_FOUND : rc;
+    }
+    size_t len = sizeof(*out_blob);
+    rc = nvs_get_blob(h, key, out_blob, &len);
+    nvs_close(h);
+    if (rc != ESP_OK) {
+        memset(out_blob, 0, sizeof(*out_blob));
+        return rc == ESP_ERR_NVS_NOT_FOUND ? ESP_ERR_NOT_FOUND : rc;
+    }
+    return hot_cue_store_memory_decode(out_blob, len);
+}
+
+esp_err_t hot_cue_store_memory_save(uint32_t track_key, const hot_cue_store_memory_blob_t *blob)
+{
+    if (track_key == 0 || !blob || blob->count > HOT_CUE_STORE_MEMORY_EDITS_MAX ||
+        blob->version != HOT_CUE_STORE_MEMORY_VERSION) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    char key[16];
+    ESP_RETURN_ON_ERROR(make_key_prefixed("mc", track_key, key), TAG, "key");
+
+    nvs_handle_t h;
+    ESP_RETURN_ON_ERROR(nvs_open(NS, NVS_READWRITE, &h), TAG, "nvs_open");
+    esp_err_t rc = blob->count == 0 ? nvs_erase_key(h, key)
+                                    : nvs_set_blob(h, key, blob, sizeof(*blob));
     if (rc == ESP_ERR_NVS_NOT_FOUND) {
         rc = ESP_OK;
     }

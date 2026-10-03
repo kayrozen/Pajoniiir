@@ -170,7 +170,7 @@ static void draw_zoom_grid(uint8_t *pixels,
     if (meta && meta->beats && meta->beat_count > 0) {
         int last_x = -1000;
         for (uint16_t b = 0; b < meta->beat_count; b++) {
-            bool downbeat = (meta->beats[b].beat_phase % 4u) == 0u;
+            bool downbeat = anlz_beat_is_downbeat(meta->beats[b].beat_phase);
             if (downbeats_only && !downbeat) {
                 continue;
             }
@@ -215,7 +215,7 @@ static void draw_zoom_grid(uint8_t *pixels,
         return;
     }
 
-    ui_overview_grid_style_t style = ui_overview_grid_style_for_phase(1);
+    ui_overview_grid_style_t style = ui_overview_grid_style_for_phase(2);   /* regular beat */
     if (caps_only && style.cap_palette_index == 0) {
         return;
     }
@@ -330,7 +330,7 @@ static void draw_zoom_grid_rgb565_column_span(uint16_t *pixels,
 
         int last_x = -1000;
         for (uint16_t b = 0; b < meta->beat_count; b++) {
-            bool downbeat = (meta->beats[b].beat_phase % 4u) == 0u;
+            bool downbeat = anlz_beat_is_downbeat(meta->beats[b].beat_phase);
             if (downbeats_only && !downbeat) {
                 continue;
             }
@@ -391,7 +391,7 @@ static void draw_zoom_grid_rgb565_column_span(uint16_t *pixels,
         return;
     }
 
-    ui_overview_grid_style_t style = ui_overview_grid_style_for_phase(1);
+    ui_overview_grid_style_t style = ui_overview_grid_style_for_phase(2);   /* regular beat */
     if (caps_only && style.cap_palette_index == 0) {
         return;
     }
@@ -746,6 +746,64 @@ void ui_overview_renderer_draw_main_rgb565_column_span_cues(uint16_t *pixels,
                 for (int y = 0; y < head_h; y++) {
                     pixels[y * stride_px + head_dx] = cue_color;
                 }
+            }
+        }
+    }
+}
+
+/* v309: memory cues as CDJ-red triangles on the bottom edge (base on the
+ * last row, tip WAVE_MEMORY_H - 1 rows up), drawn over the span the caller
+ * just rendered. A white outline (base row and both edges) tells them from
+ * the plain red downbeat caps, which also sit on the bottom edge of a HIGH
+ * strip. A triangle may straddle two spans; each draws its part. */
+#define WAVE_MEMORY_PALETTE_INDEX 9
+#define WAVE_MEMORY_OUTLINE_PALETTE_INDEX 4
+#define WAVE_MEMORY_HALF_W 5
+#define WAVE_MEMORY_H 6
+
+void ui_overview_renderer_draw_memory_rgb565_column_span(uint16_t *pixels,
+                                                         int stride_px,
+                                                         int height_px,
+                                                         int dest_x_px,
+                                                         int logical_x_px,
+                                                         int column_count,
+                                                         int logical_width_px,
+                                                         uint32_t center_ms,
+                                                         uint32_t window_ms,
+                                                         const uint16_t *palette,
+                                                         size_t palette_count,
+                                                         const anlz_memory_cue_t *cues,
+                                                         uint8_t cue_count)
+{
+    if (!pixels || !cues || cue_count == 0u || window_ms == 0u || stride_px <= 0 ||
+        height_px <= 0 || logical_width_px <= 0 || column_count <= 0) {
+        return;
+    }
+    const uint16_t color = rgb565_palette_color(palette, palette_count,
+                                                WAVE_MEMORY_PALETTE_INDEX);
+    const uint16_t outline = rgb565_palette_color(palette, palette_count,
+                                                  WAVE_MEMORY_OUTLINE_PALETTE_INDEX);
+    const int64_t window_start_ms = (int64_t)center_ms - ((int64_t)window_ms / 2);
+    for (uint8_t c = 0; c < cue_count; c++) {
+        const int cue_x = (int)(((int64_t)cues[c].start_ms - window_start_ms) *
+                                (int64_t)logical_width_px / (int64_t)window_ms);
+        if (cue_x + WAVE_MEMORY_HALF_W < logical_x_px ||
+            cue_x - WAVE_MEMORY_HALF_W >= logical_x_px + column_count) {
+            continue;
+        }
+        for (int r = 0; r < WAVE_MEMORY_H && r < height_px; r++) {
+            const int half = WAVE_MEMORY_HALF_W - r;
+            const int y = height_px - 1 - r;
+            for (int x = cue_x - half; x <= cue_x + half; x++) {
+                if (x < logical_x_px || x >= logical_x_px + column_count) {
+                    continue;
+                }
+                const int dest_x = dest_x_px + (x - logical_x_px);
+                if (dest_x < 0 || dest_x >= stride_px) {
+                    continue;
+                }
+                const bool edge = r == 0 || x == cue_x - half || x == cue_x + half;
+                pixels[y * stride_px + dest_x] = edge ? outline : color;
             }
         }
     }

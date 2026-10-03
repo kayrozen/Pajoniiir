@@ -32,6 +32,7 @@ typedef struct {
     uint32_t bpm_x100;                  /* base (unpitched) BPM x100, 0 = bpm; dj_ui applies tempo_pct */
     const char *key;                    /* NULL/"" = "--" */
     bool master_tempo;
+    dj_sync_t sync;                     /* v304: SYNC button state */
     bool cue_point_set;
     uint32_t cue_point_ms;
     bool loop_active;                   /* in+out set: burned into the zoom strip */
@@ -51,10 +52,18 @@ typedef struct {
     uint32_t center_ms, window_ms;
     const anlz_cue_t *cues;             /* merged hot cues burned into the strip */
     uint8_t cue_count;
+    /* v309: memory cues by time (copied): burned into the strip, drawn by
+     * dj_ui on the mini. */
+    const anlz_memory_cue_t *memory;
+    uint8_t memory_count;
     /* Deck header thumbnail (DJ_ART_DECK_PX^2 RGB565), copied by dj_ui when
      * (art_key, art) changes. NULL = "ART" placeholder, e.g. still decoding. */
     uint32_t art_key;
     const uint16_t *art;
+    /* v307: DJ Link download into the deck (bar under the title): 0..100;
+     * load_db = still reading the peer's export.pdb. */
+    bool load_active, load_db;
+    uint8_t load_percent;
 } ui_djui_deck_view_t;
 
 /* Beat FX panel (v264). Plain values, formatted by the caller. */
@@ -153,6 +162,7 @@ typedef struct {
     bool jog_cdj;                       /* v267: jog mode, false = VINYL */
     uint8_t tempo_range_pct;            /* v275: tempo fader range 6/10/16; 0 = 10 */
     bool load_lock;                     /* v293: no LOAD onto a playing deck */
+    bool link_sync;                     /* v304: SYNC follows the DJ Link master */
 
     ui_djui_sd_state_t sd_state;
     uint64_t sd_free_bytes, sd_total_bytes;

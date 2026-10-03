@@ -13,6 +13,7 @@
 #include "deck_jog_scrub.h"
 #include "deck_hot_cue_recall.h"
 #include "deck_load_lock.h"
+#include "deck_net_sync.h"
 #include "rekordbox_anlz.h"
 #if !defined(DECK_CORE_PC_TEST)
 #include "esp_timer.h"
@@ -40,6 +41,7 @@ static const char *TAG = "deck";
 #define DECK_CORE_INTERNAL_RESET_ID 0xFEu
 #define DECK_CORE_INTERNAL_LOAD_CUE_ID 0xFDu
 #define DECK_CORE_INTERNAL_TEMPO_RANGE_ID 0xFCu
+#define DECK_CORE_INTERNAL_NET_CMD_ID 0xFBu
 #define DECK_CORE_TEMPO_RANGE_QUEUE_TIMEOUT_MS 100u
 #define DECK_CORE_LOAD_CUE_QUEUE_TIMEOUT_MS 100u
 #define DECK_CORE_RESET_TIMEOUT_MS 2000u
@@ -109,6 +111,15 @@ static TickType_t        s_last_drop_warn;
 static bool              s_flx4_connection_state_valid;
 static bool              s_flx4_connected;
 static uint8_t           s_sync_master_deck = CTRL_DECK_NONE;
+/* v304: network beat sync per deck (deck task), the LINK SYNC switch, and
+ * the DJ Link beat clock behind a seqlock written by the dj_link task. */
+static deck_net_sync_t   s_net_sync[DECK_CORE_DECK_COUNT];
+static bool              s_net_sync_enabled;
+static deck_net_clock_t  s_net_clock;
+static uint32_t          s_net_clock_seq;
+static bool              s_net_clock_writer;
+static bool net_sync_available(uint8_t *player);
+static void net_sync_engage(uint8_t deck, deck_state_t *state, uint8_t player);
 
 typedef enum {
     DECK_UI_CMD_LOAD_SELECTED,
@@ -350,12 +361,62 @@ static void hot_cue_mask_cache_store(uint8_t deck, uint32_t track_key,
 
 #define DECK_CORE_DEFERRED_MIXER_LOG_STEP 2048u
 
+/* v309: memory cues of the loaded track, owned by the deck actor: the list
+ * CALL walks (analysis + local, by time) and the edits hot_cue_store keeps in
+ * NVS. Static, not on the 8 KB actor stack. The list is published to the UI
+ * through the snapshot seqlock, like the hot cues. A cue "at" the playhead
+ * (DELETE, and the one CALL steps away from) starts within
+ * DECK_MEMORY_CUE_ON_MS of it. */
+#define DECK_MEMORY_CUE_ON_MS 50u
+
+typedef char deck_core_memory_cue_max_matches_store
+    [(DECK_CORE_MEMORY_CUE_MAX == HOT_CUE_STORE_MEMORY_MAX) ? 1 : -1];
+
+typedef struct {
+    uint32_t track_key;
+    hot_cue_store_memory_list_t list;
+} deck_memory_view_t;
+
+static uint32_t s_memory_key[DECK_CORE_DECK_COUNT];
+static bool s_memory_editable[DECK_CORE_DECK_COUNT];
+static hot_cue_store_memory_list_t s_memory_list[DECK_CORE_DECK_COUNT];
+static hot_cue_store_memory_blob_t s_memory_edits[DECK_CORE_DECK_COUNT];
+static hot_cue_store_memory_list_t s_memory_tmp_list;
+static hot_cue_store_memory_blob_t s_memory_tmp_edits;
+static hot_cue_store_memory_t s_memory_source[ANLZ_MAX_MEMORY_CUES];
+static deck_memory_view_t s_published_memory[DECK_CORE_DECK_COUNT];
+static uint32_t s_memory_revision;
+
+static void publish_memory_view(void)
+{
+    snapshot_write_begin();
+    for (uint8_t d = 0; d < DECK_CORE_DECK_COUNT; d++) {
+        s_published_memory[d].track_key = s_memory_key[d];
+        s_published_memory[d].list = s_memory_list[d];
+    }
+    (void)__atomic_add_fetch(&s_memory_revision, 1u, __ATOMIC_RELEASE);
+    snapshot_write_end();
+}
+
+static void memory_cues_invalidate(uint8_t deck)
+{
+    if (deck >= DECK_CORE_DECK_COUNT) {
+        return;
+    }
+    s_memory_key[deck] = 0u;
+    s_memory_editable[deck] = false;
+    memset(&s_memory_list[deck], 0, sizeof(s_memory_list[deck]));
+    memset(&s_memory_edits[deck], 0, sizeof(s_memory_edits[deck]));
+    publish_memory_view();
+}
+
 static void publish_flx4_led_snapshot(bool force);
 static void publish_loaded_track_hot_cue_leds(uint8_t deck);
 static void apply_deck_pitch(uint8_t deck, deck_state_t *state);
 static bool apply_beat_sync(uint8_t deck, deck_state_t *state);
 static uint8_t beat_sync_reference_deck(uint8_t deck);
 static void set_sync_master(uint8_t deck, deck_state_t *state);
+static bool sync_engage(uint8_t deck, deck_state_t *state);
 static float deck_effective_bpm(uint8_t deck, const deck_state_t *state);
 static void deck_send_led(led_id_t led, uint8_t state, uint8_t deck);
 static void handle_jog_touch(uint8_t deck, bool pressed, deck_state_t *state);
@@ -940,6 +1001,7 @@ static void handle_hot_cue_pad_action(uint8_t deck, uint8_t pad, bool shifted, d
 
     uint32_t pos_ms = current_deck_position_ms(deck, state);
     blob.valid_mask |= bit;
+    blob.source_mask &= (uint8_t)~bit; /* v303: a pad set is a local cue */
     blob.slots[pad] = (hot_cue_store_slot_t) {
         .pos_ms = pos_ms,
         .end_ms = 0,
@@ -2146,13 +2208,15 @@ static void hot_cue_seed_from_anlz(const anlz_metadata_t *meta, uint32_t duratio
     }
 }
 
-/* One store read and at most one write per load. Rekordbox hot cues are seeded
- * only while the track has no local hot cue (pads keep priority). The cue point
- * resolves local cue > Rekordbox memory cue > track start; a memory cue with no
- * local cue is seeded like the hot cues, and a local cue past the track end is
- * dropped. A store read error other than "not found" leaves the store alone. */
+/* One store read and at most one write per load. v303: local cues (pads, CUE
+ * button) keep priority slot by slot; cues seeded from the analysis follow it
+ * on every load, so a cue edited at the source (Rekordbox USB, DJ Link peer)
+ * is no longer frozen by the first seed (hot_cue_store_merge_source). The cue
+ * point resolves local cue > analysis memory cue > track start. have_source:
+ * the analysis carries cue lists; without them the store is left as it is.
+ * A store read error other than "not found" leaves the store alone. */
 static uint32_t load_track_cues(uint8_t deck, uint32_t track_key, uint32_t duration_ms,
-                                const hot_cue_store_blob_t *seed,
+                                const hot_cue_store_blob_t *seed, bool have_source,
                                 bool rb_cue, uint32_t rb_cue_ms, const char **source)
 {
     uint32_t cue_ms = rb_cue ? rb_cue_ms : 0u;
@@ -2170,24 +2234,17 @@ static uint32_t load_track_cues(uint8_t deck, uint32_t track_key, uint32_t durat
         return cue_ms;
     }
 
-    hot_cue_store_blob_t next = stored;
-    bool seeded = false;
-    if ((stored.valid_mask & 0xFFu) != 0u) {
-        if (seed->valid_mask != 0u) {
-            ESP_LOGI(TAG, "deck %u hot cues: local mask 0x%02x kept, Rekordbox ignored",
-                     (unsigned)deck + 1, (unsigned)(stored.valid_mask & 0xFFu));
-        }
-    } else if (seed->valid_mask != 0u) {
-        next.valid_mask = seed->valid_mask;
-        memcpy(next.slots, seed->slots, sizeof(next.slots));
-        seeded = true;
-    }
-    if (stored.has_cue && (duration_ms == 0u || stored.cue_point_ms < duration_ms)) {
-        cue_ms = stored.cue_point_ms;
-        *source = "local cue";
+    hot_cue_store_blob_t next;
+    hot_cue_store_merge_source(&stored, seed, have_source, rb_cue, rb_cue_ms, duration_ms,
+                               &next);
+    const bool seeded = next.source_mask != stored.source_mask ||
+                        memcmp(next.slots, stored.slots, sizeof(next.slots)) != 0;
+    if (next.has_cue) {
+        cue_ms = next.cue_point_ms;
+        *source = next.cue_from_source ? "memory cue" : "local cue";
     } else {
-        next.has_cue = rb_cue ? 1u : 0u;
-        next.cue_point_ms = rb_cue ? rb_cue_ms : 0u;
+        cue_ms = 0u;
+        *source = "track start";
     }
 
     if (memcmp(&next, &stored, sizeof(next)) != 0) {
@@ -2196,12 +2253,11 @@ static uint32_t load_track_cues(uint8_t deck, uint32_t track_key, uint32_t durat
             ESP_LOGW(TAG, "deck %u track cues save failed: %s",
                      (unsigned)deck + 1, esp_err_to_name(rc));
             next = stored;
-            seeded = false;
+        } else if (seeded) {
+            ESP_LOGI(TAG, "deck %u hot cues from analysis: mask 0x%02x (source 0x%02x)",
+                     (unsigned)deck + 1, (unsigned)(next.valid_mask & 0xFFu),
+                     (unsigned)next.source_mask);
         }
-    }
-    if (seeded) {
-        ESP_LOGI(TAG, "deck %u hot cues seeded from Rekordbox: mask 0x%02x",
-                 (unsigned)deck + 1, (unsigned)(next.valid_mask & 0xFFu));
     }
     hot_cue_mask_cache_store(deck, track_key, &next);
     return cue_ms;
@@ -2233,6 +2289,7 @@ static void persist_cue_point(uint8_t deck, bool has_cue, uint32_t cue_ms)
     }
     blob.has_cue = has_cue ? 1u : 0u;
     blob.cue_point_ms = has_cue ? cue_ms : 0u;
+    blob.cue_from_source = 0u; /* v303: a CUE press is a local cue */
     rc = hot_cue_store_save(track_key, &blob);
     if (rc != ESP_OK) {
         ESP_LOGW(TAG, "deck %u cue save failed: %s", (unsigned)deck + 1, esp_err_to_name(rc));
@@ -2347,6 +2404,198 @@ static bool cue_park_service(void)
     return armed;
 }
 
+/* v309: the analysis memory cues into s_memory_source; returns the count. */
+static size_t memory_source_from_anlz(const anlz_metadata_t *meta)
+{
+    size_t n = meta->memory_cue_count < ANLZ_MAX_MEMORY_CUES ? meta->memory_cue_count
+                                                             : ANLZ_MAX_MEMORY_CUES;
+    for (size_t i = 0; i < n; i++) {
+        s_memory_source[i] = (hot_cue_store_memory_t) {
+            .pos_ms = meta->memory_cues[i].start_ms,
+            .end_ms = meta->memory_cues[i].end_ms,
+        };
+    }
+    return n;
+}
+
+/* v309: the deck's memory cues for this load: the analysis' (s_memory_source)
+ * merged with the edits stored for the track. A store read error other than
+ * "not found" shows the analysis cues but refuses edits, so a save cannot
+ * overwrite edits it never read. */
+static void load_memory_cues(uint8_t deck, uint32_t track_key, uint32_t duration_ms,
+                             size_t source_count, bool have_source)
+{
+    hot_cue_store_memory_blob_t *edits = &s_memory_edits[deck];
+    bool editable = track_key != 0u;
+    esp_err_t rc = editable ? hot_cue_store_memory_load(track_key, edits) : ESP_ERR_NOT_FOUND;
+    if (rc != ESP_OK) {
+        if (rc != ESP_ERR_NOT_FOUND) {
+            ESP_LOGW(TAG, "deck %u memory cues read-only: load failed: %s",
+                     (unsigned)deck + 1, esp_err_to_name(rc));
+            editable = false;
+        }
+        memset(edits, 0, sizeof(*edits));
+    }
+    const bool pruned = hot_cue_store_memory_merge(edits, s_memory_source, source_count,
+                                                   have_source, duration_ms,
+                                                   &s_memory_list[deck]);
+    if (pruned && editable) {
+        rc = hot_cue_store_memory_save(track_key, edits);
+        if (rc != ESP_OK) {
+            ESP_LOGW(TAG, "deck %u memory cue edits save failed: %s",
+                     (unsigned)deck + 1, esp_err_to_name(rc));
+        }
+    }
+    s_memory_key[deck] = track_key;
+    s_memory_editable[deck] = editable;
+    publish_memory_view();
+    ESP_LOGW(TAG, "deck %u memory cues: %u (%u from the analysis, %u edits)",
+             (unsigned)deck + 1, (unsigned)s_memory_list[deck].count,
+             (unsigned)source_count, (unsigned)edits->count);
+}
+
+/* The memory cues the deck holds are this load's. */
+static bool memory_cues_current(uint8_t deck)
+{
+    const uint32_t key = loaded_track_key_for_deck(deck);
+    return key != 0u && s_memory_key[deck] == key;
+}
+
+/* Saves the edited copies (s_memory_tmp_*) and makes them the deck's, and the
+ * other deck's when it holds the same track. On a save error the deck keeps
+ * what it had. */
+static bool memory_cues_commit(uint8_t deck, const char *what)
+{
+    esp_err_t rc = hot_cue_store_memory_save(s_memory_key[deck], &s_memory_tmp_edits);
+    if (rc != ESP_OK) {
+        ESP_LOGW(TAG, "deck %u memory cue %s not saved: %s", (unsigned)deck + 1, what,
+                 esp_err_to_name(rc));
+        return false;
+    }
+    for (uint8_t d = 0; d < DECK_CORE_DECK_COUNT; d++) {
+        if (d == deck || (s_memory_key[d] == s_memory_key[deck] && s_memory_editable[d])) {
+            s_memory_list[d] = s_memory_tmp_list;
+            s_memory_edits[d] = s_memory_tmp_edits;
+        }
+    }
+    publish_memory_view();
+    return true;
+}
+
+/* CUE/LOOP CALL (v309): an active loop is halved / doubled as before;
+ * otherwise the deck goes to the previous / next memory cue, which becomes
+ * the cue point (not saved: the track keeps its load cue). A playing deck
+ * keeps playing from it, a paused one parks on it; a memory loop is set. */
+static void memory_call(uint8_t deck, int dir, deck_state_t *state)
+{
+    bool active = false;
+    uint32_t start_ms = 0u;
+    uint32_t end_ms = 0u;
+    if (read_active_loop(deck, &active, &start_ms, &end_ms) && active && end_ms > start_ms) {
+        on_loop_control(deck, dir < 0 ? CTRL_DECK_CTL_LOOP_HALVE : CTRL_DECK_CTL_LOOP_DOUBLE,
+                        state);
+        return;
+    }
+    if (!memory_cues_current(deck)) {
+        ESP_LOGW(TAG, "deck %u memory cue call ignored: no cues for the loaded track",
+                 (unsigned)deck + 1);
+        return;
+    }
+    const uint32_t pos_ms = current_deck_position_ms(deck, state);
+    const int i = hot_cue_store_memory_step(&s_memory_list[deck], pos_ms, DECK_MEMORY_CUE_ON_MS,
+                                            dir);
+    if (i < 0) {
+        ESP_LOGW(TAG, "deck %u memory cue call: none %s %lu ms", (unsigned)deck + 1,
+                 dir < 0 ? "before" : "after", (unsigned long)pos_ms);
+        return;
+    }
+    const hot_cue_store_memory_t cue = s_memory_list[deck].cues[i];
+    cue_park_cancel(deck, "memory cue call");
+    esp_err_t rc = deck_seek(deck, cue.pos_ms, "CONTROLLER_MEMORY_CUE");
+    if (rc != ESP_OK) {
+        ESP_LOGW(TAG, "deck %u memory cue %d call failed: %s", (unsigned)deck + 1, i + 1,
+                 esp_err_to_name(rc));
+        return;
+    }
+    const uint8_t idx = normalize_deck(deck);
+    s_cue_preview[idx] = false;   /* a held CUE no longer returns anywhere else */
+    state->position_ms = cue.pos_ms;
+    state->cue_point_ms = cue.pos_ms;
+    if (cue.end_ms > cue.pos_ms) {
+        set_deck_loop(deck, cue.pos_ms, cue.end_ms);
+    }
+    ESP_LOGW(TAG, "deck %u memory cue %d/%u call -> %lu ms%s (%s)", (unsigned)deck + 1, i + 1,
+             (unsigned)s_memory_list[deck].count, (unsigned long)cue.pos_ms,
+             cue.end_ms > cue.pos_ms ? " loop" : "", state->playing ? "PLAYING" : "PAUSED");
+    sync_legacy_compat_leds(deck);
+}
+
+/* MEMORY (SHIFT + CALL >, v309): the active loop as a memory loop, else the
+ * playhead as a memory cue. */
+static void memory_store(uint8_t deck, deck_state_t *state)
+{
+    if (!memory_cues_current(deck) || !s_memory_editable[deck]) {
+        ESP_LOGW(TAG, "deck %u MEMORY ignored: no editable cues for the loaded track",
+                 (unsigned)deck + 1);
+        return;
+    }
+    bool active = false;
+    uint32_t pos_ms = 0u;
+    uint32_t end_ms = 0u;
+    if (!read_active_loop(deck, &active, &pos_ms, &end_ms) || !active || end_ms <= pos_ms) {
+        pos_ms = current_deck_position_ms(deck, state);
+        end_ms = 0u;
+    }
+    s_memory_tmp_list = s_memory_list[deck];
+    s_memory_tmp_edits = s_memory_edits[deck];
+    switch (hot_cue_store_memory_add(&s_memory_tmp_edits, &s_memory_tmp_list, pos_ms, end_ms)) {
+    case HOT_CUE_STORE_MEMORY_ADDED:
+        if (memory_cues_commit(deck, "store")) {
+            ESP_LOGW(TAG, "deck %u MEMORY -> %lu ms%s (%u cues)", (unsigned)deck + 1,
+                     (unsigned long)pos_ms, end_ms ? " loop" : "",
+                     (unsigned)s_memory_list[deck].count);
+        }
+        return;
+    case HOT_CUE_STORE_MEMORY_EXISTS:
+        ESP_LOGW(TAG, "deck %u MEMORY ignored: a cue is already at %lu ms",
+                 (unsigned)deck + 1, (unsigned long)pos_ms);
+        return;
+    default:
+        ESP_LOGW(TAG, "deck %u MEMORY ignored: %u cues, full", (unsigned)deck + 1,
+                 (unsigned)s_memory_list[deck].count);
+        return;
+    }
+}
+
+/* DELETE (SHIFT + CALL <, v309): the memory cue at the playhead (call it
+ * first). An analysis cue is hidden on this deck, the source keeps it. */
+static void memory_delete(uint8_t deck, deck_state_t *state)
+{
+    if (!memory_cues_current(deck) || !s_memory_editable[deck]) {
+        ESP_LOGW(TAG, "deck %u DELETE ignored: no editable cues for the loaded track",
+                 (unsigned)deck + 1);
+        return;
+    }
+    const uint32_t pos_ms = current_deck_position_ms(deck, state);
+    const int i = hot_cue_store_memory_find(&s_memory_list[deck], pos_ms, DECK_MEMORY_CUE_ON_MS);
+    if (i < 0) {
+        ESP_LOGW(TAG, "deck %u DELETE ignored: no memory cue at %lu ms", (unsigned)deck + 1,
+                 (unsigned long)pos_ms);
+        return;
+    }
+    const uint32_t cue_ms = s_memory_list[deck].cues[i].pos_ms;
+    s_memory_tmp_list = s_memory_list[deck];
+    s_memory_tmp_edits = s_memory_edits[deck];
+    if (!hot_cue_store_memory_remove(&s_memory_tmp_edits, &s_memory_tmp_list, (size_t)i)) {
+        ESP_LOGW(TAG, "deck %u DELETE ignored: edits full", (unsigned)deck + 1);
+        return;
+    }
+    if (memory_cues_commit(deck, "delete")) {
+        ESP_LOGW(TAG, "deck %u DELETE memory cue %lu ms (%u left)", (unsigned)deck + 1,
+                 (unsigned long)cue_ms, (unsigned)s_memory_list[deck].count);
+    }
+}
+
 /* Actor side of a track load: the cue point starts at the track's saved cue,
  * else the Rekordbox memory cue, else the track start, and a paused deck parks
  * on it, so the first CUE press previews instead of overwriting it.
@@ -2375,8 +2624,12 @@ static void apply_loaded_memory_cue(uint8_t deck, uint16_t generation)
         rb_cue_ms = meta->memory_cue_ms;
     }
     hot_cue_store_blob_t hot_cue_seed = {0};
+    bool have_source = false;
+    size_t memory_count = 0u;
     if (current && loaded.has_anlz && meta) {
         hot_cue_seed_from_anlz(meta, loaded.duration_ms, &hot_cue_seed);
+        have_source = meta->has_cue_lists;
+        memory_count = memory_source_from_anlz(meta);
     }
     anlz_snapshot_release(snapshot);
     if (!current) {
@@ -2389,11 +2642,13 @@ static void apply_loaded_memory_cue(uint8_t deck, uint16_t generation)
     deck_cue_park_cancel(&s_cue_park[idx]);
     const char *cue_source = NULL;
     const uint32_t cue_ms = load_track_cues(idx, loaded.track_key, loaded.duration_ms,
-                                            &hot_cue_seed, rb_cue, rb_cue_ms, &cue_source);
+                                            &hot_cue_seed, have_source, rb_cue, rb_cue_ms,
+                                            &cue_source);
     /* The pad bank was published when the load was submitted, before this
      * track was in the store; bring it to this track's cues (mask diff, so an
      * unchanged bank sends nothing). */
     publish_loaded_track_hot_cue_leds(idx);
+    load_memory_cues(idx, loaded.track_key, loaded.duration_ms, memory_count, have_source);
 
     deck_state_t *state = &s_decks[idx];
     state->cue_point_ms = cue_ms;
@@ -2814,7 +3069,7 @@ static bool on_deck_extension_button(const ctrl_event_t *ev)
             if (state->sync_enabled) {
                 state->sync_enabled = false;
             } else {
-                applied = apply_beat_sync(deck, state);
+                applied = sync_engage(deck, state);
             }
             (void)applied;
             ESP_LOGI(TAG, "deck %u sync -> %s%s",
@@ -2882,6 +3137,16 @@ static bool on_deck_extension_button(const ctrl_event_t *ev)
                 publish_flx4_led_snapshot(false);
             }
             ESP_LOGI(TAG, "deck %u sync -> OFF", (unsigned)deck + 1);
+            return true;
+        case CTRL_DECK_EXT_ACTION_MEMORY_CALL_PREV:
+        case CTRL_DECK_EXT_ACTION_MEMORY_CALL_NEXT:
+            memory_call(deck, action == CTRL_DECK_EXT_ACTION_MEMORY_CALL_PREV ? -1 : 1, state);
+            return true;
+        case CTRL_DECK_EXT_ACTION_MEMORY_STORE:
+            memory_store(deck, state);
+            return true;
+        case CTRL_DECK_EXT_ACTION_MEMORY_DELETE:
+            memory_delete(deck, state);
             return true;
         default:
             return true;
@@ -3469,6 +3734,172 @@ static bool event_uses_ui_without_deck_state(const ctrl_event_t *ev)
            ev->id == CTRL_ID_BROWSE_SHIFT_PRESS;
 }
 
+// ─── Network beat sync (v304) ─────────────────────────────────────────────────
+
+static void net_clock_read(deck_net_clock_t *out)
+{
+    for (;;) {
+        const uint32_t before = __atomic_load_n(&s_net_clock_seq, __ATOMIC_ACQUIRE);
+        if (before & 1u) {
+            continue;
+        }
+        *out = s_net_clock;
+        const uint32_t after = __atomic_load_n(&s_net_clock_seq, __ATOMIC_ACQUIRE);
+        if (after == before) {
+            return;
+        }
+    }
+}
+
+/* LINK SYNC on and a beat clock fresh enough to follow now. */
+static bool net_sync_available(uint8_t *player)
+{
+    if (!__atomic_load_n(&s_net_sync_enabled, __ATOMIC_ACQUIRE)) {
+        return false;
+    }
+    deck_net_clock_t clock;
+    net_clock_read(&clock);
+    if (player) *player = clock.player;
+    return deck_net_clock_bar_position(&clock, deck_core_net_clock_now_ms(), NULL, NULL);
+}
+
+static void net_sync_engage(uint8_t deck, deck_state_t *state, uint8_t player)
+{
+    deck_net_sync_engage(&s_net_sync[deck]);
+    state->sync_enabled = true;
+    state->sync_net = DECK_NET_SYNC_WAIT;
+    ESP_LOGI(TAG, "deck %u sync -> ON (DJ Link player #%u)", (unsigned)deck + 1,
+             (unsigned)player);
+}
+
+/* SYNC on: a DJ Link master wins over the other deck (v304). */
+static bool sync_engage(uint8_t deck, deck_state_t *state)
+{
+    uint8_t player = 0u;
+    if (net_sync_available(&player)) {
+        net_sync_engage(normalize_deck(deck), state, player);
+        return true;
+    }
+    return apply_beat_sync(deck, state);
+}
+
+/* v305: SYNC / SYNC MASTER asked by the network (dj_link_master.h), deck
+ * task. deck_core decides: these are the same changes the buttons make. */
+static void apply_net_command(uint8_t deck, deck_core_net_cmd_t cmd)
+{
+    deck = normalize_deck(deck);
+    deck_state_t *state = &s_decks[deck];
+    switch (cmd) {
+    case DECK_CORE_NET_SYNC_ON:
+        if (!state->sync_enabled) {
+            (void)sync_engage(deck, state);
+        }
+        break;
+    case DECK_CORE_NET_SYNC_OFF:
+        state->sync_enabled = false;
+        break;
+    case DECK_CORE_NET_MASTER_TAKE:
+        if (s_sync_master_deck != deck) {
+            set_sync_master(deck, state);
+        }
+        break;
+    case DECK_CORE_NET_MASTER_DROP:
+        if (s_sync_master_deck == deck) {
+            s_sync_master_deck = CTRL_DECK_NONE;
+        }
+        state->sync_master = false;
+        break;
+    default:
+        return;
+    }
+    ESP_LOGI(TAG, "deck %u network command %u -> sync %s%s", (unsigned)deck + 1,
+             (unsigned)cmd, state->sync_enabled ? "ON" : "OFF",
+             state->sync_master ? ", sync master" : "");
+    publish_flx4_led_snapshot(false);
+}
+
+/* Runs on the deck task every DECK_NET_SYNC_POLL_MS while a deck is engaged.
+ * Tempo goes through the engine's atomic pitch store; a snap is an ordinary
+ * deck seek. Any path that clears sync_enabled (SYNC, fader, tempo range,
+ * SYNC MASTER, reset) disengages here. True while a deck stays engaged. */
+static bool net_sync_service(void)
+{
+    static uint32_t s_last_step_ms;
+    const bool enabled = __atomic_load_n(&s_net_sync_enabled, __ATOMIC_ACQUIRE);
+    const uint32_t now_ms = deck_core_net_clock_now_ms();
+    bool active = false;
+    bool leds = false;
+    /* A burst of controller events must not step the loop faster than its
+     * tuning; disengaging is not rate limited. */
+    const bool step_due = (uint32_t)(now_ms - s_last_step_ms) >= DECK_NET_SYNC_POLL_MS;
+    deck_net_clock_t clock;
+    net_clock_read(&clock);
+    for (uint8_t deck = 0; deck < DECK_CORE_DECK_COUNT; deck++) {
+        deck_net_sync_t *ns = &s_net_sync[deck];
+        deck_state_t *state = &s_decks[deck];
+        if (!ns->engaged) {
+            continue;
+        }
+        if (!enabled || !state->sync_enabled || !deck_uses_audio_engine(deck)) {
+            deck_net_sync_disengage(ns);
+            leds |= state->sync_enabled;
+            state->sync_enabled = false;
+            state->sync_net = DECK_NET_SYNC_OFF;
+            ESP_LOGI(TAG, "deck %u DJ Link sync -> OFF%s", (unsigned)deck + 1,
+                     enabled ? "" : " (LINK SYNC off)");
+            continue;
+        }
+        active = true;
+        if (!step_due) {
+            continue;
+        }
+        deck_loaded_track_summary_t loaded = {0};
+        anlz_snapshot_t *snapshot = NULL;
+        const bool valid = acquire_loaded_track_for_deck(deck, &loaded, &snapshot);
+        const anlz_metadata_t *meta =
+            valid && loaded.has_anlz ? anlz_snapshot_metadata(snapshot) : NULL;
+        deck_net_sync_local_t local = {
+            .playing = state->playing,
+            .hold = s_jog_touched[deck] || s_jog_scratch_active[deck],
+            .position_ms = current_deck_position_ms(deck, state),
+            .beats = meta ? meta->beats : NULL,
+            .beat_count = meta ? meta->beat_count : 0u,
+        };
+        deck_net_sync_out_t out;
+        deck_net_sync_step(ns, &clock, &local, now_ms, &out);
+        anlz_snapshot_release(snapshot);
+        if (out.set_pitch) {
+            const float cp = out.pitch_percent * 100.0f;
+            state->pitch_centipercent = (int16_t)(cp + (cp >= 0.0f ? 0.5f : -0.5f));
+            audio_engine_deck_set_pitch_percent(deck, out.pitch_percent);
+        }
+        if (out.seek) {
+            esp_err_t rc = deck_seek(deck, out.seek_ms, "NET_SYNC_PHASE");
+            ESP_LOGI(TAG, "deck %u DJ Link bar snap %lu -> %lu ms: %s", (unsigned)deck + 1,
+                     (unsigned long)local.position_ms, (unsigned long)out.seek_ms,
+                     esp_err_to_name(rc));
+            if (rc == ESP_OK) {
+                state->position_ms = out.seek_ms;
+            }
+        }
+        if (state->sync_net != (uint8_t)out.status) {
+            ESP_LOGI(TAG, "deck %u DJ Link sync %s, pitch %+.3f%%, phase %+.3f beat",
+                     (unsigned)deck + 1,
+                     out.status == DECK_NET_SYNC_LOCKED ? "LOCKED"
+                     : out.status == DECK_NET_SYNC_ALIGNING ? "ALIGNING" : "WAIT",
+                     (double)out.pitch_percent, (double)out.phase_error);
+            state->sync_net = (uint8_t)out.status;
+        }
+    }
+    if (active && step_due) {
+        s_last_step_ms = now_ms;
+    }
+    if (leds) {
+        publish_flx4_led_snapshot(false);
+    }
+    return active;
+}
+
 // ─── Main task ────────────────────────────────────────────────────────────────
 
 /* v265: seeks the scrub target the jog ticks left pending once the engine has
@@ -3500,12 +3931,15 @@ static void deck_task(void *arg)
     while (1) {
         const bool cue_parked = cue_park_service();
         const bool scrub_waiting = jog_scrub_service();
+        const bool net_synced = net_sync_service();
         publish_state_snapshot();
         TickType_t wait = portMAX_DELAY;
         if (cue_parked) {
             wait = pdMS_TO_TICKS(DECK_CUE_PARK_RETRY_MS);
         } else if (scrub_waiting) {
             wait = pdMS_TO_TICKS(DECK_JOG_SCRUB_POLL_MS);
+        } else if (net_synced) {
+            wait = pdMS_TO_TICKS(DECK_NET_SYNC_POLL_MS);
         }
         if (xQueueReceive(s_queue, &ev, wait) != pdTRUE) continue;
 
@@ -3526,12 +3960,14 @@ static void deck_task(void *arg)
             memset(&s_jog_scrub[idx], 0, sizeof(s_jog_scrub[idx]));
             __atomic_store_n(&s_jog_show_pub[idx], DECK_JOG_SHOW_ENGINE, __ATOMIC_RELEASE);
             if (s_sync_master_deck == idx) s_sync_master_deck = CTRL_DECK_NONE;
+            deck_net_sync_disengage(&s_net_sync[idx]);
             memset(&s_loop_shadow[idx], 0, sizeof(s_loop_shadow[idx]));
             memset(&s_shifted_loop_roll[idx], 0, sizeof(s_shifted_loop_roll[idx]));
             memset(&s_pad_fx_led[idx], 0, sizeof(s_pad_fx_led[idx]));
             memset(&s_beat_loop_led[idx], 0, sizeof(s_beat_loop_led[idx]));
             memset(&s_censor_shadow[idx], 0, sizeof(s_censor_shadow[idx]));
             hot_cue_mask_cache_invalidate(idx);
+            memory_cues_invalidate(idx);
             publish_state_snapshot();
             if (s_reset_done_sem) xSemaphoreGive(s_reset_done_sem);
             continue;
@@ -3544,6 +3980,11 @@ static void deck_task(void *arg)
 
         if (ev.type == CTRL_EV_STATE && ev.id == DECK_CORE_INTERNAL_TEMPO_RANGE_ID) {
             apply_tempo_range_all((uint16_t)ev.value);
+            continue;
+        }
+
+        if (ev.type == CTRL_EV_STATE && ev.id == DECK_CORE_INTERNAL_NET_CMD_ID) {
+            apply_net_command(ev.deck, (deck_core_net_cmd_t)ev.value);
             continue;
         }
 
@@ -3844,6 +4285,65 @@ bool deck_core_get_jog_cdj_mode(void)
     return __atomic_load_n(&s_jog_cdj_mode, __ATOMIC_ACQUIRE);
 }
 
+void deck_core_set_net_sync_enabled(bool on)
+{
+    __atomic_store_n(&s_net_sync_enabled, on, __ATOMIC_RELEASE);
+}
+
+bool deck_core_get_net_sync_enabled(void)
+{
+    return __atomic_load_n(&s_net_sync_enabled, __ATOMIC_ACQUIRE);
+}
+
+void deck_core_net_command(uint8_t deck, deck_core_net_cmd_t cmd)
+{
+    if (deck >= DECK_CORE_DECK_COUNT) return;
+#if defined(DECK_CORE_PC_TEST)
+    apply_net_command(deck, cmd);
+#else
+    /* Straight to the deck queue, never waiting: not a user action, so it
+     * neither wakes the screensaver nor counts as activity. */
+    ctrl_event_t ev = {
+        .type = CTRL_EV_STATE,
+        .id = DECK_CORE_INTERNAL_NET_CMD_ID,
+        .value = (int16_t)cmd,
+        .deck = deck,
+    };
+    if (!s_queue || xQueueSend(s_queue, &ev, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "deck %u network command %u dropped", (unsigned)deck + 1u,
+                 (unsigned)cmd);
+    }
+#endif
+}
+
+void deck_core_set_net_clock(const deck_net_clock_t *clock)
+{
+    const deck_net_clock_t next = clock ? *clock : (deck_net_clock_t){0};
+    while (__atomic_exchange_n(&s_net_clock_writer, true, __ATOMIC_ACQ_REL)) {
+        taskYIELD();
+    }
+    (void)__atomic_add_fetch(&s_net_clock_seq, 1u, __ATOMIC_RELEASE); /* odd */
+    s_net_clock = next;
+    (void)__atomic_add_fetch(&s_net_clock_seq, 1u, __ATOMIC_RELEASE); /* even */
+    __atomic_store_n(&s_net_clock_writer, false, __ATOMIC_RELEASE);
+}
+
+void deck_core_get_net_clock(deck_net_clock_t *out)
+{
+    if (out) {
+        net_clock_read(out);
+    }
+}
+
+uint32_t deck_core_net_clock_now_ms(void)
+{
+#if defined(DECK_CORE_PC_TEST)
+    return deck_now_ms();
+#else
+    return (uint32_t)(esp_timer_get_time() / 1000);
+#endif
+}
+
 void deck_core_set_load_lock(bool on)
 {
     __atomic_store_n(&s_load_lock, on, __ATOMIC_RELEASE);
@@ -3940,6 +4440,7 @@ void deck_core_reset_deck(uint8_t deck)
     memset(&s_beat_loop_led[idx], 0, sizeof(s_beat_loop_led[idx]));
     memset(&s_censor_shadow[idx], 0, sizeof(s_censor_shadow[idx]));
     hot_cue_mask_cache_invalidate(idx);
+    memory_cues_invalidate(idx);
     publish_state_snapshot();
 #else
     if (!s_queue || !s_reset_done_sem) return;
@@ -4076,6 +4577,50 @@ uint32_t deck_core_hot_cues_revision(void)
     return __atomic_load_n(&s_hot_cue_revision, __ATOMIC_ACQUIRE);
 }
 
+bool deck_core_get_memory_cues(uint8_t deck, deck_core_memory_cues_t *out)
+{
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (deck >= DECK_CORE_DECK_COUNT) return false;
+
+    deck_memory_view_t view;
+    for (;;) {
+        const uint32_t before = __atomic_load_n(&s_snapshot_seq, __ATOMIC_ACQUIRE);
+        if (before & 1u) {
+            continue;   /* writer mid-update; re-read the sequence */
+        }
+        view = s_published_memory[deck];
+        const uint32_t after = __atomic_load_n(&s_snapshot_seq, __ATOMIC_ACQUIRE);
+        if (after == before) {
+            break;
+        }
+    }
+
+    /* Same rule as the hot cues: only while the view names the loaded track. */
+    deck_loaded_track_summary_t loaded = {0};
+    if (view.track_key == 0u ||
+        !deck_loaded_track_store_get(&s_loaded_tracks, deck, &loaded) ||
+        !loaded.valid || loaded.track_key != view.track_key) {
+        return false;
+    }
+    out->known = true;
+    out->count = view.list.count <= DECK_CORE_MEMORY_CUE_MAX ? view.list.count
+                                                             : DECK_CORE_MEMORY_CUE_MAX;
+    for (uint8_t i = 0; i < out->count; i++) {
+        out->cues[i] = (deck_core_memory_cue_t) {
+            .pos_ms = view.list.cues[i].pos_ms,
+            .end_ms = view.list.cues[i].end_ms,
+            .local = view.list.cues[i].flags == HOT_CUE_STORE_MEMORY_LOCAL,
+        };
+    }
+    return true;
+}
+
+uint32_t deck_core_memory_cues_revision(void)
+{
+    return __atomic_load_n(&s_memory_revision, __ATOMIC_ACQUIRE);
+}
+
 #if defined(DECK_CORE_PC_TEST)
 void deck_core_test_reset(void)
 {
@@ -4113,6 +4658,11 @@ void deck_core_test_reset(void)
     memset(s_hot_cue_mask_cache_value, 0, sizeof(s_hot_cue_mask_cache_value));
     memset(s_hot_cue_cache_slots, 0, sizeof(s_hot_cue_cache_slots));
     memset(s_published_hot_cues, 0, sizeof(s_published_hot_cues));
+    memset(s_memory_key, 0, sizeof(s_memory_key));
+    memset(s_memory_editable, 0, sizeof(s_memory_editable));
+    memset(s_memory_list, 0, sizeof(s_memory_list));
+    memset(s_memory_edits, 0, sizeof(s_memory_edits));
+    memset(s_published_memory, 0, sizeof(s_published_memory));
 #if defined(DECK_CORE_PC_TEST)
     memset(s_deferred_mixer_last, 0, sizeof(s_deferred_mixer_last));
     memset(s_deferred_mixer_seen, 0, sizeof(s_deferred_mixer_seen));

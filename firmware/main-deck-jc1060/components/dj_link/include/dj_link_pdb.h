@@ -54,6 +54,23 @@ dj_link_pdb_result_t dj_link_pdb_find_track(dj_link_pdb_read_fn read, void *ctx,
  * or longer than cap - 1. */
 void dj_link_pdb_extension(const char *path, char *out, size_t cap);
 
+/* v303: which export.pdb the cached copy is: the peer and the NFS
+ * attributes it was read with. v302 trusted the copy for as long as the
+ * browse selection stayed (generation), so a source edit (re-analysis,
+ * cues, a new track) under the same selection never reached the deck. */
+typedef struct {
+    bool     valid;
+    uint32_t ip;
+    uint8_t  peer;
+    uint32_t size;
+    uint32_t mtime_s;
+    uint32_t mtime_us;
+} dj_link_pdb_stamp_t;
+
+/* The cached copy (stamp) is still the peer's file (now): same peer, same
+ * size and modification time. A zero mtime is unknown, never a match. */
+bool dj_link_pdb_stamp_matches(const dj_link_pdb_stamp_t *stamp, const dj_link_pdb_stamp_t *now);
+
 #ifdef __cplusplus
 }
 #endif

@@ -309,6 +309,42 @@ static void on_dj_link_toggle(bool enable)
     }
 }
 
+// v304: the DJ Link master's beat clock (dj_link task, on change only). Both
+// sides stamp with esp_timer ms; the store is a seqlock, never a wait.
+static void on_dj_link_beat_clock(const dj_link_beat_clock_t *clock)
+{
+    const deck_net_clock_t net = {
+        .valid = clock->valid,
+        .anchor_ms = clock->anchor_ms,
+        .period_us = clock->period_us,
+        .beat_in_bar = clock->beat_in_bar,
+        .player = clock->player,
+    };
+    deck_core_set_net_clock(&net);
+}
+
+// v305: SYNC / SYNC MASTER asked by the network (dj_link task). Queued to the
+// deck task without waiting; deck_core applies it like the buttons.
+static void on_dj_link_deck_command(uint8_t deck, dj_link_deck_cmd_t cmd)
+{
+    switch (cmd) {
+    case DJ_LINK_DECK_CMD_SYNC_ON:
+        deck_core_net_command(deck, DECK_CORE_NET_SYNC_ON);
+        break;
+    case DJ_LINK_DECK_CMD_SYNC_OFF:
+        deck_core_net_command(deck, DECK_CORE_NET_SYNC_OFF);
+        break;
+    case DJ_LINK_DECK_CMD_MASTER_TAKE:
+        deck_core_net_command(deck, DECK_CORE_NET_MASTER_TAKE);
+        break;
+    case DJ_LINK_DECK_CMD_MASTER_DROP:
+        deck_core_net_command(deck, DECK_CORE_NET_MASTER_DROP);
+        break;
+    default:
+        break;
+    }
+}
+
 // Called from the USB storage task when the Rekordbox drive mounts/unmounts.
 static void on_usb_storage_event(bool mounted)
 {
@@ -403,14 +439,39 @@ static size_t stall_usb_probe(bool begin, char *buf, size_t size)
 
 // v292: names the allocation behind a boot-time ESP_ERR_NO_MEM (v290/v291
 // usb_host_install boot loop). Any context, so ROM printf only.
+// v315: at most one line per second. The SD driver's bounce-buffer probe
+// (an 8 KB internal DMA try, then halving) failed on every write of a DJ
+// Link download: 5 lines/s, 182 in 3 s at its end (v314 HW). The first
+// failure still prints at once; later lines count the ones not printed.
+#define FAILED_ALLOC_LOG_US 1000000
+static uint32_t s_failed_alloc_count;
+static uint32_t s_failed_alloc_printed;
+static int64_t s_failed_alloc_last_us = -FAILED_ALLOC_LOG_US;
+
 static void failed_alloc_cb(size_t size, uint32_t caps, const char *function_name)
 {
-    esp_rom_printf("[HEAP] alloc FAILED size=%u caps=0x%08x in %s: internal free=%u "
-                   "largest=%u\n",
+    const uint32_t count = __atomic_add_fetch(&s_failed_alloc_count, 1u, __ATOMIC_RELAXED);
+    const int64_t now = esp_timer_get_time();
+    int64_t last = __atomic_load_n(&s_failed_alloc_last_us, __ATOMIC_RELAXED);
+    if (now - last < FAILED_ALLOC_LOG_US ||
+        !__atomic_compare_exchange_n(&s_failed_alloc_last_us, &last, now, false,
+                                     __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+        return;
+    }
+    const uint32_t printed = __atomic_exchange_n(&s_failed_alloc_printed, count, __ATOMIC_RELAXED);
+    /* v318: "largest" alone misled (v317 HIL: 8192 B DMA failed with an
+     * internal largest of 23552): on the P4 the internal figure includes
+     * RTCRAM (CONFIG_ESP_SYSTEM_ALLOW_RTC_FAST_MEM_AS_HEAP), which has no
+     * MALLOC_CAP_DMA. The free / largest for the requested caps decide. */
+    esp_rom_printf("[HEAP] alloc FAILED size=%u caps=0x%08x in %s: caps free=%u largest=%u, "
+                   "internal free=%u largest=%u (+%u not shown, %u total)\n",
                    (unsigned)size, (unsigned)caps,
                    function_name ? function_name : "?",
+                   (unsigned)heap_caps_get_free_size(caps),
+                   (unsigned)heap_caps_get_largest_free_block(caps),
                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                   (unsigned)(count - printed - 1u), (unsigned)count);
 }
 
 void app_main(void)
@@ -558,6 +619,7 @@ void app_main(void)
     ESP_ERROR_CHECK(deck_core_init(&ctrl_queue));
     deck_core_set_jog_cdj_mode(settings.jog_cdj_mode != 0u);
     deck_core_set_load_lock(settings.load_lock != 0u);
+    deck_core_set_net_sync_enabled(settings.dj_link_sync != 0u);
 
     // ── UI ───────────────────────────────────────────────────────────────────
     /* v293: the stall probe is a diagnostics-build tool (UI_DIAGNOSTICS_ENABLED). */
@@ -606,9 +668,12 @@ void app_main(void)
         const dj_link_config_t dj_cfg = {
             .ip_ready = eth_bringup_got_ip,
             .eth_netif = eth_bringup_netif,
+            .beat_clock = on_dj_link_beat_clock,
+            .deck_command = on_dj_link_deck_command,
         };
         esp_err_t dj_rc = dj_link_init(&dj_cfg);
         if (dj_rc == ESP_OK) {
+            dj_link_set_sync_control(app_settings_get().dj_link_sync != 0u);
             ui_settings_set_dj_link_toggle_cb(on_dj_link_toggle);
             if (app_settings_get().dj_link_enable) {
                 ESP_LOGI(TAG, "DJ Link enabled in settings - starting observer");

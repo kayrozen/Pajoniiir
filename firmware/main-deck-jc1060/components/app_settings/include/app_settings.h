@@ -24,6 +24,7 @@ typedef struct {
     uint8_t jog_cdj_mode;   // v267: 0 = VINYL jog (default, touch scratch), 1 = CDJ jog (touch inert)
     uint8_t tempo_range_pct; // v275: deck tempo fader range +/-%: 6, 10 (default) or 16
     uint8_t load_lock;      // v293: 0 = LOAD at any time (default), 1 = no LOAD onto a playing deck
+    uint8_t dj_link_sync;   // v304: 0 = SYNC is local only (default), 1 = SYNC follows the DJ Link master
 } app_settings_t;
 
 #define APP_SETTINGS_AUDIO_OUT_SPEAKER 0u
@@ -64,6 +65,8 @@ void app_settings_set_jog_cdj_mode(uint8_t on);
 void app_settings_set_tempo_range_pct(uint8_t pct);  // 6/10/16, anything else -> 10
 // v293: LOAD LOCK, 1 = refuse a track load onto a playing deck (deck_load_lock.h).
 void app_settings_set_load_lock(uint8_t on);
+// v304: LINK SYNC, 1 = a SYNC press follows a playing DJ Link master (deck_net_sync.h).
+void app_settings_set_dj_link_sync(uint8_t on);
 
 /* ── Pull-OTA service network ─────────────────────────────────────────────
  *
