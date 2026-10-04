@@ -6,9 +6,20 @@
 
 typedef bool (*audio_resampler_pop_fn)(void *ctx, audio_mixer_frame_t *out_frame);
 
+/* v325 (JC1060 divergence from main-deck-p4): 16-tap windowed-sinc
+ * interpolation instead of linear. The all-USB chain runs at 48 kHz, so every
+ * 44.1 kHz track goes through this resampler even at pitch 0; linear
+ * interpolation lost 1.5-4.5 dB at 10-17 kHz and left image spurs 13-23 dB
+ * below the tone (the "dull and grainy" MP3s). Output lags the consumed
+ * source by AUDIO_RESAMPLER_TAPS / 2 frames (0.17 ms at 48 kHz) instead of 1. */
+#define AUDIO_RESAMPLER_TAPS 16u
+
 typedef struct {
-    audio_mixer_frame_t previous;
-    audio_mixer_frame_t current;
+    /* Source history, doubled so the TAPS-frame window is always contiguous:
+     * a new frame is stored at `write` and `write + TAPS`, then the window is
+     * history[write .. write + TAPS - 1], oldest first. */
+    audio_mixer_frame_t history[2u * AUDIO_RESAMPLER_TAPS];
+    uint32_t write;
     /* Q0.32 phase plus cached Q32 step. The input pitch is binary32, so every
      * supported value (0.01..16) is represented exactly after scaling by 2^32.
      * This keeps long-run consumption deterministic without double-precision

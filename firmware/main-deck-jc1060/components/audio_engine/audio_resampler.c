@@ -1,4 +1,5 @@
 #include "audio_resampler.h"
+#include "audio_resampler_sinc_table.h"
 
 #include <math.h>
 #include <string.h>
@@ -31,24 +32,55 @@ static uint64_t pitch_step_q32(uint32_t bits)
     return (uint64_t)mantissa << (uint32_t)(exponent + 9);
 }
 
-static float phase_fraction_float(uint32_t phase_q32)
-{
-    /* Build 1.f directly, then subtract one. Retaining the upper 23 fraction
-     * bits is exactly the precision a binary32 interpolator can consume. */
-    uint32_t bits = 0x3F800000u | (phase_q32 >> 9);
-    float one_to_two = 1.0f;
-    memcpy(&one_to_two, &bits, sizeof(one_to_two));
-    return one_to_two - 1.0f;
-}
-
 void audio_resampler_reset(audio_resampler_state_t *state)
 {
     if (!state) return;
-    state->previous = (audio_mixer_frame_t){ 0 };
-    state->current = (audio_mixer_frame_t){ 0 };
+    memset(state->history, 0, sizeof(state->history));
+    state->write = 0u;
     state->phase_q32 = 0u;
     state->pitch_factor_bits = UINT32_MAX;
     state->step_q32 = 0u;
+}
+
+static void push_frame(audio_resampler_state_t *state, audio_mixer_frame_t frame)
+{
+    const uint32_t w = state->write;
+    state->history[w] = frame;
+    state->history[w + AUDIO_RESAMPLER_TAPS] = frame;
+    state->write = w + 1u < AUDIO_RESAMPLER_TAPS ? w + 1u : 0u;
+}
+
+static int16_t round_clamp_i16(float v)
+{
+    if (v >= 32767.0f) return 32767;
+    if (v <= -32768.0f) return -32768;
+    return (int16_t)(v >= 0.0f ? v + 0.5f : v - 0.5f);
+}
+
+/* Interpolation point between window[TAPS/2 - 1] ("previous") and
+ * window[TAPS/2] at the Q32 phase: the two phase rows around it are blended
+ * linearly, then 16 taps per channel. */
+static audio_mixer_frame_t interpolate(const audio_resampler_state_t *state)
+{
+    const audio_mixer_frame_t *window = &state->history[state->write];
+    const uint32_t phase = state->phase_q32;
+    const uint32_t row_shift = 27u;   /* 32 phases = top 5 bits */
+    const uint32_t row = phase >> row_shift;
+    const float blend = (float)(phase & ((1u << row_shift) - 1u)) *
+                        (1.0f / (float)(1u << row_shift));
+    const float *a = s_resampler_sinc[row];
+    const float *b = s_resampler_sinc[row + 1u];
+    float left = 0.0f;
+    float right = 0.0f;
+    for (uint32_t k = 0u; k < AUDIO_RESAMPLER_TAPS; k++) {
+        const float c = a[k] + blend * (b[k] - a[k]);
+        left += c * (float)window[k].left;
+        right += c * (float)window[k].right;
+    }
+    return (audio_mixer_frame_t) {
+        .left = round_clamp_i16(left),
+        .right = round_clamp_i16(right),
+    };
 }
 
 audio_mixer_frame_t audio_resampler_next(audio_resampler_state_t *state,
@@ -71,25 +103,22 @@ audio_mixer_frame_t audio_resampler_next(audio_resampler_state_t *state,
     uint32_t source_frames = (uint32_t)(phase >> 32);
     state->phase_q32 = (uint32_t)phase;
     while (source_frames-- > 0u) {
-        state->previous = state->current;
-
-        audio_mixer_frame_t next = { 0 };
+        /* Ring underrun: repeat the newest frame instead of a 0, so the
+         * output settles on a flat hold rather than a click to silence.
+         * Nothing is consumed, so pacing is unaffected. */
+        audio_mixer_frame_t next = state->history[
+            (state->write + 2u * AUDIO_RESAMPLER_TAPS - 1u) % (2u * AUDIO_RESAMPLER_TAPS)];
         if (pop_source && pop_source(source_ctx, &next)) {
-            state->current = next;
             if (out_consumed) (*out_consumed)++;
         }
-        /* Ring underrun: leave `current` unchanged instead of snapping it to 0.
-         * `previous` was just set to `current` above, so both now hold the last
-         * delivered frame and the interpolation is a flat hold rather than a
-         * click to silence. Nothing is consumed, so pacing is unaffected. */
+        push_frame(state, next);
     }
 
-    float t = phase_fraction_float(state->phase_q32);
-    float inv = 1.0f - t;
-    return (audio_mixer_frame_t) {
-        .left = (int16_t)(inv * (float)state->previous.left +
-                          t * (float)state->current.left),
-        .right = (int16_t)(inv * (float)state->previous.right +
-                           t * (float)state->current.right),
-    };
+    /* Unity rate on a whole sample (48 kHz track, pitch 0): the source frame
+     * itself, bit-exact, as with linear interpolation. Same alignment as the
+     * filter at phase 0, so leaving this path does not shift the audio. */
+    if (state->phase_q32 == 0u && state->step_q32 == (UINT64_C(1) << 32)) {
+        return state->history[state->write + AUDIO_RESAMPLER_TAPS / 2u - 1u];
+    }
+    return interpolate(state);
 }

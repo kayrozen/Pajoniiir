@@ -147,8 +147,12 @@ void dj_link_browse_want_detail_row(uint32_t generation, uint32_t index, uint32_
 /* v249 peer track download. The dj_link task fetches the peer's export.pdb
  * over NFS (to find the file path of the rekordbox id), then the audio file,
  * into /sd/djlcache; the UI then loads that local file through its usual
- * path. Nothing is ever streamed to the audio engine from the network. One
- * fetch at a time; the status keeps the last outcome until the next start. */
+ * path. Nothing is ever streamed to the audio engine from the network.
+ * v335: up to DJ_LINK_FETCH_SLOTS requests (one per deck); they run one after
+ * the other in request order (the SD writes, not the network, bound the
+ * throughput, so a second transfer in parallel would not finish the pair
+ * sooner). Each status keeps its last outcome until its slot is reused. */
+#define DJ_LINK_FETCH_SLOTS 2u
 #define DJ_LINK_FETCH_PATH_MAX 64u
 
 typedef enum {
@@ -158,6 +162,7 @@ typedef enum {
     DJ_LINK_FETCH_DONE,         /* path holds the cached file */
     DJ_LINK_FETCH_FAILED,       /* error says why */
     DJ_LINK_FETCH_CANCELLED,
+    DJ_LINK_FETCH_QUEUED,       /* v335: waits for the running fetch */
 } dj_link_fetch_state_t;
 
 typedef struct {
@@ -172,18 +177,26 @@ typedef struct {
     bool     cache_hit;         /* DONE without downloading */
     char     path[DJ_LINK_FETCH_PATH_MAX];
     char     error[48];
+    /* v333: the track's metadata (0x2002) from the job's own dbserver
+     * session, valid once has_meta: a load of a row the Library does not
+     * list (network load-track) gets its title / artist from here. */
+    bool     has_meta;
+    dj_link_peer_track_t meta;
 } dj_link_fetch_status_t;
 
 /* Fetch track `rekordbox_id` from the USB of player `peer`. keep_keys (NULL
  * or two entries, 0 = none) name cached files that must survive the cache
  * pruning, e.g. the ones loaded on the decks. v300: artwork_id (from the
  * listing, 0 = none) is fetched with the analysis into <key>.JPG. Returns
- * the fetch id, or 0 if dj_link is off or a fetch is already running. */
+ * the fetch id, or 0 if dj_link is off or every slot holds a queued or
+ * running fetch. v335: a fetch started while another runs is QUEUED. */
 uint32_t dj_link_fetch_start(uint8_t peer, uint32_t rekordbox_id, uint32_t artwork_id,
                              const uint32_t *keep_keys);
-/* Stop fetch `id` (no-op once it is over); the partial file is deleted. */
+/* Stop fetch `id` (no-op once it is over); a queued one is dropped, a
+ * running one's partial file is deleted. */
 void dj_link_fetch_cancel(uint32_t id);
-void dj_link_fetch_get_status(dj_link_fetch_status_t *out);
+/* v335: status of fetch `id`; false once its slot was reused (or unknown). */
+bool dj_link_fetch_get_status(uint32_t id, dj_link_fetch_status_t *out);
 
 #ifdef __cplusplus
 }

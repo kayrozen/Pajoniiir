@@ -16,6 +16,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "sdkconfig.h"
 #include "lwip/def.h"
 #include "lwip/ip.h"
 #include "lwip/ip_addr.h"
@@ -158,11 +159,21 @@ typedef struct {
 } dj_link_browse_mem_t;
 
 static dj_link_browse_mem_t *s_browse; /* written by the dj_link task under s_mux */
-static struct tcp_pcb *s_tcp;          /* tcpip thread only */
-static atomic_uint s_tcp_head;         /* written by the tcpip thread only */
-static atomic_uint s_tcp_tail;         /* written by the dj_link task only */
-static atomic_uint s_tcp_events;       /* DJ_LINK_TCP_EVT_*, set by the tcpip thread */
-static uint32_t s_tcp_gen;             /* dj_link task: bumps on every close */
+
+/* v333: one dbserver TCP connection. Two exist: the browse session's and the
+ * download job's own (dj_link_fetch_*), so a download no longer depends on
+ * what the Library browses. The ring belongs to the owner's PSRAM block and
+ * is only touched by the tcpip thread while pcb is set. */
+typedef struct {
+    struct tcp_pcb *pcb;               /* tcpip thread only */
+    uint8_t *ring;                     /* DJ_LINK_TCP_RING_BYTES, owner's memory */
+    atomic_uint head;                  /* written by the tcpip thread only */
+    atomic_uint tail;                  /* written by the dj_link task only */
+    atomic_uint events;                /* DJ_LINK_TCP_EVT_*, set by the tcpip thread */
+    uint32_t gen;                      /* dj_link task: bumps on every close */
+} dj_link_tcp_t;
+
+static dj_link_tcp_t s_browse_tcp;     /* the browse session's connection */
 static uint8_t  s_browse_peer;         /* dj_link task: selection being served */
 static bool     s_browse_started;      /* dj_link task: client started */
 static uint32_t s_browse_req_done;     /* dj_link task: last request served */
@@ -320,30 +331,30 @@ static uint32_t dj_link_eth_ip(esp_netif_t *eth)
 
 /* ---- v248: TCP transport for the dbserver client ------------------------ */
 
-static void dj_link_tcp_signal(unsigned event)
+static void dj_link_tcp_signal(dj_link_tcp_t *t, unsigned event)
 {
-    atomic_fetch_or_explicit(&s_tcp_events, event, memory_order_release);
+    atomic_fetch_or_explicit(&t->events, event, memory_order_release);
     xTaskNotifyGive(s_rx_task);
 }
 
 /* tcpip thread. */
 static err_t dj_link_tcp_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
 {
-    (void)arg;
+    dj_link_tcp_t *t = arg;
     if (!p) {
-        dj_link_tcp_signal(DJ_LINK_TCP_EVT_CLOSED); /* FIN from the peer */
+        dj_link_tcp_signal(t, DJ_LINK_TCP_EVT_CLOSED); /* FIN from the peer */
         return ERR_OK;
     }
     if (err != ERR_OK) {
         pbuf_free(p);
         return ERR_OK;
     }
-    unsigned head = atomic_load_explicit(&s_tcp_head, memory_order_relaxed);
-    unsigned tail = atomic_load_explicit(&s_tcp_tail, memory_order_acquire);
+    unsigned head = atomic_load_explicit(&t->head, memory_order_relaxed);
+    unsigned tail = atomic_load_explicit(&t->tail, memory_order_acquire);
     if (p->tot_len > DJ_LINK_TCP_RING_BYTES - (head - tail)) {
         return ERR_MEM; /* not freed: lwIP keeps it and retries */
     }
-    uint8_t *ring = s_browse->tcp_ring;
+    uint8_t *ring = t->ring;
     for (struct pbuf *q = p; q; q = q->next) {
         size_t at = head % DJ_LINK_TCP_RING_BYTES;
         size_t first = DJ_LINK_TCP_RING_BYTES - at;
@@ -354,7 +365,7 @@ static err_t dj_link_tcp_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, er
         memcpy(ring, (const uint8_t *)q->payload + first, q->len - first);
         head += q->len;
     }
-    atomic_store_explicit(&s_tcp_head, head, memory_order_release);
+    atomic_store_explicit(&t->head, head, memory_order_release);
     tcp_recved(pcb, p->tot_len);
     pbuf_free(p);
     xTaskNotifyGive(s_rx_task);
@@ -364,18 +375,17 @@ static err_t dj_link_tcp_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, er
 /* tcpip thread. The PCB is already freed by lwIP. */
 static void dj_link_tcp_err(void *arg, err_t err)
 {
-    (void)arg;
+    dj_link_tcp_t *t = arg;
     (void)err;
-    s_tcp = NULL;
-    dj_link_tcp_signal(DJ_LINK_TCP_EVT_CLOSED);
+    t->pcb = NULL;
+    dj_link_tcp_signal(t, DJ_LINK_TCP_EVT_CLOSED);
 }
 
 static err_t dj_link_tcp_connected(void *arg, struct tcp_pcb *pcb, err_t err)
 {
-    (void)arg;
     (void)pcb;
     (void)err;
-    dj_link_tcp_signal(DJ_LINK_TCP_EVT_CONNECTED);
+    dj_link_tcp_signal(arg, DJ_LINK_TCP_EVT_CONNECTED);
     return ERR_OK;
 }
 
@@ -383,20 +393,21 @@ static err_t dj_link_tcp_connected(void *arg, struct tcp_pcb *pcb, err_t err)
  * connection can reach the ring or the event flags. */
 static esp_err_t dj_link_tcp_close_tcpip(void *ctx)
 {
-    (void)ctx;
-    if (s_tcp) {
-        tcp_arg(s_tcp, NULL);
-        tcp_recv(s_tcp, NULL);
-        tcp_err(s_tcp, NULL);
-        if (tcp_close(s_tcp) != ERR_OK) {
-            tcp_abort(s_tcp);
+    dj_link_tcp_t *t = ctx;
+    if (t->pcb) {
+        tcp_arg(t->pcb, NULL);
+        tcp_recv(t->pcb, NULL);
+        tcp_err(t->pcb, NULL);
+        if (tcp_close(t->pcb) != ERR_OK) {
+            tcp_abort(t->pcb);
         }
-        s_tcp = NULL;
+        t->pcb = NULL;
     }
     return ESP_OK;
 }
 
 typedef struct {
+    dj_link_tcp_t *t;
     uint32_t ip;    /* host order */
     uint16_t port;
 } dj_link_tcp_dst_t;
@@ -405,8 +416,9 @@ typedef struct {
 static esp_err_t dj_link_tcp_connect_tcpip(void *ctx)
 {
     const dj_link_tcp_dst_t *dst = ctx;
+    dj_link_tcp_t *t = dst->t;
     struct netif *nif = netif_get_by_index(s_netif_index);
-    if (!nif || s_tcp) {
+    if (!nif || t->pcb || !t->ring) {
         return ESP_ERR_INVALID_STATE;
     }
     struct tcp_pcb *pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
@@ -414,18 +426,20 @@ static esp_err_t dj_link_tcp_connect_tcpip(void *ctx)
         return ESP_ERR_NO_MEM;
     }
     tcp_bind_netif(pcb, nif);
+    tcp_arg(pcb, t);
     tcp_recv(pcb, dj_link_tcp_recv);
     tcp_err(pcb, dj_link_tcp_err);
-    s_tcp = pcb;
+    t->pcb = pcb;
     ip_addr_t addr = IPADDR4_INIT(lwip_htonl(dst->ip));
     if (tcp_connect(pcb, &addr, dst->port, dj_link_tcp_connected) != ERR_OK) {
-        dj_link_tcp_close_tcpip(NULL);
+        dj_link_tcp_close_tcpip(t);
         return ESP_FAIL;
     }
     return ESP_OK;
 }
 
 typedef struct {
+    dj_link_tcp_t *t;
     const uint8_t *buf;
     size_t len;
 } dj_link_tcp_tx_t;
@@ -433,31 +447,29 @@ typedef struct {
 static esp_err_t dj_link_tcp_send_tcpip(void *ctx)
 {
     const dj_link_tcp_tx_t *tx = ctx;
-    if (!s_tcp || tx->len > tcp_sndbuf(s_tcp) ||
-        tcp_write(s_tcp, tx->buf, (u16_t)tx->len, TCP_WRITE_FLAG_COPY) != ERR_OK) {
+    struct tcp_pcb *pcb = tx->t->pcb;
+    if (!pcb || tx->len > tcp_sndbuf(pcb) ||
+        tcp_write(pcb, tx->buf, (u16_t)tx->len, TCP_WRITE_FLAG_COPY) != ERR_OK) {
         return ESP_FAIL;
     }
-    tcp_output(s_tcp);
+    tcp_output(pcb);
     return ESP_OK;
 }
 
-static void dj_link_tcp_close(void)
+static void dj_link_tcp_close(dj_link_tcp_t *t)
 {
-    esp_netif_tcpip_exec(dj_link_tcp_close_tcpip, NULL);
+    esp_netif_tcpip_exec(dj_link_tcp_close_tcpip, t);
     /* No producer is left: drop what the old connection left behind. */
-    s_tcp_gen++;
-    atomic_store(&s_tcp_events, 0u);
-    atomic_store(&s_tcp_head, 0u);
-    atomic_store(&s_tcp_tail, 0u);
+    t->gen++;
+    atomic_store(&t->events, 0u);
+    atomic_store(&t->head, 0u);
+    atomic_store(&t->tail, 0u);
 }
 
-/* ---- v248: dbserver client hooks (dj_link task) ------------------------- */
-
-static int dj_link_db_io_connect(void *ctx, uint32_t ip, uint16_t port)
+static int dj_link_tcp_open(dj_link_tcp_t *t, uint32_t ip, uint16_t port)
 {
-    (void)ctx;
-    dj_link_tcp_close();
-    dj_link_tcp_dst_t dst = { .ip = ip, .port = port };
+    dj_link_tcp_close(t);
+    dj_link_tcp_dst_t dst = { .t = t, .ip = ip, .port = port };
     esp_err_t rc = esp_netif_tcpip_exec(dj_link_tcp_connect_tcpip, &dst);
     if (rc != ESP_OK) {
         ESP_LOGW(TAG, "dbserver connect %u.%u.%u.%u:%u failed: %s",
@@ -468,17 +480,67 @@ static int dj_link_db_io_connect(void *ctx, uint32_t ip, uint16_t port)
     return rc == ESP_OK ? 0 : -1;
 }
 
+static int dj_link_tcp_write(dj_link_tcp_t *t, const uint8_t *buf, size_t len)
+{
+    dj_link_tcp_tx_t tx = { .t = t, .buf = buf, .len = len };
+    return esp_netif_tcpip_exec(dj_link_tcp_send_tcpip, &tx) == ESP_OK ? 0 : -1;
+}
+
+/* Connection events and received bytes into a dbserver client. A close from
+ * inside the client (it hops from the discovery port to the dbserver port)
+ * bumps t->gen, and whatever was read before belongs to the old connection. */
+static void dj_link_tcp_pump(dj_link_tcp_t *t, dj_link_db_t *c, uint32_t now_ms)
+{
+    uint32_t gen = t->gen;
+    unsigned events = atomic_exchange_explicit(&t->events, 0u, memory_order_acquire);
+    if (events & DJ_LINK_TCP_EVT_CONNECTED) {
+        dj_link_db_on_connected(c, now_ms);
+    }
+    while (gen == t->gen) {
+        unsigned tail = atomic_load_explicit(&t->tail, memory_order_relaxed);
+        unsigned head = atomic_load_explicit(&t->head, memory_order_acquire);
+        if (tail == head) {
+            break;
+        }
+        size_t at = tail % DJ_LINK_TCP_RING_BYTES;
+        size_t n = DJ_LINK_TCP_RING_BYTES - at;
+        if (n > head - tail) {
+            n = head - tail;
+        }
+        /* Never more than the client can buffer: a reply split across
+         * chunks is fine; one larger than its buffer fails it cleanly. */
+        size_t room = sizeof(c->rx) - c->rx_len;
+        if (n > room) {
+            n = room ? room : 1u;
+        }
+        dj_link_db_on_data(c, &t->ring[at], n, now_ms);
+        if (gen != t->gen) {
+            break;
+        }
+        /* Released only now: the producer cannot overwrite bytes in use. */
+        atomic_store_explicit(&t->tail, tail + (unsigned)n, memory_order_release);
+    }
+    if ((events & DJ_LINK_TCP_EVT_CLOSED) && gen == t->gen) {
+        dj_link_tcp_close(t);
+        dj_link_db_on_closed(c, now_ms);
+    }
+}
+
+/* ---- v248: dbserver client hooks (dj_link task) ------------------------- */
+
+static int dj_link_db_io_connect(void *ctx, uint32_t ip, uint16_t port)
+{
+    return dj_link_tcp_open(ctx, ip, port);
+}
+
 static int dj_link_db_io_send(void *ctx, const uint8_t *buf, size_t len)
 {
-    (void)ctx;
-    dj_link_tcp_tx_t tx = { .buf = buf, .len = len };
-    return esp_netif_tcpip_exec(dj_link_tcp_send_tcpip, &tx) == ESP_OK ? 0 : -1;
+    return dj_link_tcp_write(ctx, buf, len);
 }
 
 static void dj_link_db_io_close(void *ctx)
 {
-    (void)ctx;
-    dj_link_tcp_close();
+    dj_link_tcp_close(ctx);
 }
 
 static void dj_link_db_io_list_begin(void *ctx, uint32_t total)
@@ -547,24 +609,6 @@ static bool dj_link_db_io_next_detail(void *ctx, uint32_t *index, uint32_t *reko
     return found;
 }
 
-static void dj_link_fetch_on_path(uint32_t rekordbox_id, const char *path);
-
-/* v297: the fetch job asked the browse session for a file path. */
-static void dj_link_db_io_path(void *ctx, uint32_t rekordbox_id, const char *path)
-{
-    (void)ctx;
-    dj_link_fetch_on_path(rekordbox_id, path);
-}
-
-static void dj_link_fetch_on_blob(uint32_t rekordbox_id, uint16_t request, size_t len,
-                                  bool answered);
-static void dj_link_db_io_blob(void *ctx, uint32_t rekordbox_id, uint16_t request, size_t len,
-                               bool answered)
-{
-    (void)ctx;
-    dj_link_fetch_on_blob(rekordbox_id, request, len, answered);
-}
-
 static const dj_link_peer_t *dj_link_find_peer(uint8_t number)
 {
     for (size_t i = 0; i < DJ_LINK_MAX_PEERS; i++) {
@@ -581,13 +625,14 @@ static void dj_link_browse_halt(void)
     if (s_browse) {
         dj_link_db_stop(&s_browse->client);
     }
-    dj_link_tcp_close();
+    dj_link_tcp_close(&s_browse_tcp);
     s_browse_started = false;
 }
 
 static void dj_link_browse_free(void)
 {
     dj_link_browse_halt();
+    s_browse_tcp.ring = NULL;   /* closed above: no producer is left */
     portENTER_CRITICAL(&s_mux);
     dj_link_browse_mem_t *mem = s_browse;
     s_browse = NULL;
@@ -622,8 +667,9 @@ static void dj_link_browse_restart(uint8_t peer)
             .list_begin = dj_link_db_io_list_begin,
             .track = dj_link_db_io_track,
             .next_detail = dj_link_db_io_next_detail,
-            .path = dj_link_db_io_path,
-            .blob = dj_link_db_io_blob,
+            /* v333: paths and blobs go through the download job's own
+             * session (dj_link_fetch_*), never this one. */
+            .ctx = &s_browse_tcp,
         };
         dj_link_db_init(&mem->client, &io, DJ_LINK_BROWSE_MAX_TRACKS);
         /* v249: every row is loadable through the NFS fetch job. */
@@ -643,6 +689,7 @@ static void dj_link_browse_restart(uint8_t peer)
     }
     s_browse_desc = desc;
     s_browse_rows = 0u;
+    s_browse_tcp.ring = mem ? mem->tcp_ring : NULL;   /* halted above */
     const dj_link_peer_t *p = dj_link_find_peer(peer);
     portENTER_CRITICAL(&s_mux);
     s_browse = mem;
@@ -665,46 +712,6 @@ static void dj_link_browse_restart(uint8_t peer)
     if (!mem) {
         ESP_LOGW(TAG, "browse #%u: no PSRAM for %u rows", (unsigned)peer,
                  (unsigned)DJ_LINK_BROWSE_MAX_TRACKS);
-    }
-}
-
-/* Connection events and received bytes into the client. A close from inside
- * the client (it hops from the discovery port to the dbserver port) bumps
- * s_tcp_gen, and whatever was read before belongs to the old connection. */
-static void dj_link_browse_pump(dj_link_db_t *c, uint32_t now_ms)
-{
-    uint32_t gen = s_tcp_gen;
-    unsigned events = atomic_exchange_explicit(&s_tcp_events, 0u, memory_order_acquire);
-    if (events & DJ_LINK_TCP_EVT_CONNECTED) {
-        dj_link_db_on_connected(c, now_ms);
-    }
-    while (gen == s_tcp_gen) {
-        unsigned tail = atomic_load_explicit(&s_tcp_tail, memory_order_relaxed);
-        unsigned head = atomic_load_explicit(&s_tcp_head, memory_order_acquire);
-        if (tail == head) {
-            break;
-        }
-        size_t at = tail % DJ_LINK_TCP_RING_BYTES;
-        size_t n = DJ_LINK_TCP_RING_BYTES - at;
-        if (n > head - tail) {
-            n = head - tail;
-        }
-        /* Never more than the client can buffer: a reply split across
-         * chunks is fine; one larger than its buffer fails it cleanly. */
-        size_t room = sizeof(c->rx) - c->rx_len;
-        if (n > room) {
-            n = room ? room : 1u;
-        }
-        dj_link_db_on_data(c, &s_browse->tcp_ring[at], n, now_ms);
-        if (gen != s_tcp_gen) {
-            break;
-        }
-        /* Released only now: the producer cannot overwrite bytes in use. */
-        atomic_store_explicit(&s_tcp_tail, tail + (unsigned)n, memory_order_release);
-    }
-    if ((events & DJ_LINK_TCP_EVT_CLOSED) && gen == s_tcp_gen) {
-        dj_link_tcp_close();
-        dj_link_db_on_closed(c, now_ms);
     }
 }
 
@@ -742,7 +749,7 @@ static void dj_link_browse_service(uint32_t now_ms)
         dj_link_db_start(c, p->ip, s_browse_peer,
                          collection ? DJLINK_SLOT_LAPTOP : DJLINK_SLOT_USB, ours, now_ms);
     }
-    dj_link_browse_pump(c, now_ms);
+    dj_link_tcp_pump(&s_browse_tcp, c, now_ms);
     dj_link_db_poll(c, now_ms);
 
     dj_link_browse_state_t state = DJ_LINK_BROWSE_LOADING;
@@ -790,11 +797,27 @@ static void dj_link_browse_service(uint32_t now_ms)
 #define DJ_LINK_CACHE_TMP       DJ_LINK_CACHE_DIR "/FETCH.TMP"
 #define DJ_LINK_PDB_PATH        "PIONEER/rekordbox/export.pdb"
 #define DJ_LINK_PDB_PATH_HFS    ".PIONEER/rekordbox/export.pdb" /* HFS+ media */
-/* No IP reassembly in our lwIP: every READ reply must fit one frame. */
+/* v332: with IPv4 reassembly (CONFIG_LWIP_IP4_REASSEMBLY, sdkconfig.defaults)
+ * a READ reply may span several frames. 4096-byte READs (3 fragments each),
+ * 2 in flight: 6 fragment pbufs held by reassembly (CONFIG_LWIP_IP_REASS_MAX_PBUFS
+ * 10) and a burst of ~9 KB, inside the 20 x 512 B EMAC RX DMA ring; 8 KB in
+ * flight (4 KB before) and 4x fewer round trips. The fragment buffers come
+ * from malloc (> CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL: PSRAM), not from the
+ * internal heap. Without reassembly every reply must fit one frame: 1024 x 4,
+ * as before. */
+#if CONFIG_LWIP_IP4_REASSEMBLY
+#define DJ_LINK_FETCH_READ      4096u
+#define DJ_LINK_FETCH_WINDOW    2u
+#define DJ_LINK_FETCH_FRAGS     3u      /* ceil((4096 + RPC/UDP headers) / 1480) */
+_Static_assert(DJ_LINK_FETCH_WINDOW * DJ_LINK_FETCH_FRAGS <= CONFIG_LWIP_IP_REASS_MAX_PBUFS,
+               "READ window exceeds the IPv4 reassembly pbuf limit");
+#else
 #define DJ_LINK_FETCH_READ      DJLINK_NFS_READ_DEFAULT
 #define DJ_LINK_FETCH_WINDOW    4u
+#endif
 #define DJ_LINK_FETCH_RX_SLOTS  8u      /* > window: a whole burst fits */
-#define DJ_LINK_FETCH_RX_MAX    1536u   /* larger datagrams are dropped */
+/* Largest datagram kept: a READ reply (data + RPC/NFS headers), or a frame. */
+#define DJ_LINK_FETCH_RX_MAX    (DJ_LINK_FETCH_READ > 1024u ? DJ_LINK_FETCH_READ + 256u : 1536u)
 #define DJ_LINK_FETCH_STAGE     65536u  /* bytes staged (v318: 64 KB) */
 #define DJ_LINK_FETCH_PDB_MAX   (64u * 1024u * 1024u)
 #define DJ_LINK_FETCH_AUDIO_MAX (1024u * 1024u * 1024u)
@@ -802,6 +825,7 @@ static void dj_link_browse_service(uint32_t now_ms)
 #define DJ_LINK_FETCH_PATH_MS   10000u  /* v297: dbserver path answer, reconnect included */
 #define DJ_LINK_FETCH_ANALYSIS_MS 10000u /* v300: all analysis answers */
 #define DJ_LINK_FETCH_REFRESH_MS   4000u /* v303: same, the analysis already cached */
+#define DJ_LINK_FETCH_META_MS      3000u /* v334: metadata answer before the analysis */
 #define DJ_LINK_FETCH_CUES_MAX    (8u * 1024u) /* v303: 64 entries of 124 bytes */
 #define DJ_LINK_FETCH_ART_MAX     (64u * 1024u) /* v300: = UI_ARTWORK_FILE_MAX */
 #define DJ_LINK_REKORDBOX_PMAP  50111u
@@ -811,8 +835,9 @@ typedef struct {
     uint8_t  data[DJ_LINK_FETCH_RX_MAX];
 } dj_link_fetch_rx_t;
 
-/* ~88 KB of PSRAM (v318: the 64 KB write stage is a separate aligned block,
- * s_fetch_stage), allocated per fetch and freed when it ends. */
+/* ~88 KB of PSRAM (v332 with reassembly: ~100 KB; v318: the 64 KB write
+ * stage is a separate aligned block, s_fetch_stage), allocated per fetch and
+ * freed when it ends. */
 typedef struct {
     djlink_nfs_t nfs;
     dj_link_pdb_track_t track;
@@ -836,6 +861,19 @@ static atomic_uint s_fetch_rx_head;    /* written by the tcpip thread only */
 static atomic_uint s_fetch_rx_tail;    /* written by the dj_link task only */
 static atomic_uint s_fetch_peer_ip;    /* replies from any other host are dropped */
 
+/* v333: the job's own dbserver session (path, analysis, artwork, metadata),
+ * independent of what the Library browses. PSRAM, allocated with the first
+ * job and kept: the client and its ring outlive the job that ends from
+ * inside the client's callbacks (dj_link_fetch_end), so they are never freed
+ * under it. The session is stopped once the job is over. */
+typedef struct {
+    dj_link_db_t client;
+    uint8_t tcp_ring[DJ_LINK_TCP_RING_BYTES];
+} dj_link_fetch_db_mem_t;
+static dj_link_fetch_db_mem_t *s_fetch_db;   /* dj_link task */
+static dj_link_tcp_t s_fetch_tcp;
+static bool s_fetch_db_active;                /* dj_link task: started for a job */
+
 /* The running job, dj_link task only. state is IDLE, PDB or AUDIO. */
 static struct {
     dj_link_fetch_state_t state;
@@ -845,7 +883,13 @@ static struct {
     uint32_t ip;
     uint32_t key;
     uint32_t keep[2];
-    uint32_t generation;               /* browse generation at start */
+    uint8_t  slot;                     /* v333: dbserver slot of the session */
+    bool     detail_done;              /* v333: metadata answered (or given up) */
+    /* v334: the analysis waits for the metadata answer first (bounded), so a
+     * cache hit - which skips the download the metadata used to ride on -
+     * still reloads title / artist / artwork id from the source. */
+    bool     meta_wait;
+    uint32_t meta_deadline_ms;
     bool     hfs;                      /* PDB path retried as .PIONEER */
     bool     collection;               /* v297: rekordbox source, path from dbserver */
     bool     path_wait;                /* v297: dbserver path asked, not answered */
@@ -892,12 +936,31 @@ static struct {
  * generation, so a source edit under the same selection is fetched. */
 static dj_link_pdb_stamp_t s_pdb_cache;
 
-static dj_link_fetch_status_t s_fetch_status; /* guarded by s_mux */
-static bool     s_fetch_pending;       /* guarded by s_mux: start not taken yet */
+/* v335: one slot per request (DJ_LINK_FETCH_SLOTS), guarded by s_mux. A
+ * QUEUED slot waits; the dj_link task takes the oldest when no job runs.
+ * s_fetch_cur is the slot of the running job (dj_link task writes it under
+ * s_mux), so the job's status updates land in its own slot. */
+typedef struct {
+    dj_link_fetch_status_t st;
+    uint32_t keep[2];
+    uint32_t artwork_id;
+    uint32_t seq;                      /* request order */
+} dj_link_fetch_slot_t;
+static dj_link_fetch_slot_t s_fetch_slots[DJ_LINK_FETCH_SLOTS];
+static uint32_t s_fetch_cur = DJ_LINK_FETCH_SLOTS;   /* none */
+static uint32_t s_fetch_seq;
 static uint32_t s_fetch_cancel_id;     /* guarded by s_mux */
 static uint32_t s_fetch_next_id;       /* guarded by s_mux */
-static uint32_t s_fetch_req_keep[2];   /* guarded by s_mux */
-static uint32_t s_fetch_req_artwork;   /* guarded by s_mux */
+static uint32_t s_fetch_last_key;      /* dj_link task: last fetch DONE, kept by pruning */
+
+/* The running job's status, under s_mux; NULL if its slot moved on. */
+static dj_link_fetch_status_t *dj_link_fetch_cur_status(void)
+{
+    if (s_fetch_cur >= DJ_LINK_FETCH_SLOTS || s_fetch_slots[s_fetch_cur].st.id != s_job.id) {
+        return NULL;
+    }
+    return &s_fetch_slots[s_fetch_cur].st;
+}
 
 /* tcpip thread. */
 static void dj_link_fetch_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
@@ -998,9 +1061,12 @@ static int dj_link_fetch_io_send(void *ctx, uint32_t ip, uint16_t port,
 static void dj_link_fetch_publish_progress(uint32_t done, uint32_t total)
 {
     portENTER_CRITICAL(&s_mux);
-    s_fetch_status.done = done;
-    s_fetch_status.total = total;
-    s_fetch_status.percent = total ? (uint8_t)(((uint64_t)done * 100u) / total) : 100u;
+    dj_link_fetch_status_t *st = dj_link_fetch_cur_status();
+    if (st) {
+        st->done = done;
+        st->total = total;
+        st->percent = total ? (uint8_t)(((uint64_t)done * 100u) / total) : 100u;
+    }
     portEXIT_CRITICAL(&s_mux);
 }
 
@@ -1198,12 +1264,14 @@ static void dj_link_fetch_end(dj_link_fetch_state_t state, const char *error, bo
     esp_netif_tcpip_exec(dj_link_fetch_close_tcpip, NULL);
     atomic_store(&s_fetch_peer_ip, 0u);
     dj_link_fetch_close_tmp();
-    /* The dbserver client must let go of the analysis buffers first. */
-    if (s_browse && s_browse->client.blob_dst &&
-        (s_browse->client.blob_dst == s_job.wave || s_browse->client.blob_dst == s_job.grid ||
-         s_browse->client.blob_dst == s_job.cues || s_browse->client.blob_dst == s_job.art ||
-         s_browse->client.blob_dst == s_job.color)) {
-        dj_link_db_cancel_blob(&s_browse->client);
+    /* The dbserver client must let go of the analysis buffers first. It may
+     * be calling us (io.blob): only cancel here, the session itself is
+     * stopped by dj_link_fetch_service once the job is over. */
+    if (s_fetch_db && s_fetch_db->client.blob_dst) {
+        dj_link_db_cancel_blob(&s_fetch_db->client);
+    }
+    if (s_fetch_db) {
+        s_fetch_db->client.path_id = 0u;   /* a pending path answers nobody */
     }
     s_job.analysis_wait = false;
     heap_caps_free(s_job.wave);
@@ -1222,18 +1290,23 @@ static void dj_link_fetch_end(dj_link_fetch_state_t state, const char *error, bo
     heap_caps_free(s_fetch_stage);
     s_fetch_stage = NULL;
     portENTER_CRITICAL(&s_mux);
-    if (s_fetch_status.id == s_job.id) {
-        s_fetch_status.state = state;
-        s_fetch_status.cache_hit = cache_hit;
-        s_fetch_status.error[0] = '\0';
+    dj_link_fetch_status_t *st = dj_link_fetch_cur_status();
+    if (st) {
+        st->state = state;
+        st->cache_hit = cache_hit;
+        st->error[0] = '\0';
         if (state == DJ_LINK_FETCH_DONE) {
-            s_fetch_status.track_key = s_job.key;
-            memcpy(s_fetch_status.path, s_job.path, sizeof(s_fetch_status.path));
+            st->track_key = s_job.key;
+            memcpy(st->path, s_job.path, sizeof(st->path));
         } else if (error) {
-            snprintf(s_fetch_status.error, sizeof(s_fetch_status.error), "%s", error);
+            snprintf(st->error, sizeof(st->error), "%s", error);
         }
     }
+    s_fetch_cur = DJ_LINK_FETCH_SLOTS;
     portEXIT_CRITICAL(&s_mux);
+    if (state == DJ_LINK_FETCH_DONE) {
+        s_fetch_last_key = s_job.key;   /* the UI is about to load it */
+    }
     if (state == DJ_LINK_FETCH_DONE) {
         ESP_LOGW(TAG, "fetch #%u id %u -> %s%s", (unsigned)s_job.peer,
                  (unsigned)s_job.rekordbox_id, s_job.path, cache_hit ? " (cached)" : "");
@@ -1317,9 +1390,11 @@ static bool dj_link_fetch_cached(const char *path)
  * names are collected first so nothing is unlinked mid-readdir. */
 static void dj_link_fetch_prune(void)
 {
-    char keep[3][9];
-    const uint32_t keys[3] = { s_job.key, s_job.keep[0], s_job.keep[1] };
-    for (size_t i = 0; i < 3u; i++) {
+    char keep[4][9];
+    /* v335: and the last completed fetch, which the UI may still be loading
+     * (the next job's keep keys were taken before it reached a deck). */
+    const uint32_t keys[4] = { s_job.key, s_job.keep[0], s_job.keep[1], s_fetch_last_key };
+    for (size_t i = 0; i < 4u; i++) {
         keep[i][0] = '\0';
         if (keys[i]) {
             snprintf(keep[i], sizeof(keep[i]), "%08" PRIX32, keys[i]);
@@ -1342,7 +1417,7 @@ static void dj_link_fetch_prune(void)
                 continue;
             }
             bool kept = false;
-            for (size_t i = 0; i < 3u && !kept; i++) {
+            for (size_t i = 0; i < 4u && !kept; i++) {
                 kept = keep[i][0] && len > 9u && name[8] == '.' &&
                        strncasecmp(name, keep[i], 8u) == 0;
             }
@@ -1411,7 +1486,10 @@ static void dj_link_fetch_file(uint32_t now_ms)
     dj_link_fetch_prune();
     s_job.state = DJ_LINK_FETCH_AUDIO;
     portENTER_CRITICAL(&s_mux);
-    s_fetch_status.state = DJ_LINK_FETCH_AUDIO;
+    dj_link_fetch_status_t *st = dj_link_fetch_cur_status();
+    if (st) {
+        st->state = DJ_LINK_FETCH_AUDIO;
+    }
     portEXIT_CRITICAL(&s_mux);
     ESP_LOGW(TAG, "fetch #%u id %u: %s", (unsigned)s_job.peer,
              (unsigned)s_job.rekordbox_id, s_fetch->track.file_path);
@@ -1426,9 +1504,143 @@ static bool dj_link_fetch_sd_ready(void)
     return stat("/sd", &st) == 0 && S_ISDIR(st.st_mode);
 }
 
+/* ---- v333: the job's own dbserver session ---------------------------------- */
+
+static void dj_link_fetch_on_path(uint32_t rekordbox_id, const char *path);
+static void dj_link_fetch_on_blob(uint32_t id, uint16_t request, size_t len, bool answered);
+static void dj_link_fetch_analysis(bool cache_hit, uint32_t now_ms);
+
+static int dj_link_fetch_db_connect(void *ctx, uint32_t ip, uint16_t port)
+{
+    return dj_link_tcp_open(ctx, ip, port);
+}
+
+static int dj_link_fetch_db_send(void *ctx, const uint8_t *buf, size_t len)
+{
+    return dj_link_tcp_write(ctx, buf, len);
+}
+
+static void dj_link_fetch_db_close(void *ctx)
+{
+    dj_link_tcp_close(ctx);
+}
+
+/* The only row this session asks metadata for: the job's track. */
+static bool dj_link_fetch_db_next_detail(void *ctx, uint32_t *index, uint32_t *rekordbox_id)
+{
+    (void)ctx;
+    if (s_job.detail_done || s_job.rekordbox_id == 0u ||
+        (s_job.state != DJ_LINK_FETCH_PDB && s_job.state != DJ_LINK_FETCH_AUDIO)) {
+        return false;
+    }
+    *index = 0u;
+    *rekordbox_id = s_job.rekordbox_id;
+    return true;
+}
+
+static void dj_link_fetch_db_track(void *ctx, uint32_t index, const dj_link_peer_track_t *t,
+                                   bool detail)
+{
+    (void)ctx;
+    (void)index;
+    if (!detail || !t || t->rekordbox_id != s_job.rekordbox_id) {
+        return;
+    }
+    s_job.detail_done = true;
+    if (s_job.artwork_id == 0u && t->artwork_id != 0u) {
+        s_job.artwork_id = t->artwork_id;   /* before the analysis asks for it */
+    }
+    portENTER_CRITICAL(&s_mux);
+    dj_link_fetch_status_t *st = dj_link_fetch_cur_status();
+    if (st) {
+        st->meta = *t;
+        st->has_meta = true;
+    }
+    portEXIT_CRITICAL(&s_mux);
+    if (s_job.meta_wait) {
+        s_job.meta_wait = false;
+        dj_link_fetch_analysis(s_job.cache_hit, dj_link_now_ms());
+    }
+}
+
+static void dj_link_fetch_db_path(void *ctx, uint32_t rekordbox_id, const char *path)
+{
+    (void)ctx;
+    dj_link_fetch_on_path(rekordbox_id, path);
+}
+
+static void dj_link_fetch_db_blob(void *ctx, uint32_t rekordbox_id, uint16_t request, size_t len,
+                                  bool answered)
+{
+    (void)ctx;
+    dj_link_fetch_on_blob(rekordbox_id, request, len, answered);
+}
+
+/* Start (or restart after a failure) the session to the job's peer, as our
+ * deck 1 player number. False if it cannot serve anything (not joined, no
+ * memory). */
+static bool dj_link_fetch_db_start(uint32_t now_ms)
+{
+    if (!s_fetch_db) {
+        s_fetch_db = heap_caps_calloc(1, sizeof(*s_fetch_db), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_fetch_db) {
+            return false;
+        }
+    }
+    static const dj_link_db_io_t io = {
+        .connect = dj_link_fetch_db_connect,
+        .send = dj_link_fetch_db_send,
+        .close = dj_link_fetch_db_close,
+        .track = dj_link_fetch_db_track,
+        .next_detail = dj_link_fetch_db_next_detail,
+        .path = dj_link_fetch_db_path,
+        .blob = dj_link_fetch_db_blob,
+        .ctx = &s_fetch_tcp,
+    };
+    dj_link_db_stop(&s_fetch_db->client);   /* closes s_fetch_tcp */
+    s_fetch_tcp.ring = s_fetch_db->tcp_ring;
+    dj_link_db_init(&s_fetch_db->client, &io, 0u);
+    const uint8_t ours = dj_link_session_number(&s_session[0]);
+    dj_link_db_start_service(&s_fetch_db->client, s_job.ip, s_job.peer, s_job.slot, ours,
+                             now_ms);
+    s_fetch_db_active = true;
+    return dj_link_db_phase(&s_fetch_db->client) != DJ_LINK_DB_FAILED;
+}
+
+/* The session can take a request: restarted once if it failed. */
+static bool dj_link_fetch_db_usable(uint32_t now_ms)
+{
+    if (!s_fetch_db || !s_fetch_db_active) {
+        return dj_link_fetch_db_start(now_ms);
+    }
+    if (dj_link_db_phase(&s_fetch_db->client) == DJ_LINK_DB_FAILED) {
+        ESP_LOGW(TAG, "fetch #%u: source db %s, reconnecting", (unsigned)s_job.peer,
+                 dj_link_db_error(&s_fetch_db->client));
+        return dj_link_fetch_db_start(now_ms);
+    }
+    return true;
+}
+
+/* dj_link task, every pass: the job's session, then its stop once the job
+ * is over (never from inside its own callbacks). */
+static void dj_link_fetch_db_service(uint32_t now_ms)
+{
+    if (!s_fetch_db || !s_fetch_db_active) {
+        return;
+    }
+    if (s_job.state == DJ_LINK_FETCH_PDB || s_job.state == DJ_LINK_FETCH_AUDIO) {
+        dj_link_tcp_pump(&s_fetch_tcp, &s_fetch_db->client, now_ms);
+        dj_link_db_poll(&s_fetch_db->client, now_ms);
+    }
+    if (s_job.state != DJ_LINK_FETCH_PDB && s_job.state != DJ_LINK_FETCH_AUDIO) {
+        dj_link_db_stop(&s_fetch_db->client);
+        s_fetch_db_active = false;
+    }
+}
+
 static void dj_link_fetch_begin(uint32_t id, uint8_t peer, uint32_t rekordbox_id,
                                 uint32_t artwork_id, const uint32_t keep[2],
-                                uint32_t generation, uint32_t now_ms)
+                                uint32_t now_ms)
 {
     memset(&s_job, 0, sizeof(s_job));
     s_job.state = DJ_LINK_FETCH_PDB;
@@ -1438,7 +1650,6 @@ static void dj_link_fetch_begin(uint32_t id, uint8_t peer, uint32_t rekordbox_id
     s_job.artwork_id = artwork_id;
     s_job.keep[0] = keep[0];
     s_job.keep[1] = keep[1];
-    s_job.generation = generation;
 
     const dj_link_peer_t *p = dj_link_find_peer(peer);
     if (!p || p->ip == 0u) {
@@ -1485,13 +1696,18 @@ static void dj_link_fetch_begin(uint32_t id, uint8_t peer, uint32_t rekordbox_id
     /* v297: a rekordbox source answers the path itself, every time (so a
      * cache hit is still checked against what the source serves now). */
     s_job.collection = p->device_type == DJ_LINK_DEVICE_TYPE_REKORDBOX;
+    s_job.slot = s_job.collection ? DJLINK_SLOT_LAPTOP : DJLINK_SLOT_USB;
+    /* v333: the job's own dbserver session, whatever the Library browses.
+     * It also asks the track's metadata (title, artist, artwork id) while
+     * nothing else is pending, e.g. during the audio download. */
+    const bool db = dj_link_fetch_db_start(now_ms);
     if (s_job.collection) {
-        /* The answer arrives through the browse pump: dj_link_fetch_on_path. */
+        /* The answer arrives through the job's session: dj_link_fetch_on_path. */
         s_job.path_wait = true;
         s_job.path_deadline_ms = now_ms + DJ_LINK_FETCH_PATH_MS;
-        if (!s_browse || s_browse_peer != peer || !s_browse_started ||
-            !dj_link_db_want_path(&s_browse->client, rekordbox_id, now_ms)) {
-            dj_link_fetch_end(DJ_LINK_FETCH_FAILED, "SOURCE DB NOT READY", false);
+        if (!db || !dj_link_db_want_path(&s_fetch_db->client, rekordbox_id, now_ms)) {
+            dj_link_fetch_end(DJ_LINK_FETCH_FAILED,
+                              db ? "SOURCE DB NOT READY" : "SOURCE DB: NOT JOINED", false);
             return;
         }
         ESP_LOGW(TAG, "fetch #%u id %u: path from the dbserver", (unsigned)peer,
@@ -1557,13 +1773,13 @@ static void dj_link_fetch_failed(uint32_t now_ms)
             return;
         }
     }
-    char error[sizeof(s_fetch_status.error)];
+    char error[sizeof(((dj_link_fetch_status_t *)0)->error)];
     snprintf(error, sizeof(error), "%s", djlink_nfs_error_text(c));
     dj_link_fetch_end(DJ_LINK_FETCH_FAILED, error, false);
 }
 
-/* v297: the browse session answered a path request (path "" = unknown).
- * dj_link task, from dj_link_browse_service. */
+/* v297: the job's session (v333; the browse session before) answered a path
+ * request (path "" = unknown). dj_link task, from dj_link_fetch_db_service. */
 static void dj_link_fetch_on_path(uint32_t rekordbox_id, const char *path)
 {
     if (s_job.state != DJ_LINK_FETCH_PDB || !s_job.collection || !s_fetch ||
@@ -1702,11 +1918,12 @@ static bool dj_link_fetch_want_art(uint32_t now_ms)
         s_job.art = heap_caps_malloc(DJ_LINK_FETCH_ART_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
     return s_job.art &&
-           dj_link_db_want_blob(&s_browse->client, DJLINK_DB_TYPE_ARTWORK_REQUEST,
+           dj_link_db_want_blob(&s_fetch_db->client, DJLINK_DB_TYPE_ARTWORK_REQUEST,
                                 s_job.artwork_id, s_job.art, DJ_LINK_FETCH_ART_MAX, now_ms);
 }
 
-/* v300: the audio is cached; ask the browse session for the waveform, beat
+/* v300: the audio is cached; ask the job's session (v333; the browse
+ * session before) for the waveform, beat
  * grid, cue list (v303) and artwork. v303: the analysis is asked even when
  * <key>.DAT is cached - v302 kept it forever, so a beat grid or cue edit at
  * the source never reached the deck - with a shorter wait, the cached files
@@ -1719,11 +1936,25 @@ static void dj_link_fetch_analysis(bool cache_hit, uint32_t now_ms)
     char dat[DJ_LINK_FETCH_PATH_MAX];
     char jpg[DJ_LINK_FETCH_PATH_MAX];
     s_job.cache_hit = cache_hit;
+    /* v334: metadata first. On a download it is normally back already; on a
+     * cache hit nothing else gave it time. The track callback resumes here,
+     * dj_link_fetch_service gives up at the deadline. */
+    if (!s_job.detail_done && !s_job.meta_wait && s_job.meta_deadline_ms == 0u &&
+        dj_link_fetch_db_usable(now_ms)) {
+        s_job.meta_wait = true;
+        s_job.meta_deadline_ms = now_ms + DJ_LINK_FETCH_META_MS;
+        if (s_job.meta_deadline_ms == 0u) {
+            s_job.meta_deadline_ms = 1u;
+        }
+        return;
+    }
     dj_link_fetch_anlz_path(dat, sizeof(dat), "DAT");
     dj_link_fetch_anlz_path(jpg, sizeof(jpg), "JPG");
     s_job.dat_cached = dj_link_fetch_cached(dat);
     s_job.want_art = s_job.artwork_id != 0u && !dj_link_fetch_cached(jpg);
-    if (!s_browse || s_browse_peer != s_job.peer || !s_browse_started) {
+    if (!dj_link_fetch_db_usable(now_ms)) {
+        ESP_LOGW(TAG, "fetch #%u id %u: no analysis (source db not joined)",
+                 (unsigned)s_job.peer, (unsigned)s_job.rekordbox_id);
         dj_link_fetch_end(DJ_LINK_FETCH_DONE, NULL, cache_hit);
         return;
     }
@@ -1739,7 +1970,7 @@ static void dj_link_fetch_analysis(bool cache_hit, uint32_t now_ms)
     s_job.grid = heap_caps_malloc(DJ_LINK_ANLZ_GRID_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_job.cues = heap_caps_malloc(DJ_LINK_FETCH_CUES_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     const bool mem = s_job.wave && s_job.grid && s_job.cues;
-    if (!mem || !dj_link_db_want_blob(&s_browse->client, DJLINK_DB_TYPE_WAVEFORM_REQUEST,
+    if (!mem || !dj_link_db_want_blob(&s_fetch_db->client, DJLINK_DB_TYPE_WAVEFORM_REQUEST,
                                       s_job.rekordbox_id, s_job.wave, DJ_LINK_ANLZ_WAVE_MAX,
                                       now_ms)) {
         ESP_LOGW(TAG, "fetch #%u id %u: no analysis (%s)", (unsigned)s_job.peer,
@@ -1752,9 +1983,9 @@ static void dj_link_fetch_analysis(bool cache_hit, uint32_t now_ms)
         now_ms + (s_job.dat_cached ? DJ_LINK_FETCH_REFRESH_MS : DJ_LINK_FETCH_ANALYSIS_MS);
 }
 
-/* v300: the browse session answered an analysis or artwork request (len 0
+/* v300: the job's session (v333) answered an analysis or artwork request (len 0
  * = none); id is the artwork id for the artwork. Wave, grid, cues (v303),
- * then artwork. dj_link task, from dj_link_browse_service. */
+ * then artwork. dj_link task, from dj_link_fetch_db_service. */
 static void dj_link_fetch_on_blob(uint32_t id, uint16_t request, size_t len, bool answered)
 {
     bool art = request == DJLINK_DB_TYPE_ARTWORK_REQUEST;
@@ -1765,14 +1996,14 @@ static void dj_link_fetch_on_blob(uint32_t id, uint16_t request, size_t len, boo
     if (request == DJLINK_DB_TYPE_WAVEFORM_REQUEST) {
         s_job.wave_len = len;
         s_job.wave_answered = answered;
-        if (dj_link_db_want_blob(&s_browse->client, DJLINK_DB_TYPE_BEATGRID_REQUEST,
+        if (dj_link_db_want_blob(&s_fetch_db->client, DJLINK_DB_TYPE_BEATGRID_REQUEST,
                                  s_job.rekordbox_id, s_job.grid, DJ_LINK_ANLZ_GRID_MAX, now_ms)) {
             return;
         }
     } else if (request == DJLINK_DB_TYPE_BEATGRID_REQUEST) {
         s_job.grid_len = len;
         s_job.grid_answered = answered;
-        if (dj_link_db_want_blob(&s_browse->client, DJLINK_DB_TYPE_CUES_EXT_REQUEST,
+        if (dj_link_db_want_blob(&s_fetch_db->client, DJLINK_DB_TYPE_CUES_EXT_REQUEST,
                                  s_job.rekordbox_id, s_job.cues, DJ_LINK_FETCH_CUES_MAX, now_ms)) {
             return;
         }
@@ -1785,7 +2016,7 @@ static void dj_link_fetch_on_blob(uint32_t id, uint16_t request, size_t len, boo
                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         }
         if (s_job.wave_len > 0u && s_job.color &&
-            dj_link_db_want_blob(&s_browse->client, DJ_LINK_DB_TYPE_ANLZ_TAG_REQUEST,
+            dj_link_db_want_blob(&s_fetch_db->client, DJ_LINK_DB_TYPE_ANLZ_TAG_REQUEST,
                                  s_job.rekordbox_id, s_job.color, DJ_LINK_ANLZ_COLOR_BLOB_MAX,
                                  now_ms)) {
             return;
@@ -1817,25 +2048,47 @@ static void dj_link_fetch_abort(const char *why)
 
 static void dj_link_fetch_service(uint32_t now_ms)
 {
-    uint32_t keep[2];
+    uint32_t keep[2] = { 0u, 0u };
+    bool start = false;
+    uint32_t id = 0u;
+    uint8_t peer = 0u;
+    uint32_t rekordbox_id = 0u;
+    uint32_t artwork_id = 0u;
+    const bool idle = s_job.state != DJ_LINK_FETCH_PDB && s_job.state != DJ_LINK_FETCH_AUDIO;
     portENTER_CRITICAL(&s_mux);
-    bool start = s_fetch_pending;
-    s_fetch_pending = false;
-    uint32_t id = s_fetch_status.id;
-    uint8_t peer = s_fetch_status.peer;
-    uint32_t rekordbox_id = s_fetch_status.rekordbox_id;
-    uint32_t artwork_id = s_fetch_req_artwork;
-    keep[0] = s_fetch_req_keep[0];
-    keep[1] = s_fetch_req_keep[1];
-    uint32_t generation = s_browse_status.generation;
+    if (idle) {
+        /* v335: the oldest queued request, if any. */
+        uint32_t pick = DJ_LINK_FETCH_SLOTS;
+        for (uint32_t i = 0; i < DJ_LINK_FETCH_SLOTS; i++) {
+            if (s_fetch_slots[i].st.state == DJ_LINK_FETCH_QUEUED &&
+                (pick == DJ_LINK_FETCH_SLOTS ||
+                 (int32_t)(s_fetch_slots[i].seq - s_fetch_slots[pick].seq) < 0)) {
+                pick = i;
+            }
+        }
+        if (pick < DJ_LINK_FETCH_SLOTS) {
+            dj_link_fetch_slot_t *slot = &s_fetch_slots[pick];
+            start = true;
+            s_fetch_cur = pick;
+            slot->st.state = DJ_LINK_FETCH_PDB;
+            id = slot->st.id;
+            peer = slot->st.peer;
+            rekordbox_id = slot->st.rekordbox_id;
+            artwork_id = slot->artwork_id;
+            keep[0] = slot->keep[0];
+            keep[1] = slot->keep[1];
+        }
+    }
     bool cancel = s_fetch_cancel_id != 0u && s_fetch_cancel_id == s_job.id;
     s_fetch_cancel_id = 0u;
     portEXIT_CRITICAL(&s_mux);
 
     if (start) {
-        dj_link_fetch_begin(id, peer, rekordbox_id, artwork_id, keep, generation, now_ms);
+        dj_link_fetch_begin(id, peer, rekordbox_id, artwork_id, keep, now_ms);
     }
+    dj_link_fetch_db_service(now_ms);
     if (s_job.state != DJ_LINK_FETCH_PDB && s_job.state != DJ_LINK_FETCH_AUDIO) {
+        dj_link_fetch_db_service(now_ms);   /* ended just now: stop the session */
         return;
     }
     djlink_nfs_t *c = &s_fetch->nfs;
@@ -1844,12 +2097,22 @@ static void dj_link_fetch_service(uint32_t now_ms)
         dj_link_fetch_end(DJ_LINK_FETCH_CANCELLED, "CANCELLED", false);
         return;
     }
+    if (s_job.meta_wait) {
+        /* v334: no metadata (failed session, slow source): analysis anyway. */
+        if (!s_fetch_db || dj_link_db_phase(&s_fetch_db->client) == DJ_LINK_DB_FAILED ||
+            (int32_t)(now_ms - s_job.meta_deadline_ms) >= 0) {
+            ESP_LOGW(TAG, "fetch #%u id %u: no metadata answer", (unsigned)s_job.peer,
+                     (unsigned)s_job.rekordbox_id);
+            s_job.meta_wait = false;
+            s_job.detail_done = true;   /* not asked again by this job */
+            dj_link_fetch_analysis(s_job.cache_hit, now_ms);
+        }
+        return;
+    }
     if (s_job.path_wait) {
-        /* v297: the browse session (served before us in the task loop)
-         * answers through dj_link_fetch_on_path; give up if it cannot. */
-        if (generation != s_job.generation) {
-            dj_link_fetch_end(DJ_LINK_FETCH_FAILED, "SOURCE CHANGED", false);
-        } else if (!s_browse || dj_link_db_phase(&s_browse->client) == DJ_LINK_DB_FAILED) {
+        /* v297: the job's session (v333) answers through
+         * dj_link_fetch_on_path; give up if it cannot. */
+        if (!s_fetch_db || dj_link_db_phase(&s_fetch_db->client) == DJ_LINK_DB_FAILED) {
             dj_link_fetch_end(DJ_LINK_FETCH_FAILED, "SOURCE DB FAILED", false);
         } else if ((int32_t)(now_ms - s_job.path_deadline_ms) >= 0) {
             dj_link_fetch_end(DJ_LINK_FETCH_FAILED, "SOURCE PATH TIMEOUT", false);
@@ -1858,8 +2121,7 @@ static void dj_link_fetch_service(uint32_t now_ms)
     }
     if (s_job.analysis_wait) {
         /* v300: the audio is already cached; keep what arrived and finish. */
-        if (generation != s_job.generation || !s_browse || s_browse_peer != s_job.peer ||
-            dj_link_db_phase(&s_browse->client) == DJ_LINK_DB_FAILED ||
+        if (!s_fetch_db || dj_link_db_phase(&s_fetch_db->client) == DJ_LINK_DB_FAILED ||
             (int32_t)(now_ms - s_job.analysis_deadline_ms) >= 0) {
             ESP_LOGW(TAG, "fetch #%u id %u: analysis gave up", (unsigned)s_job.peer,
                      (unsigned)s_job.rekordbox_id);
@@ -1943,11 +2205,15 @@ static void dj_link_close(void)
 {
     /* Before the TCP/UDP teardown: the fetch PCB needs the netif index. */
     dj_link_fetch_abort("DJ LINK STOPPED");
+    if (s_fetch_db && s_fetch_db_active) {
+        dj_link_db_stop(&s_fetch_db->client);   /* closes s_fetch_tcp */
+        s_fetch_db_active = false;
+    }
     /* A browse in progress starts over (new generation) once reopened. */
     if (s_browse_peer != 0u) {
         dj_link_browse_restart(s_browse_peer);
     } else {
-        dj_link_tcp_close();
+        dj_link_tcp_close(&s_browse_tcp);
     }
     /* Runs in the tcpip thread, so no callback is in flight afterwards.
      * Players simply stop hearing our keep-alives and drop us. */
@@ -2392,12 +2658,13 @@ static void dj_link_task(void *arg)
                 s_published.state = DJ_LINK_STATE_OFF;
                 s_browse_want = 0u;
                 memset(&s_browse_status, 0, sizeof(s_browse_status));
-                if (s_fetch_pending) {
-                    /* dj_link_close() already ended a running fetch. */
-                    s_fetch_pending = false;
-                    s_fetch_status.state = DJ_LINK_FETCH_FAILED;
-                    snprintf(s_fetch_status.error, sizeof(s_fetch_status.error),
-                             "DJ LINK STOPPED");
+                /* dj_link_close() already ended a running fetch. */
+                for (uint32_t i = 0; i < DJ_LINK_FETCH_SLOTS; i++) {
+                    dj_link_fetch_status_t *st = &s_fetch_slots[i].st;
+                    if (st->state == DJ_LINK_FETCH_QUEUED) {
+                        st->state = DJ_LINK_FETCH_FAILED;
+                        snprintf(st->error, sizeof(st->error), "DJ LINK STOPPED");
+                    }
                 }
                 s_running = false;
                 portEXIT_CRITICAL(&s_mux);
@@ -2560,23 +2827,32 @@ uint32_t dj_link_fetch_start(uint8_t peer, uint32_t rekordbox_id, uint32_t artwo
     }
     uint32_t id = 0u;
     portENTER_CRITICAL(&s_mux);
-    bool busy = s_fetch_pending || s_fetch_status.state == DJ_LINK_FETCH_PDB ||
-                s_fetch_status.state == DJ_LINK_FETCH_AUDIO;
-    if (s_running && s_want && !busy) {
+    /* v335: a free slot is one whose fetch is over; the oldest goes first. */
+    uint32_t pick = DJ_LINK_FETCH_SLOTS;
+    for (uint32_t i = 0; i < DJ_LINK_FETCH_SLOTS; i++) {
+        const dj_link_fetch_state_t state = s_fetch_slots[i].st.state;
+        const bool busy = state == DJ_LINK_FETCH_QUEUED || state == DJ_LINK_FETCH_PDB ||
+                          state == DJ_LINK_FETCH_AUDIO;
+        if (!busy && (pick == DJ_LINK_FETCH_SLOTS ||
+                      (int32_t)(s_fetch_slots[i].seq - s_fetch_slots[pick].seq) < 0)) {
+            pick = i;
+        }
+    }
+    if (s_running && s_want && pick < DJ_LINK_FETCH_SLOTS) {
         id = ++s_fetch_next_id;
         if (id == 0u) {
             id = ++s_fetch_next_id;
         }
-        memset(&s_fetch_status, 0, sizeof(s_fetch_status));
-        s_fetch_status.id = id;
-        s_fetch_status.state = DJ_LINK_FETCH_PDB;
-        s_fetch_status.peer = peer;
-        s_fetch_status.rekordbox_id = rekordbox_id;
-        s_fetch_req_keep[0] = keep_keys ? keep_keys[0] : 0u;
-        s_fetch_req_keep[1] = keep_keys ? keep_keys[1] : 0u;
-        s_fetch_req_artwork = artwork_id;
-        s_fetch_cancel_id = 0u;
-        s_fetch_pending = true;
+        dj_link_fetch_slot_t *slot = &s_fetch_slots[pick];
+        memset(slot, 0, sizeof(*slot));
+        slot->st.id = id;
+        slot->st.state = DJ_LINK_FETCH_QUEUED;
+        slot->st.peer = peer;
+        slot->st.rekordbox_id = rekordbox_id;
+        slot->keep[0] = keep_keys ? keep_keys[0] : 0u;
+        slot->keep[1] = keep_keys ? keep_keys[1] : 0u;
+        slot->artwork_id = artwork_id;
+        slot->seq = ++s_fetch_seq;
     }
     portEXIT_CRITICAL(&s_mux);
     return id;
@@ -2585,28 +2861,37 @@ uint32_t dj_link_fetch_start(uint8_t peer, uint32_t rekordbox_id, uint32_t artwo
 void dj_link_fetch_cancel(uint32_t id)
 {
     portENTER_CRITICAL(&s_mux);
-    if (id != 0u && s_fetch_status.id == id) {
-        if (s_fetch_pending) {
+    for (uint32_t i = 0; id != 0u && i < DJ_LINK_FETCH_SLOTS; i++) {
+        dj_link_fetch_status_t *st = &s_fetch_slots[i].st;
+        if (st->id != id) {
+            continue;
+        }
+        if (st->state == DJ_LINK_FETCH_QUEUED) {
             /* Not taken by the task yet: nothing to undo. */
-            s_fetch_pending = false;
-            s_fetch_status.state = DJ_LINK_FETCH_CANCELLED;
-            snprintf(s_fetch_status.error, sizeof(s_fetch_status.error), "CANCELLED");
-        } else if (s_fetch_status.state == DJ_LINK_FETCH_PDB ||
-                   s_fetch_status.state == DJ_LINK_FETCH_AUDIO) {
+            st->state = DJ_LINK_FETCH_CANCELLED;
+            snprintf(st->error, sizeof(st->error), "CANCELLED");
+        } else if (st->state == DJ_LINK_FETCH_PDB || st->state == DJ_LINK_FETCH_AUDIO) {
             s_fetch_cancel_id = id;
         }
     }
     portEXIT_CRITICAL(&s_mux);
 }
 
-void dj_link_fetch_get_status(dj_link_fetch_status_t *out)
+bool dj_link_fetch_get_status(uint32_t id, dj_link_fetch_status_t *out)
 {
-    if (!out) {
-        return;
+    bool found = false;
+    if (!out || id == 0u) {
+        return false;
     }
     portENTER_CRITICAL(&s_mux);
-    *out = s_fetch_status;
+    for (uint32_t i = 0; i < DJ_LINK_FETCH_SLOTS; i++) {
+        if (s_fetch_slots[i].st.id == id) {
+            *out = s_fetch_slots[i].st;
+            found = true;
+        }
+    }
     portEXIT_CRITICAL(&s_mux);
+    return found;
 }
 
 void dj_link_set_sync_control(bool on)

@@ -938,6 +938,71 @@ static void test_track_info_path(void)
     mock_stop(&mk, th);
 }
 
+/* v333: a service session (the download job's) never lists: path, blob and
+ * metadata go out right after the setup, and an idle close reconnects on
+ * demand. */
+static void test_service_session(void)
+{
+    static uint8_t wave[16384];
+    mock_t mk;
+    pthread_t th;
+    driver_t d;
+    mock_start(&mk, &th, MOCK_NORMAL);
+    memset(&d, 0, sizeof(d));
+    d.mock = &mk;
+    d.fd = -1;
+    d.want_detail = UINT32_MAX;
+    s_driver = &d;
+    dj_link_db_io_t io = {
+        .connect = io_connect, .send = io_send, .close = io_close,
+        .list_begin = io_list_begin, .track = io_track, .next_detail = io_next_detail,
+        .path = io_path, .blob = io_blob, .ctx = &d,
+    };
+    dj_link_db_init(&s_client, &io, MAX_ROWS);
+    s_client.discovery_port = mk.disc_port;
+    s_client.step_timeout_ms = 2000;
+    dj_link_db_start_service(&s_client, PEER_IP, PEER_NUMBER, DJLINK_SLOT_LAPTOP, OUR_NUMBER,
+                             now_ms());
+    CHECK(s_client.list_done);
+    CHECK(dj_link_db_want_path(&s_client, 102u, now_ms()));
+    s_paths_wanted = 1;
+    run(&d, path_or_failed, 3000);
+    CHECK(d.paths == 1 && d.path_id == 102u && d.path[0] == '/');
+    CHECK(mk.track_menus == 0 && mk.playlist_menus == 0);
+    /* Metadata of the job's track: the owner names it (row 0 here). */
+    CHECK(d.listed == 0u);
+    d.rows[0].rekordbox_id = 101u;
+    d.listed = 1u;
+    d.want_detail = 0;
+    run(&d, detail_or_failed, 3000);
+    CHECK(d.details == 1 && mk.metadata_requests == 1 && mk.metadata_id == 101u);
+    CHECK(d.rows[0].duration_s != 0u);
+    CHECK(mk.track_menus == 0);
+    /* A blob on the open session streams without any listing. */
+    CHECK(dj_link_db_want_blob(&s_client, DJLINK_DB_TYPE_WAVEFORM_REQUEST, 101u, wave,
+                               sizeof(wave), now_ms()));
+    s_blobs_wanted = 1;
+    run(&d, blob_or_failed, 3000);
+    CHECK(d.blobs == 1 && d.blob_len == MOCK_WAVE_LEN);
+    CHECK(mk.track_menus == 0);
+    const int connects = d.connects;   /* discovery + dbserver */
+    /* After an idle close, a wanted blob reconnects on its own (the
+     * discovery query again, no list). */
+    dj_link_db_on_closed(&s_client, now_ms());
+    io_close(&d);
+    CHECK(s_client.phase == DJ_LINK_DB_IDLE);
+    CHECK(dj_link_db_want_blob(&s_client, DJLINK_DB_TYPE_WAVEFORM_REQUEST, 101u, wave,
+                               sizeof(wave), now_ms()));
+    dj_link_db_poll(&s_client, now_ms());
+    CHECK(d.connects == connects + 1 && s_client.phase == DJ_LINK_DB_DISC_CONNECTING);
+    dj_link_db_cancel_blob(&s_client);
+    /* A refused start (no player number) stays failed. */
+    dj_link_db_start_service(&s_client, PEER_IP, PEER_NUMBER, DJLINK_SLOT_USB, 0, now_ms());
+    CHECK(s_client.phase == DJ_LINK_DB_FAILED && !s_client.list_done);
+    dj_link_db_stop(&s_client);
+    mock_stop(&mk, th);
+}
+
 /* v300: wave detail and beat grid stream into the owner's buffer, even
  * past the rx buffer; a missing analysis is an empty answer. */
 static void test_analysis_blobs(void)
@@ -1606,6 +1671,7 @@ int main(void)
     test_pick_detail();
     test_load_refused_metadata_only();
     test_browse_stamps_nfs();
+    test_service_session();
     test_track_info_path();
     test_analysis_blobs();
     test_artwork();

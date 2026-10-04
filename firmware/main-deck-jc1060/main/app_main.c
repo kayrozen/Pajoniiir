@@ -29,6 +29,7 @@
 #include "ui_diagnostics.h"
 #include "ui_lvgl_backend.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 #include "esp_system.h"
@@ -416,7 +417,7 @@ static size_t stall_usb_probe(bool begin, char *buf, size_t size)
     const int n = snprintf(buf, size,
         "\nlvgl STALL usb: loops %u tail %u us | midi_in cb %u %u us max %u us"
         " pkt %u | out submit %u wake %u | midi submit %u us"
-        " | isoc cb %u %u us (submit %u us) max %u us",
+        " | isoc cb %u %u us (submit %u us, prep %u us) max %u us",
         (unsigned)(now.loops - b->loops),
         (unsigned)stall_usb_us(now.loop_cycles - b->loop_cycles, t),
         (unsigned)(now.midi_in_callbacks - b->midi_in_callbacks),
@@ -429,6 +430,7 @@ static size_t stall_usb_probe(bool begin, char *buf, size_t size)
         (unsigned)(now.isoc_callbacks - b->isoc_callbacks),
         (unsigned)stall_usb_us(now.isoc_cycles - b->isoc_cycles, t),
         (unsigned)stall_usb_us(now.isoc_submit_cycles - b->isoc_submit_cycles, t),
+        (unsigned)stall_usb_us(now.isoc_prep_cycles - b->isoc_prep_cycles, t),
         (unsigned)stall_usb_us(now.isoc_max_cycles, t));
     s_stall_usb_base = now;
     if (n <= 0) {
@@ -472,6 +474,56 @@ static void failed_alloc_cb(size_t size, uint32_t caps, const char *function_nam
                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
                    (unsigned)(count - printed - 1u), (unsigned)count);
+}
+
+/* v330/v331: the web server for Ethernet with the Wi-Fi remote OFF.
+ * v330 started it from app_main before the USB host install: httpd's task
+ * and mDNS took internal RAM first and usb_host_install hit NO_MEM on the
+ * HCD port (boot loop, the v290 budget). Wait until the controller
+ * bootstrap is ready (USB host installed, controller client and dispatch
+ * task created), then start. No wait for the DHCP lease: httpd listens on
+ * every interface and mDNS (predefined ETH netif) enables itself on
+ * IP_EVENT_ETH_GOT_IP. Stack in PSRAM, one-shot. */
+#define ETH_WEB_WAIT_MS 250u
+#define ETH_WEB_WAIT_LOG_MS 30000u
+
+static void eth_web_start_task(void *arg)
+{
+    (void)arg;
+    uint32_t waited_ms = 0u;
+    for (;;) {
+        p4_local_controller_diagnostics_t diag = {0};
+        p4_local_controller_get_diagnostics(&diag);
+        if (diag.bootstrap_ready) break;
+        vTaskDelay(pdMS_TO_TICKS(ETH_WEB_WAIT_MS));
+        waited_ms += ETH_WEB_WAIT_MS;
+        if (waited_ms == ETH_WEB_WAIT_LOG_MS) {
+            ESP_LOGW(TAG, "Ethernet web UI still waiting for the USB host");
+        }
+    }
+    if (!app_settings_get().wifi_remote) {
+        printf("[HEAP] before eth web_server_start: internal free=%u largest=%u\n",
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        esp_err_t rc = web_server_start();
+        if (rc != ESP_OK) {
+            ESP_LOGW(TAG, "web_server_start: %s", esp_err_to_name(rc));
+        }
+        printf("[HEAP] after eth web_server_start: internal free=%u largest=%u\n",
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        fflush(stdout);
+    }
+    vTaskDeleteWithCaps(NULL);
+}
+
+static void eth_web_start_after_usb(void)
+{
+    if (xTaskCreatePinnedToCoreWithCaps(eth_web_start_task, "eth_web", 3072, NULL,
+                                        2, NULL, 1,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        ESP_LOGW(TAG, "eth_web task create failed: no Ethernet web UI");
+    }
 }
 
 void app_main(void)
@@ -654,12 +706,9 @@ void app_main(void)
     if (app_settings_get().wifi_remote) {
         ESP_LOGI(TAG, "Wi-Fi remote enabled in settings — starting web UI AP");
         wifi_link_request_enable(true);
-    } else if (eth_bringup_got_ip()) {
-        esp_err_t web_rc = web_server_start();
-        if (web_rc != ESP_OK) {
-            ESP_LOGW(TAG, "web_server_start: %s", esp_err_to_name(web_rc));
-        }
     }
+    /* Wi-Fi remote OFF: the Ethernet web server starts later, after the USB
+     * host install (v331, see eth_web_start_after_usb()). */
 
     // ── Pioneer DJ Link observer (v246, Ethernet only, default OFF) ──────────
     // Observation only: a low-priority core-1 task that never transmits and
@@ -697,6 +746,9 @@ void app_main(void)
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     fflush(stdout);
+    if (!app_settings_get().wifi_remote) {
+        eth_web_start_after_usb();
+    }
 
     printf("=== HEAP DIAG ===\n");
     fflush(stdout);

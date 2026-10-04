@@ -21,6 +21,30 @@ typedef bool (*audio_output_keylock_fn)(void *ctx, float tempo_factor,
                                         audio_mixer_frame_t *out,
                                         uint32_t *out_consumed);
 
+/* v328: a deck that becomes audible again (PLAY, cue play, start gate after a
+ * seek, platter hold release) fades its source in over
+ * AUDIO_OUTPUT_START_FADE_FRAMES instead of stepping from silence; the PLAY
+ * start probe watches the raw source of the first AUDIO_OUTPUT_START_PROBE_FRAMES
+ * (largest step between consecutive frames and where). Owned by the output
+ * task; the mixer only advances it. */
+#define AUDIO_OUTPUT_START_FADE_FRAMES 128u
+#define AUDIO_OUTPUT_START_PROBE_FRAMES 4800u
+typedef struct {
+    uint32_t fade_done;          /* frames faded so far */
+    uint32_t probe_left;         /* frames still observed; 0 = idle */
+    uint32_t probe_count;        /* frames observed */
+    uint32_t max_step;           /* largest |step| in the first probe frames */
+    uint32_t max_step_at;
+    uint32_t max_step_late;      /* largest |step| after the fade window */
+    audio_mixer_frame_t first;
+    audio_mixer_frame_t prev;
+} audio_output_start_ramp_t;
+
+void audio_output_start_ramp_arm(audio_output_start_ramp_t *ramp);
+/* Gain for this source frame (fade-in), probing it first. */
+float audio_output_start_ramp_next(audio_output_start_ramp_t *ramp,
+                                   audio_mixer_frame_t pcm);
+
 typedef struct {
     bool active;
     float pitch_factor;
@@ -54,6 +78,8 @@ typedef struct {
     bool scratch_active;
     audio_output_scratch_fn scratch_render;
     void *scratch_ctx;
+    /* Optional v328 start fade/probe; NULL = none. */
+    audio_output_start_ramp_t *start_ramp;
 } audio_output_mixer_deck_t;
 
 typedef enum {

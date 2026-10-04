@@ -204,6 +204,30 @@ static void current_ap_ipv4(char out[16])
     }
 }
 
+/* v330: the Ethernet lease, "" until there is one. */
+static void current_eth_ipv4(char out[16])
+{
+    out[0] = '\0';
+    esp_netif_t *eth = esp_netif_get_handle_from_ifkey("ETH_DEF");
+    esp_netif_ip_info_t info = {0};
+    if (eth && esp_netif_get_ip_info(eth, &info) == ESP_OK && info.ip.addr != 0u) {
+        (void)esp_ip4addr_ntoa(&info.ip, out, 16);
+    }
+}
+
+/* DNS-rebinding allow-list: the canonical mDNS name, the SoftAP address and
+ * (v330) the device's own Ethernet address. A rebinding page reaches the
+ * device under the attacker's host name, never under one of its literal
+ * addresses, so accepting them keeps the guard. */
+static bool request_host_allowed(const char *host)
+{
+    char ip[16] = {0};
+    current_ap_ipv4(ip);
+    if (web_api_host_allowed(host, ip)) return true;
+    current_eth_ipv4(ip);
+    return ip[0] != '\0' && web_api_host_allowed(host, ip);
+}
+
 #if CONFIG_CONTROLLER_PROFILE_MANAGER
 static const char *controller_profile_state_name(controller_profile_transfer_state_t state)
 {
@@ -258,16 +282,15 @@ static esp_err_t register_uri_or_stop(httpd_handle_t server, const httpd_uri_t *
 }
 
 /* The captive UI is deliberately served from the fixed AP address. Enforce
- * that host on every API request to block DNS rebinding, and require a custom
+ * the allow-listed hosts (request_host_allowed) on every API request to block
+ * DNS rebinding, and require a custom
  * header for mutations so third-party pages cannot trigger deck actions with
  * an image, link or plain HTML form. */
 static bool api_request_allowed(httpd_req_t *req, bool mutation)
 {
     char host[64] = {0};
-    char ap_ipv4[16] = {0};
-    current_ap_ipv4(ap_ipv4);
     if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK ||
-        !web_api_host_allowed(host, ap_ipv4)) {
+        !request_host_allowed(host)) {
         httpd_resp_set_status(req, "403 Forbidden");
         (void)httpd_resp_send(req, "Invalid API host", HTTPD_RESP_USE_STRLEN);
         return false;
@@ -298,10 +321,8 @@ extern const uint8_t app_js_end[]       asm("_binary_app_js_end");
 static bool redirect_if_needed(httpd_req_t *req)
 {
     char host[64] = {0};
-    char ap_ipv4[16] = {0};
-    current_ap_ipv4(ap_ipv4);
     if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) == ESP_OK) {
-        if (!web_api_host_allowed(host, ap_ipv4)) {
+        if (!request_host_allowed(host)) {
             ESP_LOGD(TAG, "Redirecting Host '%s' to %s", host,
                      WEB_API_CANONICAL_HOSTNAME);
             httpd_resp_set_status(req, "302 Found");

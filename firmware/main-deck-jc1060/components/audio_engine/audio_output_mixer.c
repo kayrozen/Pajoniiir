@@ -14,6 +14,50 @@ static float clamp_unit_gain(float gain)
     return gain;
 }
 
+void audio_output_start_ramp_arm(audio_output_start_ramp_t *ramp)
+{
+    if (!ramp) return;
+    *ramp = (audio_output_start_ramp_t){
+        .probe_left = AUDIO_OUTPUT_START_PROBE_FRAMES,
+    };
+}
+
+static uint32_t frame_step(audio_mixer_frame_t a, audio_mixer_frame_t b)
+{
+    int32_t dl = (int32_t)a.left - (int32_t)b.left;
+    int32_t dr = (int32_t)a.right - (int32_t)b.right;
+    if (dl < 0) dl = -dl;
+    if (dr < 0) dr = -dr;
+    return (uint32_t)(dl > dr ? dl : dr);
+}
+
+float audio_output_start_ramp_next(audio_output_start_ramp_t *ramp,
+                                   audio_mixer_frame_t pcm)
+{
+    if (!ramp) return 1.0f;
+    if (ramp->probe_left != 0u) {
+        if (ramp->probe_count == 0u) {
+            ramp->first = pcm;
+        } else {
+            const uint32_t step = frame_step(pcm, ramp->prev);
+            if (step > ramp->max_step) {
+                ramp->max_step = step;
+                ramp->max_step_at = ramp->probe_count;
+            }
+            if (ramp->probe_count >= AUDIO_OUTPUT_START_FADE_FRAMES &&
+                step > ramp->max_step_late) {
+                ramp->max_step_late = step;
+            }
+        }
+        ramp->prev = pcm;
+        ramp->probe_count++;
+        ramp->probe_left--;
+    }
+    if (ramp->fade_done >= AUDIO_OUTPUT_START_FADE_FRAMES) return 1.0f;
+    ramp->fade_done++;
+    return (float)ramp->fade_done * (1.0f / (float)(AUDIO_OUTPUT_START_FADE_FRAMES + 1u));
+}
+
 void audio_output_gain_ramp_reset(audio_output_gain_ramp_t *ramp, float gain)
 {
     if (!ramp) return;
@@ -232,6 +276,12 @@ audio_output_mix_result_t audio_output_mixer_next_prepared(
         ? clamp_gain(deck0->pre_gain) : 1.0f;
     float pre_gain1 = deck1 && deck1->pre_gain > 0.0f
         ? clamp_gain(deck1->pre_gain) : 1.0f;
+    if (deck0 && deck0->active && deck0->start_ramp) {
+        pre_gain0 *= audio_output_start_ramp_next(deck0->start_ramp, pcm0);
+    }
+    if (deck1 && deck1->active && deck1->start_ramp) {
+        pre_gain1 *= audio_output_start_ramp_next(deck1->start_ramp, pcm1);
+    }
     audio_dsp_frame_t frame0 = apply_deck_beat_fx_echo(deck0,
         apply_deck_beat_fx_flanger(deck0,
             apply_deck_beat_fx_filter(deck0,

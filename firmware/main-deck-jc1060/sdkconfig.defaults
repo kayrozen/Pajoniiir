@@ -152,3 +152,15 @@ CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=64
 # URBs (NO_MEM) on every UAC restart. Takes effect only when sdkconfig is
 # regenerated (an existing sdkconfig keeps "is not set").
 CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=y
+
+# v327: Master Tempo WSOLA v2 on both decks (Kconfig default too). An
+# existing sdkconfig keeps its previous choice (v326 builds: A/B).
+CONFIG_AUDIO_KEYLOCK_WSOLA2=y
+
+# v332: IPv4 reassembly for the DJ Link NFS download (4 KB READ replies, 3
+# fragments each). lwIP frees the oldest incomplete datagram at the pbuf
+# limit; dj_link keeps window x fragments <= CONFIG_LWIP_IP_REASS_MAX_PBUFS
+# (10, default kept). An existing sdkconfig keeps "is not set": enable it in
+# menuconfig (Component config > LWIP > Enable reassembly incoming fragmented
+# IP4 packets) or regenerate sdkconfig.
+CONFIG_LWIP_IP4_REASSEMBLY=y

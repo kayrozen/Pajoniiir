@@ -265,11 +265,11 @@ static uint32_t s_peer_repaint_ms;
 static ui_peer_nav_t s_peer_nav;
 static void ui_library_peer_relist(int32_t selected);
 static bool ui_library_peer_open_row(uint32_t index);
-static bool ui_library_peer_relist_refused(void);
 #define UI_PEER_REPAINT_MS 150u
 /* v249: LOAD on a peer row downloads the track into the SD cache (dj_link
- * task, NFS), then loads that local file through the usual worker. One
- * download at a time; SOURCE turns into CANCEL meanwhile. */
+ * task, NFS), then loads that local file through the usual worker. SOURCE
+ * turns into CANCEL meanwhile. v335: one download per deck; the second one
+ * waits in dj_link (QUEUED) for the first. */
 typedef struct {
     uint32_t id;                  /* dj_link fetch id, 0 = none */
     uint8_t  deck;
@@ -282,7 +282,7 @@ typedef struct {
     uint32_t generation;          /* v307: browse row of the track, for its */
     uint32_t index;               /* metadata (artist) once it arrives */
 } ui_peer_fetch_t;
-static ui_peer_fetch_t s_peer_fetch;
+static ui_peer_fetch_t s_peer_fetches[DECK_CORE_DECK_COUNT];
 /* v307: a peer track loaded before its metadata came back: its deck takes
  * the artist late. rekordbox_id 0 = none. */
 typedef struct {
@@ -566,9 +566,44 @@ static void ui_library_invalidate_page_cache(void)
 }
 
 #ifndef WIN32
+/* Any deck downloading (or queued). */
 static bool ui_library_peer_fetch_active(void)
 {
-    return s_peer_fetch.id != 0u;
+    for (uint8_t d = 0; d < DECK_CORE_DECK_COUNT; d++) {
+        if (s_peer_fetches[d].id != 0u) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* v335: the download of `peer`/`rekordbox_id` in progress, if any. */
+static ui_peer_fetch_t *ui_library_peer_fetch_find(uint8_t peer, uint32_t rekordbox_id)
+{
+    for (uint8_t d = 0; d < DECK_CORE_DECK_COUNT; d++) {
+        ui_peer_fetch_t *f = &s_peer_fetches[d];
+        if (f->id != 0u && f->peer == peer && f->rekordbox_id == rekordbox_id) {
+            return f;
+        }
+    }
+    return NULL;
+}
+
+/* v335: the download that runs now (not queued), else any. */
+static ui_peer_fetch_t *ui_library_peer_fetch_shown(void)
+{
+    ui_peer_fetch_t *any = NULL;
+    for (uint8_t d = 0; d < DECK_CORE_DECK_COUNT; d++) {
+        ui_peer_fetch_t *f = &s_peer_fetches[d];
+        if (f->id == 0u) {
+            continue;
+        }
+        if (f->state != DJ_LINK_FETCH_QUEUED) {
+            return f;
+        }
+        any = f;
+    }
+    return any;
 }
 
 #endif
@@ -580,10 +615,12 @@ static bool ui_library_peer_fetch_active(void)
  * visible page has come back. */
 static void ui_library_peer_badge(const dj_link_peer_track_t *t, char *badge, size_t len)
 {
-    if (ui_library_peer_fetch_active() && s_peer_fetch.peer == s_library_peer &&
-        s_peer_fetch.rekordbox_id == t->rekordbox_id) {
-        if (s_peer_fetch.state == DJ_LINK_FETCH_AUDIO) {
-            snprintf(badge, len, "%u%%", (unsigned)s_peer_fetch.percent);
+    const ui_peer_fetch_t *f = ui_library_peer_fetch_find(s_library_peer, t->rekordbox_id);
+    if (f) {
+        if (f->state == DJ_LINK_FETCH_AUDIO) {
+            snprintf(badge, len, "%u%%", (unsigned)f->percent);
+        } else if (f->state == DJ_LINK_FETCH_QUEUED) {
+            snprintf(badge, len, "WAIT");
         } else {
             snprintf(badge, len, "DB");
         }
@@ -674,9 +711,6 @@ static void ui_library_playlists_button(void)
     if (ui_library_peer_view()) {
         /* v311: the player's playlists, one level per open; this button
          * goes back one level (to all tracks from the root). */
-        if (ui_library_peer_relist_refused()) {
-            return;
-        }
         int32_t selected = s_selected_track_idx;
         ui_peer_nav_button(&s_peer_nav, &selected);
         ui_library_peer_relist(selected);
@@ -1374,7 +1408,11 @@ static esp_err_t ui_library_publish_simulated_track(
  * mounted (media_io_gate), so a cached peer file needs it too.
  * v298: also a network load-track for a track of the browsed source.
  * Returns NULL once the download started, else the refusal (already shown). */
-static const char *ui_library_peer_fetch_begin(uint8_t deck, const dj_link_peer_track_t *row,
+/* v333: peer / slot name the source, which need not be the one the Library
+ * browses (a network load-track of an unlisted row); index is the browse
+ * row, UINT32_MAX when it is not listed. */
+static const char *ui_library_peer_fetch_begin(uint8_t deck, uint8_t peer, uint8_t slot,
+                                               const dj_link_peer_track_t *row,
                                                uint32_t index)
 {
     dj_link_peer_track_t t;
@@ -1388,8 +1426,8 @@ static const char *ui_library_peer_fetch_begin(uint8_t deck, const dj_link_peer_
     const char *refusal = NULL;
     if (verdict != DJ_LINK_PEER_LOAD_OK) {
         refusal = verdict == DJ_LINK_PEER_LOAD_NO_TRACK ? "NO TRACK" : "METADATA ONLY - NO AUDIO";
-    } else if (ui_library_peer_fetch_active()) {
-        refusal = "DOWNLOAD BUSY";
+    } else if (s_peer_fetches[deck].id != 0u) {
+        refusal = "DOWNLOAD BUSY";   /* v335: this deck already waits for one */
     } else if (!media_io_gate_is_available()) {
         refusal = "LOCAL USB NEEDED";
     } else if (ui_library_track_load_busy() || media_catalog_load_in_progress()) {
@@ -1399,7 +1437,7 @@ static const char *ui_library_peer_fetch_begin(uint8_t deck, const dj_link_peer_
     }
     if (refusal) {
         ESP_LOGW(TAG, "peer load refused: deck %u <- player #%u rekordbox id %u \"%s\": %s",
-                 (unsigned)deck + 1u, (unsigned)s_library_peer,
+                 (unsigned)deck + 1u, (unsigned)peer,
                  have ? (unsigned)t.rekordbox_id : 0u, have ? t.title : "",
                  verdict != DJ_LINK_PEER_LOAD_OK ? reason : refusal);
         ui_library_status_hold(refusal, COL_AMBER, 2500);
@@ -1414,35 +1452,36 @@ static const char *ui_library_peer_fetch_begin(uint8_t deck, const dj_link_peer_
             keep[d] = s_loaded_media[d].track_key;
         }
     }
-    uint32_t id = dj_link_fetch_start(s_library_peer, t.rekordbox_id, t.artwork_id, keep);
+    uint32_t id = dj_link_fetch_start(peer, t.rekordbox_id, t.artwork_id, keep);
     if (id == 0u) {
         ui_library_status_hold("DJ LINK BUSY", COL_AMBER, 2000);
         return "DJ LINK BUSY";
     }
-    memset(&s_peer_fetch, 0, sizeof(s_peer_fetch));
-    s_peer_fetch.id = id;
-    s_peer_fetch.deck = deck;
-    s_peer_fetch.peer = s_library_peer;
-    s_peer_fetch.slot = s_library_peer_slot;
-    s_peer_fetch.rekordbox_id = t.rekordbox_id;
-    s_peer_fetch.state = DJ_LINK_FETCH_PDB;
-    snprintf(s_peer_fetch.item.title, sizeof(s_peer_fetch.item.title), "%s",
+    ui_peer_fetch_t *f = &s_peer_fetches[deck];
+    memset(f, 0, sizeof(*f));
+    f->id = id;
+    f->deck = deck;
+    f->peer = peer;
+    f->slot = slot;
+    f->rekordbox_id = t.rekordbox_id;
+    f->state = DJ_LINK_FETCH_QUEUED;
+    snprintf(f->item.title, sizeof(f->item.title), "%s",
              t.title[0] ? t.title : "Unknown Title");
-    snprintf(s_peer_fetch.item.artist, sizeof(s_peer_fetch.item.artist), "%s", t.artist);
-    s_peer_fetch.item.rekordbox_track_id = t.rekordbox_id;
-    s_peer_fetch.item.bpm = (uint16_t)((t.bpm100 + 50u) / 100u);
-    s_peer_fetch.item.duration_ms = (uint32_t)t.duration_s * 1000u;
-    s_peer_fetch.generation = s_peer_status.generation;
-    s_peer_fetch.index = index;
-    if (!t.has_detail) {
+    snprintf(f->item.artist, sizeof(f->item.artist), "%s", t.artist);
+    f->item.rekordbox_track_id = t.rekordbox_id;
+    f->item.bpm = (uint16_t)((t.bpm100 + 50u) / 100u);
+    f->item.duration_ms = (uint32_t)t.duration_s * 1000u;
+    f->generation = s_peer_status.generation;
+    f->index = index;
+    if (!t.has_detail && index != UINT32_MAX) {
         /* v307: the list rows carry no artist (vynull lists title + BPM);
          * the metadata request does, and a network load-track's row is
          * rarely on the visible page that asks for it. */
-        dj_link_browse_want_detail_row(s_peer_fetch.generation, index, t.rekordbox_id);
+        dj_link_browse_want_detail_row(f->generation, index, t.rekordbox_id);
     }
     ESP_LOGW(TAG, "peer load: deck %u <- player #%u rekordbox id %u \"%s\" - downloading",
-             (unsigned)deck + 1u, (unsigned)s_library_peer, (unsigned)t.rekordbox_id,
-             s_peer_fetch.item.title);
+             (unsigned)deck + 1u, (unsigned)peer, (unsigned)t.rekordbox_id,
+             f->item.title);
     ui_library_status_hold("DOWNLOADING", COL_ACCENT, 1500);
     ui_library_populate_rows();
     return NULL;
@@ -1458,32 +1497,42 @@ static void ui_library_peer_load(uint8_t deck)
     bool have = ui_library_peer_status_current() &&
                 dj_link_browse_get_track(s_peer_status.generation,
                                          (uint32_t)s_selected_track_idx, &t);
-    (void)ui_library_peer_fetch_begin(deck, have ? &t : NULL, (uint32_t)s_selected_track_idx);
+    (void)ui_library_peer_fetch_begin(deck, s_library_peer, s_library_peer_slot,
+                                      have ? &t : NULL, (uint32_t)s_selected_track_idx);
 }
 
 /* v298: a network load-track for a track of another player (vynull loading
  * its collection onto one of our players). It is downloaded like LOAD on
- * that row, so the source must be the one the Library browses and the row
- * listed: it gives the metadata and the audio check. Returns NULL once
- * the download started. */
+ * that row. v333: the download has its own dbserver session, so the source
+ * need not be browsed nor the row listed: a listed row gives its metadata
+ * at once, otherwise the job's metadata request does (dj_link_fetch_status_t
+ * meta) and the title shows "TRACK <id>" meanwhile. Returns NULL once the
+ * download started. */
 static const char *ui_library_remote_peer_load(const dj_link_load_request_t *req, uint8_t deck)
 {
-    if (req->source_number != s_library_peer || req->source_slot != s_library_peer_slot ||
-        !ui_library_peer_status_current()) {
-        return "source not browsed";
-    }
-    if (ui_library_peer_fetch_active() && s_peer_fetch.peer == req->source_number &&
-        s_peer_fetch.rekordbox_id == req->rekordbox_id && s_peer_fetch.deck == deck) {
+    const ui_peer_fetch_t *same = ui_library_peer_fetch_find(req->source_number,
+                                                             req->rekordbox_id);
+    if (same && same->deck == deck) {
         return NULL;   /* the duplicate 0x19 of a pair, or a resend */
     }
     dj_link_peer_track_t t;
-    for (uint32_t i = 0; i < s_peer_status.count; i++) {
-        if (dj_link_browse_get_track(s_peer_status.generation, i, &t) &&
-            t.kind == DJ_LINK_PEER_ROW_TRACK && t.rekordbox_id == req->rekordbox_id) {
-            return ui_library_peer_fetch_begin(deck, &t, i);
+    if (req->source_number == s_library_peer && req->source_slot == s_library_peer_slot &&
+        ui_library_peer_status_current()) {
+        for (uint32_t i = 0; i < s_peer_status.count; i++) {
+            if (dj_link_browse_get_track(s_peer_status.generation, i, &t) &&
+                t.kind == DJ_LINK_PEER_ROW_TRACK && t.rekordbox_id == req->rekordbox_id) {
+                return ui_library_peer_fetch_begin(deck, req->source_number, req->source_slot,
+                                                   &t, i);
+            }
         }
     }
-    return "track not listed";
+    memset(&t, 0, sizeof(t));
+    t.rekordbox_id = req->rekordbox_id;
+    t.kind = DJ_LINK_PEER_ROW_TRACK;
+    t.audio = DJ_LINK_PEER_AUDIO_NFS;   /* every player's USB / collection is */
+    snprintf(t.title, sizeof(t.title), "TRACK %u", (unsigned)req->rekordbox_id);
+    return ui_library_peer_fetch_begin(deck, req->source_number, req->source_slot, &t,
+                                       UINT32_MAX);
 }
 #endif
 
@@ -1661,8 +1710,13 @@ static void library_source_event_cb(lv_event_t *e)
 {
     (void)e;
     if (ui_library_peer_fetch_active()) {
-        /* v249: SOURCE reads CANCEL while a peer track downloads. */
-        dj_link_fetch_cancel(s_peer_fetch.id);
+        /* v249: SOURCE reads CANCEL while a peer track downloads (v335:
+         * every deck's, the queued one too). */
+        for (uint8_t d = 0; d < DECK_CORE_DECK_COUNT; d++) {
+            if (s_peer_fetches[d].id != 0u) {
+                dj_link_fetch_cancel(s_peer_fetches[d].id);
+            }
+        }
         ui_library_status_hold("CANCELLING", COL_AMBER, 1200);
         return;
     }
@@ -1702,9 +1756,9 @@ static void library_source_event_cb(lv_event_t *e)
     ui_library_status_hold(status, COL_ACCENT, 1200);
 }
 
-static void ui_library_peer_fetch_clear(void)
+static void ui_library_peer_fetch_clear(ui_peer_fetch_t *f)
 {
-    memset(&s_peer_fetch, 0, sizeof(s_peer_fetch));
+    memset(f, 0, sizeof(*f));
     ui_library_populate_rows();
 }
 
@@ -1719,21 +1773,30 @@ static bool ui_library_peer_row_detail(uint32_t generation, uint32_t index,
 
 /* v307: complete the download's deck metadata from its row's metadata
  * reply, which may land after LOAD snapshotted the row. */
-static void ui_library_peer_fetch_refresh_item(void)
+static void ui_library_peer_fetch_refresh_item(ui_peer_fetch_t *f,
+                                               const dj_link_fetch_status_t *st)
 {
     dj_link_peer_track_t t;
-    if (!ui_library_peer_row_detail(s_peer_fetch.generation, s_peer_fetch.index,
-                                    s_peer_fetch.rekordbox_id, &t)) {
+    /* v333/v334: the job's own metadata answer first - asked on every load,
+     * cache hit included, so it is what the source holds now - else the
+     * browse row's. */
+    const bool from_job = st && st->has_meta && st->meta.rekordbox_id == f->rekordbox_id;
+    if (from_job) {
+        t = st->meta;
+    } else if (!ui_library_peer_row_detail(f->generation, f->index, f->rekordbox_id, &t)) {
         return;
     }
-    media_catalog_track_t *item = &s_peer_fetch.item;
+    media_catalog_track_t *item = &f->item;
+    if (from_job && t.title[0]) {
+        snprintf(item->title, sizeof(item->title), "%s", t.title);
+    }
     if (t.artist[0]) {
         snprintf(item->artist, sizeof(item->artist), "%s", t.artist);
     }
-    if (item->bpm == 0u && t.bpm100 != 0u) {
+    if ((from_job || item->bpm == 0u) && t.bpm100 != 0u) {
         item->bpm = (uint16_t)((t.bpm100 + 50u) / 100u);
     }
-    if (item->duration_ms == 0u) {
+    if ((from_job || item->duration_ms == 0u) && t.duration_s != 0u) {
         item->duration_ms = (uint32_t)t.duration_s * 1000u;
     }
 }
@@ -1763,68 +1826,77 @@ static void ui_library_poll_peer_late(void)
     memset(&s_peer_late, 0, sizeof(s_peer_late));
 }
 
-/* The download is complete: load the cached file like a local track. */
-static void ui_library_load_peer_file(const dj_link_fetch_status_t *st)
+/* The download is complete: load the cached file like a local track.
+ * v335: false while another load is still running (the other deck's
+ * download finished just before): poll again, do not drop it. */
+static bool ui_library_load_peer_file(ui_peer_fetch_t *f, const dj_link_fetch_status_t *st)
 {
-    uint8_t deck = s_peer_fetch.deck;
+    uint8_t deck = f->deck;
+    if (media_io_gate_is_available() &&
+        (media_catalog_load_in_progress() || ui_library_track_load_busy())) {
+        return false;
+    }
     const char *refusal = NULL;
     if (!media_io_gate_is_available()) {
         refusal = "LOCAL USB NEEDED";
-    } else if (media_catalog_load_in_progress() || !ui_library_try_begin_track_load()) {
+    } else if (!ui_library_try_begin_track_load()) {
         refusal = "LOAD BUSY";
     }
     if (refusal) {
         /* The file stays cached: LOAD again finds it without downloading. */
         ESP_LOGW(TAG, "peer load: %s ready but %s", st->path, refusal);
         ui_library_status_hold(refusal, COL_AMBER, 2500);
-        return;
+        return true;
     }
-    ui_library_peer_fetch_refresh_item();
-    media_catalog_track_t item = s_peer_fetch.item;
+    ui_library_peer_fetch_refresh_item(f, st);
+    media_catalog_track_t item = f->item;
     item.track_key = st->track_key;
     ESP_LOGW(TAG, "peer load: deck %u <- %s%s", (unsigned)deck + 1u, st->path,
              st->cache_hit ? " (cached)" : "");
     if (ui_submit_track_load(-1, st->track_key, media_catalog_generation(), deck,
                              &item, st->path) == ESP_OK) {
         s_peer_load_ui_id = ui_library_active_track_load_id();
-        s_peer_load_source.peer = s_peer_fetch.peer;
-        s_peer_load_source.slot = s_peer_fetch.slot;
+        s_peer_load_source.peer = f->peer;
+        s_peer_load_source.slot = f->slot;
         memset(&s_peer_late, 0, sizeof(s_peer_late));
-        if (item.artist[0] == '\0') {
+        if (item.artist[0] == '\0' && f->index != UINT32_MAX) {
             s_peer_late.deck = deck;
-            s_peer_late.generation = s_peer_fetch.generation;
-            s_peer_late.index = s_peer_fetch.index;
-            s_peer_late.rekordbox_id = s_peer_fetch.rekordbox_id;
+            s_peer_late.generation = f->generation;
+            s_peer_late.index = f->index;
+            s_peer_late.rekordbox_id = f->rekordbox_id;
         }
         ui_library_status_hold("LOADING", COL_ACCENT, 1500);
     }
+    return true;
 }
 
-/* ui_update(): follow the download started by a peer LOAD. */
-static void ui_library_poll_peer_fetch(void)
+/* ui_update(): follow one deck's download started by a peer LOAD. */
+static void ui_library_poll_peer_fetch_deck(ui_peer_fetch_t *f)
 {
-    if (!ui_library_peer_fetch_active()) {
+    if (f->id == 0u) {
         return;
     }
     dj_link_fetch_status_t st;
-    dj_link_fetch_get_status(&st);
-    if (st.id != s_peer_fetch.id) {
-        ui_library_peer_fetch_clear();
+    if (!dj_link_fetch_get_status(f->id, &st)) {
+        ui_library_peer_fetch_clear(f);
         return;
     }
-    if (st.state == DJ_LINK_FETCH_PDB || st.state == DJ_LINK_FETCH_AUDIO) {
+    if (st.state == DJ_LINK_FETCH_QUEUED || st.state == DJ_LINK_FETCH_PDB ||
+        st.state == DJ_LINK_FETCH_AUDIO) {
         uint32_t now_ms = lv_tick_get();
-        if ((st.state != s_peer_fetch.state || st.percent != s_peer_fetch.percent) &&
+        if ((st.state != f->state || st.percent != f->percent) &&
             (uint32_t)(now_ms - s_peer_repaint_ms) >= UI_PEER_REPAINT_MS) {
-            s_peer_fetch.state = st.state;
-            s_peer_fetch.percent = st.percent;
+            f->state = st.state;
+            f->percent = st.percent;
             s_peer_repaint_ms = now_ms;
             ui_library_populate_rows();
         }
         return;
     }
     if (st.state == DJ_LINK_FETCH_DONE) {
-        ui_library_load_peer_file(&st);
+        if (!ui_library_load_peer_file(f, &st)) {
+            return;
+        }
     } else if (st.state == DJ_LINK_FETCH_CANCELLED) {
         ui_library_status_hold("DOWNLOAD CANCELLED", COL_AMBER, 2000);
     } else {
@@ -1833,7 +1905,14 @@ static void ui_library_poll_peer_fetch(void)
         ESP_LOGW(TAG, "peer load: download failed: %s", text);
         ui_library_status_hold(text, COL_RED, 3500);
     }
-    ui_library_peer_fetch_clear();
+    ui_library_peer_fetch_clear(f);
+}
+
+static void ui_library_poll_peer_fetch(void)
+{
+    for (uint8_t d = 0; d < DECK_CORE_DECK_COUNT; d++) {
+        ui_library_poll_peer_fetch_deck(&s_peer_fetches[d]);
+    }
 }
 
 /* ui_update(): follow the dj_link cache. Rows are re-read only when the
@@ -2273,12 +2352,13 @@ static void ui_library_djui_fill_row(int visible_row, int track_index)
         } else if (ui_library_peer_status_current() &&
             dj_link_browse_get_track(s_peer_status.generation, (uint32_t)track_index, &t)) {
             ui_library_peer_badge(&t, p->badge[visible_row], sizeof(p->badge[visible_row]));
-            if (ui_library_peer_fetch_active() && s_peer_fetch.peer == s_library_peer &&
-                s_peer_fetch.rekordbox_id == t.rekordbox_id) {
+            const ui_peer_fetch_t *f = ui_library_peer_fetch_find(s_library_peer, t.rekordbox_id);
+            if (f) {
                 row->badge_tone = DJ_TONE_OK;
-                /* v307: the download bar; empty while the export.pdb is read */
+                /* v307: the download bar; empty while the export.pdb is read
+                 * (v335: or while it waits for the other deck's) */
                 row->has_progress = true;
-                row->progress = s_peer_fetch.state == DJ_LINK_FETCH_AUDIO ? s_peer_fetch.percent : 0u;
+                row->progress = f->state == DJ_LINK_FETCH_AUDIO ? f->percent : 0u;
             } else if (t.audio != DJ_LINK_PEER_AUDIO_NFS) {
                 row->badge_tone = DJ_TONE_MUTED;
             }
@@ -2368,9 +2448,11 @@ static void ui_library_djui_source_text(char *out, size_t len)
         } else if (!ui_library_peer_fetch_active()) {
             snprintf(out, len, "USB %s #%u  LOAD = DOWNLOAD", name, (unsigned)st->peer);
         } else {
+            const ui_peer_fetch_t *f = ui_library_peer_fetch_shown();
             snprintf(out, len, "USB %s #%u  %s %u%%", name, (unsigned)st->peer,
-                     s_peer_fetch.state == DJ_LINK_FETCH_AUDIO ? "DOWNLOAD" : "READING DB",
-                     (unsigned)s_peer_fetch.percent);
+                     f->state == DJ_LINK_FETCH_AUDIO    ? "DOWNLOAD" :
+                     f->state == DJ_LINK_FETCH_QUEUED   ? "QUEUED" : "READING DB",
+                     (unsigned)f->percent);
         }
         break;
     case DJ_LINK_BROWSE_FAILED:
@@ -2512,7 +2594,7 @@ static void ui_library_djui_publish(const ui_frame_context_t *ctx)
                      s_deck_loaded_track_valid[d] ? "" : ", none");
     }
     if (ui_library_peer_fetch_active()) {
-        v.progress = (int16_t)s_peer_fetch.percent;
+        v.progress = (int16_t)ui_library_peer_fetch_shown()->percent;
         v.source_label = "CANCEL";
     } else {
         v.source_label = "SOURCE";
@@ -2584,17 +2666,10 @@ void ui_library_djui_on_load(uint8_t deck, uint8_t row)
  * second tap reverses it, a third goes back to the player's order. Each
  * step lists the player again (new generation, selection on the first row);
  * the lit column follows the list actually served. */
-/* v311: a new list restarts the player's dbserver session, which a peer
- * download also uses (path, analysis, artwork): not while one runs. */
-static bool ui_library_peer_relist_refused(void)
-{
-    if (ui_library_peer_fetch_active()) {
-        ui_library_status_hold("DOWNLOAD BUSY", COL_AMBER, 1200);
-        return true;
-    }
-    return false;
-}
-
+/* v311 refused a new list while a download ran: it restarted the browse
+ * session, which the download used too. v335: the download has its own
+ * session since v333, so the Library lists, sorts and opens playlists
+ * during a download (to pick the other deck's track). */
 /* v311: list the level s_peer_nav shows, selection on `selected`. */
 static void ui_library_peer_relist(int32_t selected)
 {
@@ -2624,9 +2699,6 @@ static bool ui_library_peer_open_row(uint32_t index)
         t.kind == DJ_LINK_PEER_ROW_TRACK) {
         return false;
     }
-    if (ui_library_peer_relist_refused()) {
-        return true;
-    }
     int32_t selected = (int32_t)index;
     const ui_peer_nav_kind_t kind = t.kind == DJ_LINK_PEER_ROW_FOLDER ? UI_PEER_NAV_FOLDER
                                                                       : UI_PEER_NAV_PLAYLIST;
@@ -2643,9 +2715,6 @@ static void ui_library_djui_on_peer_sort(uint8_t sort)
     if (s_peer_nav.depth != 0u) {
         /* Playlists keep the player's order. */
         ui_library_status_hold("SORT: ALL TRACKS ONLY", COL_AMBER, 1200);
-        return;
-    }
-    if (ui_library_peer_relist_refused()) {
         return;
     }
     static const uint8_t k_codes[] = {
@@ -2759,9 +2828,10 @@ void ui_library_update(const ui_frame_context_t *ctx)
 bool ui_library_deck_load_progress(uint8_t deck, uint8_t *percent, bool *db)
 {
 #ifndef WIN32
-    if (ui_library_peer_fetch_active() && s_peer_fetch.deck == ui_library_deck_index(deck)) {
-        if (percent) *percent = s_peer_fetch.state == DJ_LINK_FETCH_AUDIO ? s_peer_fetch.percent : 0u;
-        if (db) *db = s_peer_fetch.state != DJ_LINK_FETCH_AUDIO;
+    const ui_peer_fetch_t *f = &s_peer_fetches[ui_library_deck_index(deck)];
+    if (f->id != 0u) {
+        if (percent) *percent = f->state == DJ_LINK_FETCH_AUDIO ? f->percent : 0u;
+        if (db) *db = f->state != DJ_LINK_FETCH_AUDIO;
         return true;
     }
 #else

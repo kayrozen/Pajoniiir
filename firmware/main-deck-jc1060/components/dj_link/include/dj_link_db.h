@@ -218,6 +218,11 @@ void dj_link_db_init(dj_link_db_t *c, const dj_link_db_io_t *io, uint32_t max_tr
  * player our_number. Closes any previous session, then connects and lists. */
 void dj_link_db_start(dj_link_db_t *c, uint32_t peer_ip, uint8_t peer_number,
                       uint8_t slot, uint8_t our_number, uint32_t now_ms);
+/* v333: the same session without the listing, for the download job: the
+ * owner only asks paths, blobs and the metadata of its track (io.next_detail
+ * / io.track with detail true). list_begin is never called. */
+void dj_link_db_start_service(dj_link_db_t *c, uint32_t peer_ip, uint8_t peer_number,
+                              uint8_t slot, uint8_t our_number, uint32_t now_ms);
 /* Close the connection (if any) and go IDLE. */
 void dj_link_db_stop(dj_link_db_t *c);
 /* v310: the sort order of the next listing (DJ_LINK_DB_SORT_*). Set it

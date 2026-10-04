@@ -132,6 +132,7 @@ typedef struct {
     uint32_t isoc_cycles;
     uint32_t isoc_max_cycles;
     uint32_t isoc_submit_cycles;  /* part of isoc_cycles */
+    uint32_t isoc_prep_cycles;    /* v329: packet preparation, part of isoc_cycles */
 } controller_usb_host_work_t;
 
 esp_err_t controller_usb_host_init(const controller_usb_host_config_t *config);

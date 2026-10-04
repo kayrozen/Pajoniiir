@@ -834,6 +834,28 @@ static void test_big_fetch_with_losses(sink_t *sink)
     CHECK_EQ((uint32_t)m.read_calls, (BIG_SIZE + DJLINK_NFS_MAXDATA - 1u) / DJLINK_NFS_MAXDATA + 1u);
     CHECK(content_ok(sink, 8, BIG_SIZE));
 
+    /* v332 firmware setting (JC1060 dj_link.c): 4 KiB reads, 2 in flight,
+     * one reply lost and one duplicated. */
+    mock_reset();
+    pthread_mutex_lock(&s_mock_lock);
+    s_mock.drop_reply = 7;
+    s_mock.dup_reply = 50;
+    pthread_mutex_unlock(&s_mock_lock);
+    cfg.read_size = 4096u;
+    cfg.window = 2;
+    cfg.window_buf_len = 2u * 4096u;
+    t0 = now_ms();
+    CHECK_EQ(run_fetch(&cfg, sink), DJLINK_NFS_DONE);
+    m = mock_get();
+    printf("  1.5 MiB / 4096 x2: %u ms, %u READs, %u retransmits\n",
+           now_ms() - t0, m.read_calls, s_client.retransmits);
+    CHECK_EQ(s_client.window, 2);
+    CHECK_EQ(m.max_count, 4096);
+    CHECK_EQ(s_client.retransmits, 1);
+    CHECK_EQ((uint32_t)m.read_calls, (BIG_SIZE + 4095u) / 4096u + 1u);
+    CHECK_EQ(sink->order_errors, 0);
+    CHECK(content_ok(sink, 8, BIG_SIZE));
+
     /* The window is capped by the reorder buffer. */
     mock_reset();
     base_cfg(&cfg, "/small.bin");

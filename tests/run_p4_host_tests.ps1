@@ -1304,6 +1304,63 @@ $tests = @(
         )
     },
     @{
+        # JC1060 windowed-sinc resampler (v325): latency, hold, drift,
+        # 44.1 -> 48 kHz highs/image gate, pitch-change and reset continuity.
+        Name = "audio_resampler_jc1060"
+        Dir = "tests/audio_resampler_jc1060"
+        Target = "test_audio_resampler_jc1060.exe"
+        Args = @(
+            "-Wall", "-Wextra", "-Wpedantic", "-Werror=implicit-function-declaration", "-std=c99", "-O2",
+            "-I../../firmware/main-deck-jc1060/components/audio_engine/include",
+            "-I../../firmware/main-deck-jc1060/components/audio_engine",
+            "-o", "test_audio_resampler_jc1060.exe",
+            "test_audio_resampler_jc1060.c",
+            "../../firmware/main-deck-jc1060/components/audio_engine/audio_resampler.c",
+            "-lm"
+        )
+    },
+    @{
+        # JC1060 Master Tempo WSOLA v2 (v326): unity bit-exactness, tempo
+        # consumption/pitch, end of source, seek restart, tempo-move clicks,
+        # 5-minute drift, objective A/B against v1 at 1.00/0.94/1.06.
+        Name = "audio_keylock_wsola2_jc1060"
+        Dir = "tests/audio_keylock_wsola2_jc1060"
+        Target = "test_audio_keylock_wsola2_jc1060.exe"
+        Args = @(
+            "-Wall", "-Wextra", "-Wpedantic", "-Werror=implicit-function-declaration", "-std=c99", "-O2",
+            "-I../../firmware/main-deck-jc1060/components/audio_engine/include",
+            "-I../../firmware/main-deck-jc1060/components/audio_engine",
+            "-o", "test_audio_keylock_wsola2_jc1060.exe",
+            "test_audio_keylock_wsola2_jc1060.c",
+            "../../firmware/main-deck-jc1060/components/audio_engine/audio_keylock_wsola2.c",
+            "../../firmware/main-deck-jc1060/components/audio_engine/audio_keylock.c",
+            "../../firmware/main-deck-jc1060/components/audio_engine/audio_resampler.c",
+            "-lm"
+        )
+    },
+    @{
+        # JC1060 v328 start fade-in and PLAY start probe (audio_output_mixer.c).
+        Name = "audio_start_ramp_jc1060"
+        Dir = "tests/audio_start_ramp_jc1060"
+        Target = "test_audio_start_ramp_jc1060.exe"
+        Args = @(
+            "-Wall", "-Wextra", "-Wpedantic", "-Werror=implicit-function-declaration", "-std=c99",
+            "-I../../firmware/main-deck-jc1060/components/audio_engine/include",
+            "-o", "test_audio_start_ramp_jc1060.exe",
+            "test_audio_start_ramp_jc1060.c",
+            "../../firmware/main-deck-jc1060/components/audio_engine/audio_output_mixer.c",
+            "../../firmware/main-deck-jc1060/components/audio_engine/audio_mixer.c",
+            "../../firmware/main-deck-jc1060/components/audio_engine/audio_eq.c",
+            "../../firmware/main-deck-jc1060/components/audio_engine/audio_filter.c",
+            "../../firmware/main-deck-jc1060/components/audio_engine/audio_flanger_fx.c",
+            "../../firmware/main-deck-jc1060/components/audio_engine/audio_delay_fx.c",
+            "../../firmware/main-deck-jc1060/components/audio_engine/audio_pad_fx.c",
+            "../../firmware/main-deck-jc1060/components/audio_engine/audio_resampler.c",
+            "../../firmware/main-deck-jc1060/components/audio_engine/audio_smart_cfx.c",
+            "-lm"
+        )
+    },
+    @{
         Name = "hot_cue_store_jc1060"
         Dir = "tests/hot_cue_store_jc1060"
         Target = "test_hot_cue_store_jc1060.exe"

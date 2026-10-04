@@ -819,6 +819,15 @@ void dj_link_db_start(dj_link_db_t *c, uint32_t peer_ip, uint8_t peer_number,
     connect_to(c, c->discovery_port, DJ_LINK_DB_DISC_CONNECTING, now_ms);
 }
 
+void dj_link_db_start_service(dj_link_db_t *c, uint32_t peer_ip, uint8_t peer_number,
+                              uint8_t slot, uint8_t our_number, uint32_t now_ms)
+{
+    dj_link_db_start(c, peer_ip, peer_number, slot, our_number, now_ms);
+    if (c->phase != DJ_LINK_DB_FAILED) {
+        c->list_done = true;   /* nothing to list: paths, blobs and metadata only */
+    }
+}
+
 void dj_link_db_set_sort(dj_link_db_t *c, uint8_t sort)
 {
     if (c) {

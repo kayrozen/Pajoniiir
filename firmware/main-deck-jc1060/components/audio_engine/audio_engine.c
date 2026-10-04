@@ -39,6 +39,7 @@
 #include "audio_fw_task_plan.h"
 #include "audio_censor.h"
 #include "audio_keylock.h"
+#include "audio_keylock_wsola2.h"
 #include "audio_mixer.h"
 #include "audio_output_mixer.h"
 #include "audio_output_sink.h"
@@ -708,6 +709,11 @@ static uint32_t deck_pcm_drop_newest(uint8_t deck, uint32_t frames)
         : audio_pcm_ring_drop_newest(&s_pcm_rings[deck], frames);
 }
 
+/* v328 start probe: when the cue pre-roll of each deck was last published
+ * (0 = none since the deck last started). Written by the decode task, read
+ * and cleared by the output task; a torn read only skews one log value. */
+static int64_t s_preroll_ready_us[AUDIO_ENGINE_DECK_COUNT];
+
 /* Decode task only. Output is gated while pending, so moving play_seq here
  * cannot race a consumer; key-lock re-seeds from it on the first render.
  * force: the producer cannot write further (source EOF, or no room under the
@@ -742,6 +748,7 @@ static void ae_cue_preroll_publish(uint8_t deck, audio_engine_state_t *eng, bool
             ? eng->output_base_ms - short_ms : 0u;
     }
     __atomic_store_n(&eng->timeline_preroll.pending, false, __ATOMIC_RELEASE);
+    s_preroll_ready_us[deck] = esp_timer_get_time();
     ESP_LOGI(TAG, "cue pre-roll D%u ready: history=%u frames target=%u ms%s",
              (unsigned)deck, (unsigned)playhead, (unsigned)eng->output_base_ms,
              playhead < eng->timeline_preroll.frames ? " (forced short)" : "");
@@ -1378,10 +1385,41 @@ static audio_fw_task_context_t s_fw_task_contexts[AUDIO_ENGINE_DECK_COUNT];
 #if AE_FW
 static audio_resampler_state_t s_resamplers[AUDIO_ENGINE_DECK_COUNT];
 static audio_keylock_t s_keylocks[AUDIO_ENGINE_DECK_COUNT];
+#if CONFIG_AUDIO_KEYLOCK_WSOLA2 || CONFIG_AUDIO_KEYLOCK_AB_DECK1
+#define AE_KEYLOCK_V2 1
+/* v326 WSOLA v2 state (~6.4 KB per deck: correlation buffers) in PSRAM; the
+ * internal heap is kept for DMA. Touched only by the output task. */
+static EXT_RAM_BSS_ATTR audio_keylock2_t s_keylocks2[AUDIO_ENGINE_DECK_COUNT];
+#else
+#define AE_KEYLOCK_V2 0
+#endif
 static bool s_master_tempo_enabled[AUDIO_ENGINE_DECK_COUNT];
 static uint32_t         s_master_tempo_command_epoch[AUDIO_ENGINE_DECK_COUNT];
 static uint32_t         s_master_tempo_applied_epoch[AUDIO_ENGINE_DECK_COUNT];
 static uint32_t s_keylock_generation[AUDIO_ENGINE_DECK_COUNT];
+
+/* Which Master Tempo algorithm a deck runs (CONFIG_AUDIO_KEYLOCK_ALGO). */
+static inline AE_RT_ATTR bool ae_keylock_uses_v2(uint8_t deck)
+{
+#if CONFIG_AUDIO_KEYLOCK_WSOLA2
+    (void)deck;
+    return true;
+#elif CONFIG_AUDIO_KEYLOCK_AB_DECK1
+    return deck == AE_DECK_0;
+#else
+    (void)deck;
+    return false;
+#endif
+}
+
+/* Next render restarts the key lock at the playhead (seek, EOF, MT toggle). */
+static inline void ae_keylock_invalidate(uint8_t deck)
+{
+    s_keylocks[deck].initialized = false;
+#if AE_KEYLOCK_V2
+    s_keylocks2[deck].initialized = false;
+#endif
+}
 
 /* Defined here, immediately after the DSP storage it mutates. It used to sit
  * several hundred lines earlier, which is why the build routed audio_engine.c
@@ -1399,7 +1437,7 @@ static void audio_output_apply_master_tempo_commands(void)
         }
         /* Output task is the sole owner of keylock/resampler DSP mutation. The
          * command takes effect exactly at an audio-block boundary. */
-        s_keylocks[deck].initialized = false;
+        ae_keylock_invalidate(deck);
         audio_resampler_reset(&s_resamplers[deck]);
         s_master_tempo_applied_epoch[deck] = epoch;
     }
@@ -1432,12 +1470,25 @@ static AE_RT_ATTR bool ae_keylock_render_cb(void *ctx, float tempo_factor,
         atomic_load_bool(&s_start_seek_pending[deck])) return false;
     audio_pcm_timeline_t *timeline = &s_pcm_timelines[deck];
     uint32_t generation = audio_pcm_timeline_generation(timeline);
+    uint64_t play_seq = audio_pcm_timeline_play_seq(timeline);
+#if AE_KEYLOCK_V2
+    if (ae_keylock_uses_v2(deck)) {
+        audio_keylock2_t *k2 = &s_keylocks2[deck];
+        if (!k2->initialized || s_keylock_generation[deck] != generation) {
+            audio_keylock2_reset(k2, play_seq);
+            s_keylock_generation[deck] = generation;
+        }
+        audio_keylock2_configure(k2, tempo_factor, rate_ratio);
+        if (!audio_keylock2_next(k2, keylock_timeline_read, ctx,
+                                 out, out_consumed, &play_seq)) return false;
+        return audio_pcm_timeline_set_playhead_output_owner(timeline, play_seq);
+    }
+#endif
     if (!s_keylocks[deck].initialized || s_keylock_generation[deck] != generation) {
-        audio_keylock_reset(&s_keylocks[deck], audio_pcm_timeline_play_seq(timeline));
+        audio_keylock_reset(&s_keylocks[deck], play_seq);
         s_keylock_generation[deck] = generation;
     }
     audio_keylock_configure(&s_keylocks[deck], tempo_factor, rate_ratio);
-    uint64_t play_seq = audio_pcm_timeline_play_seq(timeline);
     if (!audio_keylock_next(&s_keylocks[deck], keylock_timeline_read, ctx,
                             out, out_consumed, &play_seq)) return false;
     return audio_pcm_timeline_set_playhead_output_owner(timeline, play_seq);
@@ -1453,6 +1504,7 @@ enum {
     AE_RT_EV_EOF_DRAIN = 1,
     AE_RT_EV_START_GATE,
     AE_RT_EV_SINK_FAULT,
+    AE_RT_EV_START_PROBE,
 };
 
 typedef struct {
@@ -1460,6 +1512,11 @@ typedef struct {
     uint8_t deck;
     int32_t a;
     int32_t b;
+    /* AE_RT_EV_START_PROBE only (see ae_start_probe_post). */
+    int32_t c;
+    int32_t d;
+    int32_t e;
+    int32_t f;
 } ae_rt_event_t;
 
 static void ae_rt_event_print(const ae_rt_event_t *ev)
@@ -1476,6 +1533,18 @@ static void ae_rt_event_print(const ae_rt_event_t *ev)
         ESP_LOGE(TAG, "output sink fault: main=%s hp=%s",
                  esp_err_to_name((esp_err_t)ev->a), esp_err_to_name((esp_err_t)ev->b));
         break;
+    case AE_RT_EV_START_PROBE:
+        /* v328: first 100 ms of a deck that became audible (raw source,
+         * before the start fade). */
+        ESP_LOGW(TAG, "PLAY D%u start: %s first %d/%d max step %u @%u "
+                 "(after fade %u) future %u hist %u preroll %d ms ago",
+                 (unsigned)ev->deck + 1u,
+                 (ev->f & 1) ? "keylock" : (ev->f & 2) ? "scratch" : "resampler",
+                 (int)(int16_t)((uint32_t)ev->c >> 16), (int)(int16_t)(ev->c & 0xFFFF),
+                 (unsigned)ev->a & 0xFFFFu, (unsigned)ev->b,
+                 (unsigned)((uint32_t)ev->a >> 16), (unsigned)ev->d,
+                 (unsigned)ev->e, (int)(ev->f >> 2));
+        break;
     default:
         break;
     }
@@ -1490,13 +1559,12 @@ static uint32_t s_rt_event_tail;
 static uint32_t s_rt_event_dropped;
 static TaskHandle_t s_log_task;
 
-static void ae_rt_log_event(uint8_t kind, uint8_t deck, int32_t a, int32_t b)
+static void ae_rt_post(const ae_rt_event_t *ev)
 {
     bool posted = false;
     portENTER_CRITICAL_SAFE(&s_rt_event_mux);
     if (s_rt_event_head - s_rt_event_tail < AE_RT_EVENT_SLOTS) {
-        s_rt_events[s_rt_event_head % AE_RT_EVENT_SLOTS] =
-            (ae_rt_event_t){ .kind = kind, .deck = deck, .a = a, .b = b };
+        s_rt_events[s_rt_event_head % AE_RT_EVENT_SLOTS] = *ev;
         s_rt_event_head++;
         posted = true;
     } else {
@@ -1504,6 +1572,12 @@ static void ae_rt_log_event(uint8_t kind, uint8_t deck, int32_t a, int32_t b)
     }
     portEXIT_CRITICAL_SAFE(&s_rt_event_mux);
     if (posted && s_log_task) xTaskNotifyGive(s_log_task);
+}
+
+static void ae_rt_log_event(uint8_t kind, uint8_t deck, int32_t a, int32_t b)
+{
+    const ae_rt_event_t ev = { .kind = kind, .deck = deck, .a = a, .b = b };
+    ae_rt_post(&ev);
 }
 
 static bool ae_rt_event_take(ae_rt_event_t *out, uint32_t *dropped)
@@ -1521,10 +1595,15 @@ static bool ae_rt_event_take(ae_rt_event_t *out, uint32_t *dropped)
     return taken;
 }
 #else
+static void ae_rt_post(const ae_rt_event_t *ev)
+{
+    ae_rt_event_print(ev);
+}
+
 static void ae_rt_log_event(uint8_t kind, uint8_t deck, int32_t a, int32_t b)
 {
     const ae_rt_event_t ev = { .kind = kind, .deck = deck, .a = a, .b = b };
-    ae_rt_event_print(&ev);
+    ae_rt_post(&ev);
 }
 #endif
 
@@ -1560,7 +1639,7 @@ static void complete_eof_drain_if_ready(uint8_t deck)
         atomic_store_bool(&eng->playback_finished, true);
         atomic_store_bool(&eng->playing, false);
         audio_resampler_reset(&s_resamplers[deck]);
-        s_keylocks[deck].initialized = false;
+        ae_keylock_invalidate(deck);
         ae_rt_log_event(AE_RT_EV_EOF_DRAIN, deck, 0, 0);
     }
     AE_UNLOCK();
@@ -4340,7 +4419,7 @@ static void ae_hb_report_print(const ae_hb_report_t *r)
              (unsigned)uac.packet_lost_frames,
              (unsigned)lim.limited_samples, (int)lim.peak_input_abs,
              (unsigned)isoc_cb, (unsigned)bna);
-    /* v323 diagnostics build: longest isoc completion gap and late (>= 6 ms)
+    /* v323 diagnostics build: longest isoc completion gap and late (>= 1.5 URB periods)
      * completions, tagged by overlapping SD write / read. */
     if (SD_IO_DIAG_ENABLED) {
         uint32_t gap_max_us = 0u, late = 0u, late_wr = 0u, late_rd = 0u;
@@ -4524,6 +4603,64 @@ static AE_RT_ATTR void ae_output_pace_sinkless(int64_t *deadline_us,
         vTaskDelay(1);
     }
 }
+
+#if AE_FW
+/* v328: start fade + PLAY start probe per deck (output task only). A deck
+ * that turns audible (inactive -> active) fades in and is probed for its
+ * first AUDIO_OUTPUT_START_PROBE_FRAMES; the result goes to ae_log. */
+static audio_output_start_ramp_t s_start_ramps[AUDIO_ENGINE_DECK_COUNT];
+static bool s_start_was_active[AUDIO_ENGINE_DECK_COUNT];
+static bool s_start_reporting[AUDIO_ENGINE_DECK_COUNT];
+static ae_rt_event_t s_start_report[AUDIO_ENGINE_DECK_COUNT];
+
+static AE_RT_ATTR void ae_start_ramp_update(audio_output_mixer_deck_t *d,
+                                            uint8_t deck)
+{
+    const bool was_active = s_start_was_active[deck];
+    s_start_was_active[deck] = d->active;
+    d->start_ramp = &s_start_ramps[deck];
+    if (!d->active || was_active) return;
+
+    audio_output_start_ramp_arm(&s_start_ramps[deck]);
+    int32_t hist = -1;
+    if (timeline_active(deck)) {
+        const audio_pcm_timeline_t *t = &s_pcm_timelines[deck];
+        hist = (int32_t)(audio_pcm_timeline_play_seq(t) -
+                         audio_pcm_timeline_oldest_seq(t));
+    }
+    int32_t since_ms = -1;
+    const int64_t ready = s_preroll_ready_us[deck];
+    if (ready != 0) {
+        since_ms = (int32_t)((esp_timer_get_time() - ready) / 1000);
+        s_preroll_ready_us[deck] = 0;
+    }
+    const int32_t path = d->scratch_active ? 2 : d->keylock_active ? 1 : 0;
+    s_start_report[deck] = (ae_rt_event_t){
+        .kind = AE_RT_EV_START_PROBE,
+        .deck = deck,
+        .d = (int32_t)deck_pcm_used(deck),
+        .e = hist,
+        .f = path | (int32_t)((uint32_t)since_ms << 2),
+    };
+    s_start_reporting[deck] = true;
+}
+
+/* After the mix: post the probe once its window is complete. */
+static AE_RT_ATTR void ae_start_probe_post(uint8_t deck)
+{
+    const audio_output_start_ramp_t *r = &s_start_ramps[deck];
+    if (!s_start_reporting[deck] || r->probe_left != 0u) return;
+    s_start_reporting[deck] = false;
+    ae_rt_event_t *ev = &s_start_report[deck];
+    const uint32_t step = r->max_step > 0xFFFFu ? 0xFFFFu : r->max_step;
+    const uint32_t late = r->max_step_late > 0xFFFFu ? 0xFFFFu : r->max_step_late;
+    ev->a = (int32_t)(step | (late << 16));
+    ev->b = (int32_t)r->max_step_at;
+    ev->c = (int32_t)(((uint32_t)(uint16_t)r->first.left << 16) |
+                      (uint32_t)(uint16_t)r->first.right);
+    ae_rt_post(ev);
+}
+#endif
 
 static AE_RT_ATTR void ae_output_task(void *arg)
 {
@@ -4753,6 +4890,10 @@ static AE_RT_ATTR void ae_output_task(void *arg)
             .scratch_ctx = &s_scratch_ctx_deck[deck1_index],
         };
         ae_wdt_trace(AUDIO_WDT_PHASE_SNAPSHOT, 4u);
+#if AE_FW
+        ae_start_ramp_update(&deck0, deck0_index);
+        ae_start_ramp_update(&deck1, deck1_index);
+#endif
 #if !defined(AUDIO_ENGINE_PC_TEST)
         s_audio_wdt_active_decks = (deck0.active ? 1u : 0u) |
                                    (deck1.active ? 2u : 0u);
@@ -4900,6 +5041,10 @@ static AE_RT_ATTR void ae_output_task(void *arg)
 #endif
         consumed[deck0_index] += s_scratch_handoff_consumed[deck0_index];
         consumed[deck1_index] += s_scratch_handoff_consumed[deck1_index];
+#if AE_FW
+        ae_start_probe_post(deck0_index);
+        ae_start_probe_post(deck1_index);
+#endif
         {
             int64_t now = esp_timer_get_time();
             ae_phase_note(AE_PH_MIX, now - phase_mark);
@@ -5604,7 +5749,7 @@ static esp_err_t audio_engine_play_for_deck(uint8_t deck)
         if (seek_rc != ESP_OK) return seek_rc;
 #if AE_FW
         audio_resampler_reset(&s_resamplers[deck]);
-        s_keylocks[deck].initialized = false;
+        ae_keylock_invalidate(deck);
 #endif
     }
 

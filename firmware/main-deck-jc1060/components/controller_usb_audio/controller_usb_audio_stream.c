@@ -39,7 +39,13 @@
 #define STREAM_BYTES_PER_SAMPLE 2u
 #define STREAM_RING_FRAMES 2048u
 #define STREAM_TRANSFER_COUNT 3u
-#define STREAM_PACKETS_PER_TRANSFER 4
+/* v329: 6 x 1-ms packets per URB (was 4). HIL v328: every isoc callback cost
+ * ~1.9 ms of controller-task time on core 1 (submit ~0.7 ms), so 250
+ * callbacks/s took ~45 % of the core before any MIDI, and completion gaps of
+ * 10-15 ms (> the 8 ms left queued behind a completion with 3 x 4 ms) were
+ * the audible crackles. 3 x 6 ms: 167 callbacks/s, 12 ms queued behind a
+ * completion (gap tolerance 18 ms), +6 ms output latency. */
+#define STREAM_PACKETS_PER_TRANSFER 6
 /* Accepted engine output rates. The engine picks 44.1 or 48 kHz from the
  * track (audio_output_select_sample_rate); a 48 kHz source is resampled to the
  * 44.1 kHz stream here, exactly like upstream. */
@@ -99,7 +105,8 @@
  * the engine is paced this way the write skips dup/trim (there is no second
  * clock left to track). 1280 frames (5/8) caps latency at ~29 ms; with
  * 256-frame blocks and 176-frame (4-packet) drains the ring bottoms out
- * around 670 frames, ~15 ms of margin for render spikes. */
+ * around 670 frames, ~15 ms of margin for render spikes (v329: 288-frame
+ * 6-packet drains, ~560 frames). */
 #define STREAM_PACE_CEILING_FRAMES ((STREAM_RING_FRAMES * 5u) / 8u)
 
 /* Subframe slot of each stereo pair in the 4-channel USB frame, in the
@@ -381,14 +388,16 @@ static uint32_t s_work_isoc_callbacks;
 static uint32_t s_work_isoc_cycles;
 static uint32_t s_work_isoc_max_cycles;
 static uint32_t s_work_isoc_submit_cycles;
+/* v329: packet preparation (ring read + 24-bit packing) before each submit. */
+static uint32_t s_work_isoc_prep_cycles;
 
 /* v323 cadence probe (residual download crackles with every engine/UAC
  * counter clean): completed URBs should arrive every
- * STREAM_PACKETS_PER_TRANSFER ms. A longer gap means the resubmit came late
+ * STREAM_PACKETS_PER_TRANSFER ms; "late" = 1.5x that. A longer gap means the resubmit came late
  * and the bus queue (STREAM_TRANSFER_COUNT URBs) ran short. Late gaps are
  * tagged with the SD transfer kind that overlapped them. Counters only,
  * diagnostics builds only (SD_IO_DIAG_ENABLED). */
-#define STREAM_ISOC_LATE_US 6000u
+#define STREAM_ISOC_LATE_US (STREAM_PACKETS_PER_TRANSFER * 1500u)
 static uint32_t s_isoc_last_us;
 static uint32_t s_isoc_gap_max_us;
 static uint32_t s_isoc_late;
@@ -402,6 +411,7 @@ static esp_err_t prepare_and_submit(usb_transfer_t *transfer)
         return ESP_ERR_INVALID_STATE;
     }
 
+    const uint32_t prep_start = esp_cpu_get_cycle_count();
     size_t offset = 0u;
     const uint8_t out_bps = s_format.bytes_per_sample;
     for (int packet = 0; packet < transfer->num_isoc_packets; ++packet) {
@@ -453,6 +463,8 @@ static esp_err_t prepare_and_submit(usb_transfer_t *transfer)
     transfer->num_bytes = (int)offset;
     s_isoc_active[index] = true;
     const uint32_t submit_start = esp_cpu_get_cycle_count();
+    __atomic_add_fetch(&s_work_isoc_prep_cycles, submit_start - prep_start,
+                       __ATOMIC_RELAXED);
     const esp_err_t rc = usb_host_transfer_submit(transfer);
     __atomic_add_fetch(&s_work_isoc_submit_cycles,
                        esp_cpu_get_cycle_count() - submit_start,
@@ -594,6 +606,11 @@ void controller_usb_audio_stream_get_work(uint32_t *callbacks,
                                       __ATOMIC_RELAXED);
     *submit_cycles = __atomic_load_n(&s_work_isoc_submit_cycles,
                                      __ATOMIC_RELAXED);
+}
+
+uint32_t controller_usb_audio_stream_get_prep_cycles(void)
+{
+    return __atomic_load_n(&s_work_isoc_prep_cycles, __ATOMIC_RELAXED);
 }
 
 void controller_usb_audio_stream_take_cadence(uint32_t *gap_max_us,

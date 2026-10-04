@@ -145,6 +145,10 @@ Phase 2 — virtual CDJ:
   "PAJONIIIR LIBRARY", track count, 500 ms per-querier limit, no reply when
   the library is empty. The advertised media cannot be browsed yet: we do not
   serve our own NFS export or dbserver (the v249 NFS code is a client only).
+- Since v333 a network load-track no longer needs the source to be browsed
+  nor the row to be listed: the download job opens its own dbserver session
+  (Phase 2c), and an unlisted row is titled `TRACK <id>` until the job's
+  metadata request (`0x2002`) answers with the title and artist.
 - Incoming load-track `19` is accepted only if it is unicast to us after we
   joined, and the source is our own USB (`0x28` = our number, `0x29` = USB).
   Loads from another player's slot are refused and logged (v248+).
@@ -274,6 +278,23 @@ Phase 2c — peer track download (NFS client, peer → us):
   driven through `tcpip_exec`.
   - All its buffers come from PSRAM and are allocated per job.
   - Nothing runs in LVGL or in the audio path.
+- v333: the job has its own dbserver session (`dj_link_db_start_service`, a
+  session without listing, on its own TCP PCB and 64 KiB PSRAM ring kept
+  between jobs). The file path of a rekordbox source (`0x2102`), the
+  analysis, cues, PWV4 and artwork, and the track's metadata (`0x2002`,
+  asked while nothing else is pending, e.g. during the audio download) all
+  go through it. Before, they went through the browse session, so changing
+  the Library source during a download failed it (`SOURCE CHANGED`) or
+  dropped its analysis. The session restarts once if it failed, and is
+  stopped when the job ends.
+- v335: one download per deck. A LOAD while the other deck downloads is
+  queued (`DJ_LINK_FETCH_QUEUED`, row badge `WAIT`, source line `QUEUED`)
+  and runs right after it, in request order. Not in parallel on purpose:
+  the SD writes, bounced through the 8 KB internal buffer since v322, take
+  about half of a download, so two transfers at once would not finish the
+  pair sooner and would double the job memory. The Library lists, sorts
+  and opens playlists during a download (it refused since v311, when the
+  download shared the browse session). SOURCE = CANCEL cancels both.
 - Steps of one LOAD:
   1. The job downloads `PIONEER/rekordbox/export.pdb` from the peer's USB
      export `/C/` to `/sd/djlcache/PEER.PDB`. It falls back to
@@ -317,7 +338,11 @@ Phase 2c — peer track download (NFS client, peer → us):
     file loads only while a local USB is present (`LOCAL USB NEEDED`).
   - READs are 1024 bytes because lwIP has no IP reassembly here. A 10 MB MP3
     therefore needs about 10 000 round trips, sent as a small window of
-    requests in flight.
+    requests in flight. Since v332 `CONFIG_LWIP_IP4_REASSEMBLY=y`
+    (`sdkconfig.defaults`) and READs are 4096 bytes, 2 in flight (3
+    fragments each: 6 reassembly pbufs of the 10 allowed, a ~9 KB burst in
+    the 20 x 512 B EMAC RX ring): about 2 500 round trips for 10 MB. Without
+    reassembly in the build the code keeps 1024 x 4.
   - The first LOAD after a new browse selection downloads `export.pdb` first,
     which is several MB on large libraries.
   - Since v300, a peer track gets its waveform and beat grid from the

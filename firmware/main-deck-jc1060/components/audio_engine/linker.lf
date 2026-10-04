@@ -17,6 +17,7 @@ entries:
     audio_delay_fx (noflash)
     audio_flanger_fx (noflash)
     audio_keylock (noflash)
+    audio_keylock_wsola2 (noflash)
     audio_scratch (noflash)
     audio_pcm_timeline (noflash)
     audio_pcm_ring (noflash)

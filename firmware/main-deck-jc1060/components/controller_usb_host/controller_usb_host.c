@@ -42,6 +42,15 @@ static const char *TAG = "controller_usb";
  * service through FreeRTOS time slicing and ae_output's explicit yield/block
  * points without increasing the audio ring or its cue latency. */
 #define CONTROLLER_USB_ACTIVE_PRIORITY 6u
+/* v329: the MIDI IN transfer is resubmitted from the task loop at most once
+ * per CONTROLLER_MIDI_IN_PACE_TICKS after its completion, not from the
+ * completion callback. HIL v328: during a jog/fader stream every completion
+ * carried 1 event and cost ~0.3 ms callback + ~0.27 ms submit on core 1 (~550
+ * per second), which with the isoc work left LVGL no time at all. The device
+ * keeps the events meanwhile; a 64-byte transfer returns up to 16 of them,
+ * so nothing is lost and MIDI latency grows by at most 3 ms. */
+#define CONTROLLER_MIDI_IN_PACE_TICKS 3u
+#define CONTROLLER_IDLE_WAIT_TICKS pdMS_TO_TICKS(100)
 /* v217 unplug/replug recovery. The root port is re-armed by the Host Library
  * only after every client has closed the gone device, so a close that stalls
  * leaves the controller root dead (no NEW_DEV, no MIDI, no UAC). After
@@ -168,6 +177,8 @@ typedef struct {
     bool opened;
     bool claimed;
     bool in_active;
+    bool in_resubmit_due;        /* v329: completed, resubmit when paced */
+    TickType_t in_done_tick;
     bool out_active;
     bool closing;
     bool device_gone;
@@ -765,10 +776,39 @@ static void midi_in_callback_body(usb_transfer_t *transfer)
     }
 
     if (!state->closing && !terminal) {
-        const esp_err_t rc = submit_in_if_idle(state);
-        if (rc != ESP_OK) {
-            ESP_LOGW(TAG, "MIDI IN resubmit: %s", esp_err_to_name(rc));
-        }
+        /* v329: resubmitted by the task loop (submit_in_paced). */
+        state->in_done_tick = xTaskGetTickCount();
+        state->in_resubmit_due = true;
+    }
+}
+
+/* Ticks until the paced MIDI IN resubmit is due (0 = now), or the idle wait
+ * when none is pending. Task loop only. */
+static TickType_t midi_in_pace_wait(const controller_state_t *state)
+{
+    if (!state->in_resubmit_due || state->closing) {
+        return CONTROLLER_IDLE_WAIT_TICKS;
+    }
+    const TickType_t elapsed = xTaskGetTickCount() - state->in_done_tick;
+    return elapsed >= CONTROLLER_MIDI_IN_PACE_TICKS
+        ? 0u : CONTROLLER_MIDI_IN_PACE_TICKS - elapsed;
+}
+
+/* Every loop, like the unpaced submit before v329: a completed transfer
+ * waits for its pace, anything else idle (open, failed submit) goes now. */
+static void submit_in_paced(controller_state_t *state)
+{
+    if (!state->in_resubmit_due) {
+        (void)submit_in_if_idle(state);
+        return;
+    }
+    if (midi_in_pace_wait(state) != 0u) {
+        return;
+    }
+    state->in_resubmit_due = false;
+    const esp_err_t rc = submit_in_if_idle(state);
+    if (rc != ESP_OK) {
+        ESP_LOGW(TAG, "MIDI IN resubmit: %s", esp_err_to_name(rc));
     }
 }
 
@@ -919,6 +959,7 @@ static void close_step(controller_state_t *state)
         }
         state->in_transfer = NULL;
     }
+    state->in_resubmit_due = false;
     if (state->out_transfer) {
         if (usb_host_transfer_free(state->out_transfer) != ESP_OK) {
             close_wait_log(state, "MIDI OUT free");
@@ -1563,7 +1604,7 @@ static void controller_task(void *arg)
 
     for (;;) {
         const esp_err_t rc = usb_host_client_handle_events(
-            s_state.client, pdMS_TO_TICKS(100));
+            s_state.client, midi_in_pace_wait(&s_state));
         const uint32_t loop_start = esp_cpu_get_cycle_count();
         count_inc(&s_work_loops);
         if (rc != ESP_OK && rc != ESP_ERR_TIMEOUT) {
@@ -1608,7 +1649,7 @@ static void controller_task(void *arg)
                 root_cycle_if_due(&s_state);
             }
         }
-        (void)submit_in_if_idle(&s_state);
+        submit_in_paced(&s_state);
         (void)submit_out_if_idle(&s_state);
         work_add(&s_work_loop_cycles, NULL,
                  esp_cpu_get_cycle_count() - loop_start);
@@ -1742,6 +1783,7 @@ void controller_usb_host_get_work(controller_usb_host_work_t *work_out)
                                          &work_out->isoc_cycles,
                                          &work_out->isoc_max_cycles,
                                          &work_out->isoc_submit_cycles);
+    work_out->isoc_prep_cycles = controller_usb_audio_stream_get_prep_cycles();
 }
 
 void controller_usb_host_take_isoc_cadence(uint32_t *gap_max_us, uint32_t *late,

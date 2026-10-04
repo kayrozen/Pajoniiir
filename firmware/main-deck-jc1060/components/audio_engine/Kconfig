@@ -14,14 +14,38 @@ config AUDIO_SCRATCH_ENABLED
 config AUDIO_DISPLAY_LATENCY_MS
     int "Output latency past the UAC ring, for the displayed position (ms)"
     range 0 200
-    default 12
+    default 18
     help
         The engine position counts frames when they are mixed; they become
         audible only after the output chain. The UI shows the position that
         was mixed this long ago: the measured UAC ring fill (smoothed, read
         by the UI) plus this constant, which covers the isoc URBs in flight
-        (3 x 4 ms) and the controller's own buffering. v260 HB logs: ring
+        (3 x 6 ms since v329, 3 x 4 ms before: default 12 then) and the
+        controller's own buffering. v260 HB logs: ring
         ~830-1280 frames at 48 kHz (17-27 ms), so ~35 ms in total.
         Raise it if the waveform still leads the audio, 0 = ring only.
+
+choice AUDIO_KEYLOCK_ALGO
+    prompt "Master Tempo (key lock) algorithm"
+    default AUDIO_KEYLOCK_WSOLA2
+    help
+        v326: WSOLA v2 (audio_keylock_wsola2.c) replaces the original WSOLA
+        (audio_keylock.c): whole-frame grains of 32 ms with an 11 ms aligned
+        crossfade, +/-10.7 ms normalised-correlation search, and the v325
+        windowed-sinc rate conversion. v1 stays compiled as the fallback.
+        v327: v2 on both decks by default. HIL v326 (P4 PROBE): v2 costs
+        about 36 us per 16-frame group and deck, v1 about 50, so the A/B
+        (v2 + v1) was the most expensive two-deck combination.
+
+    config AUDIO_KEYLOCK_WSOLA1
+        bool "WSOLA v1 on both decks (original)"
+    config AUDIO_KEYLOCK_WSOLA2
+        bool "WSOLA v2 on both decks"
+    config AUDIO_KEYLOCK_AB_DECK1
+        bool "A/B: WSOLA v2 on deck 1, v1 on deck 2"
+        help
+            Listening A/B: load the same track on both decks with Master
+            Tempo on and the same tempo, and switch with the crossfader.
+endchoice
 
 endmenu

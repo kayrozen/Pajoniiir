@@ -1416,6 +1416,161 @@ phases 0-6 done, v293 removed the legacy widgets and
       a download stays clean (same as v323).
 - [ ] Before any Espressif issue: `esptool.py --port /dev/ttyUSB0 chip_id`
       for the chip revision, then the operator's agreement.
+- [x] v325: `audio_resampler` 16-tap windowed sinc instead of linear (44.1
+      kHz tracks on the 48 kHz USB chain lost 1.5-4.5 dB at 10-17 kHz with
+      image spurs at -13..-23 dB; now <= 1 dB loss to 17 kHz, spurs below
+      -76 dB). 48 kHz tracks at pitch 0 stay bit-exact. Host test
+      `tests/audio_resampler_jc1060` passes (ASan/UBSan clean); syntax of
+      `audio_resampler.c`, `audio_output_mixer.c`, `audio_engine.c` checked.
+- [ ] HIL v325: a 44.1 kHz track (`track format D0: 44100 Hz` in the log)
+      that sounded dull/grainy, Master Tempo off, pitch 0 then +/-6 %:
+      highs back, no grain, no click at load, cue, hot cue, loop, seek or
+      pitch moves. `PROBE worst` with that deck: mix per 16-frame group vs
+      a 48 kHz track (expected +12..20 us per resampled deck). A 48 kHz
+      track at pitch 0 sounds exactly as before.
+- [x] v326: Master Tempo WSOLA v2 (`audio_keylock_wsola2.c`), selected by
+      `CONFIG_AUDIO_KEYLOCK_ALGO`, default A/B: v2 on deck 1, v1 on deck 2.
+      Host A/B: energy off the partials -27..-28.5 dB (v1 -3 dB), 12 kHz
+      kept (v1 -5..-12 dB), no doubled hits. Syntax of `audio_engine.c`
+      checked with each choice.
+- [ ] HIL v326 (A/B): same track on both decks, Master Tempo on, same tempo
+      (try 0.94, 1.00, 1.06 and a slow fader move), switch with the
+      crossfader:
+      - deck 1 (v2) without the metallic tone and with clean highs;
+      - no click at cue, hot cue, loop, seek, tempo moves, MT on/off;
+      - `PROBE worst` with MT on: cost per 16-frame group, deck 1 vs deck 2;
+      - after acceptance, set `CONFIG_AUDIO_KEYLOCK_WSOLA2` (both decks).
+      - Result (HIL v326): deck 1 (v2) cleaner. Slight crackles on both
+        decks during simultaneous play and UI freezes while touching MIDI
+        controls. PROBE per deck: v2 +36 us per 16-frame group, v1 +50;
+        v2 + v1 with both MT 170 (v1 + v1 163 in older logs). Every UAC and
+        engine counter clean; UI freeze attributed (not yet measured) to the
+        MIDI chain tasks moving to core 1 once core 0 is about 85 % busy.
+- [x] v327: `CONFIG_AUDIO_KEYLOCK_WSOLA2` default (Kconfig and
+      `sdkconfig.defaults`). The local `sdkconfig` still says A/B: switch it
+      in menuconfig (Audio engine > Master Tempo algorithm) before building.
+- [ ] HIL v327, normal build: both decks MT, same scenario as v326.
+      - Crackles and the UI freeze when touching faders/jog: still there?
+      - `PROBE` "all norm" with both decks MT (expected about 145-150 vs 170).
+- [ ] HIL v327, diagnostics build (`idf.py -DPAJONIIIR_DIAGNOSTICS=1
+      build`, cached: `-DPAJONIIIR_DIAGNOSTICS=0` to go back), same
+      scenario:
+      - while the UI freezes: the `lvgl STALL ...` block (which tasks ran on
+        core 0 / core 1, `lvgl STALL usb:` controller work);
+      - when a crackle is heard: `HB isoc gap_max=… late=… wr=… rd=…` of
+        that window (nominal gap_max ~4000 us, late 0);
+      - optional: the same with "WSOLA v1 on both decks", to tell whether the
+        freeze already existed with two v1 decks.
+      - Result (HIL v327): no general crackles. UI still freezes on MIDI
+        touch (diagnostics run still to do). Crackle on deck 1 PLAY after a
+        long pause at the cue (11 s, 24 s), not on a quick cue play; every
+        decode/UAC counter clean.
+- [x] v328: 128-frame start fade-in on every inactive -> active transition
+      and the `PLAY D<n> start: ...` probe line (every build). Host test
+      `tests/audio_start_ramp_jc1060` passes.
+- [ ] HIL v328 (diagnostics build recommended: it also carries the LVGL
+      stall probe):
+      - load, wait 10 s or more at the cue, PLAY; 3 times with MT off, 3
+        with MT on; then a quick cue play for comparison;
+      - crackle still heard? Note each `PLAY D<n> start:` line (max step and
+        its index, after-fade step, preroll ms ago, path);
+      - while the UI freezes on a fader/jog move: the `lvgl STALL ...` block.
+      - Result (HIL v328): 1 crackle in 6. The start probe values repeat on
+        every PLAY (attacks in the music): the source is clean, the crackle
+        is downstream. `HB isoc gap_max` 10-15 ms in several windows (8 ms
+        queued with 3 x 4 ms URBs). `lvgl STALL`: core 1 owned by
+        `controller_usb` (isoc callbacks 1.9 ms each, ~45 % of core 1; MIDI
+        IN callbacks + submits ~0.55 ms per event during a stream).
+- [x] v329: 6 packets per isoc URB (167 callbacks/s, 18 ms gap tolerance,
+      +6 ms latency), MIDI IN resubmit paced at 3 ms from the task loop,
+      `prep` time in `lvgl STALL usb:`, display latency default 18 ms.
+      Syntax-checked (normal and diagnostics builds).
+- [ ] Before building v329: menuconfig > Audio engine > display latency 18
+      (the local `sdkconfig` keeps 12).
+- [ ] HIL v329 (diagnostics build), same scenario as v328:
+      - `HB isoc gap_max` stays below ~12 ms outside loads, `late` near 0;
+      - crackle at PLAY and during play gone;
+      - UI during a jog/fader stream: freeze gone, or `lvgl STALL` reports
+        much shorter; note `isoc cb` count/time, `midi_in cb`, `prep`;
+      - jog/fader response feels unchanged (+3 ms max).
+      - Result (HIL v329): accepted. No freeze during jog/fader use (4
+        `lvgl STALL` at boot only), PROBE baseline 80-90 us per group, 0
+        heap fail, no rate drop. `HB isoc`: 10 gaps of 9.9-12.7 ms absorbed
+        by the 18 ms tolerance; 3 beyond it, 25-93 ms, around a download/
+        load, a CUE set and the first PLAY after idle (open item).
+- [ ] Open (if audible): isochronous stall of 25-90 ms around loads, CUE set
+      and the first PLAY after idle; worst 16-frame groups of ~1.2 ms on
+      core 0 (absorbed so far).
+- [x] v330: web server started at boot with the Wi-Fi remote OFF (no wait
+      for the DHCP lease); the API host allow-list also accepts the current
+      Ethernet IP. Syntax-checked.
+- [x] HIL v330: BOOT LOOP (`usb_host_install` NO_MEM: the boot-time web
+      server took the internal RAM first).
+- [x] v331: Ethernet web server started by a one-shot PSRAM-stack task once
+      the controller bootstrap (USB host install) is ready. Syntax-checked.
+- [ ] HIL v331: boots normally (no `alloc FAILED`, DDJ and USB drive
+      enumerate); note `[HEAP] before/after p4_local_controller_start` and
+      `[HEAP] before/after eth web_server_start`; then the v330 checks
+      below.
+- [x] v332: DJ Link NFS READs 4096 x 2 through IPv4 reassembly
+      (`CONFIG_LWIP_IP4_REASSEMBLY=y` in `sdkconfig.defaults`). Host nfs
+      mock passes; syntax checked with and without reassembly.
+- [ ] Before building v332: menuconfig > LWIP > enable IPv4 reassembly (the
+      local `sdkconfig` keeps it off; without it the code stays at 1024 x 4).
+- [ ] HIL v332, vynull peer, one deck playing (MT on) and a download into
+      the other, then the same with both decks playing:
+      - `fetch #.. : N bytes, M retransmits` and the download time vs v322
+        (12.3 MB in 41 s, 28 retransmits); `SD writes` (diagnostics build)
+        to split network and SD time;
+      - `[HEAP]` boot lines unchanged (no `alloc FAILED`), internal free
+        during the download;
+      - no crackle, `HB isoc` gap_max as in v329, no USB stop.
+- [x] HIL v332: +12 % throughput (13.8 MB in ~41 s), retransmits 28 -> 6;
+      SD writes (bounced, ~104 ms per 64 KB) now ~half of the time; audio
+      clean.
+- [x] v333: the download job has its own dbserver session; network
+      load-track of an unlisted / unbrowsed track accepted. Host tests and
+      UI simulator pass.
+- [ ] HIL v333, vynull:
+      - LOAD a track, then switch the Library source (LOCAL or another
+        player) during the download: it finishes, with waveform, grid, cues
+        and artwork;
+      - from vynull, load a track onto one of our players while the Library
+        shows LOCAL (was `source not browsed`) and one that is not on the
+        visible list (was `track not listed`): downloaded, deck titled
+        `TRACK <id>` meanwhile, then the real title / artist once loaded;
+      - log: `fetch #.. id ..` lines, no `SOURCE DB` errors; audio as v332.
+      - Operator review: a cached track kept `TRACK <id>` (metadata not
+        reloaded on a cache hit) -> v334.
+- [x] HIL v333/v334: accepted.
+- [x] v335: one download per deck, the second queued; Library usable during
+      a download. Syntax and UI simulator pass.
+- [ ] HIL v335, vynull, one deck playing:
+      - LOAD deck 1 (not cached), then while it downloads browse / sort /
+        open a playlist and LOAD deck 2: deck 2 row `WAIT`, source line
+        `QUEUED`, then it downloads right after deck 1 and both decks load
+        (no `LOAD BUSY` when they finish close together);
+      - LOAD again on a deck that is already downloading: `DOWNLOAD BUSY`;
+      - CANCEL (SOURCE) during deck 1's download: both cancelled;
+      - from vynull, load onto both of our players back to back: both
+        downloaded, in order;
+      - after both: deck 1's file still in the cache (LOAD it again: cache
+        hit); audio as v332.
+- [x] v334: the analysis waits (<= 3 s) for the job's metadata answer; the
+      deck takes title / artist / BPM / duration from it.
+- [ ] HIL v334: network load of a track already in the cache, unlisted and
+      listed: real title and artist on the deck (no `TRACK <id>`); edit the
+      title in vynull, load again from cache: the new title shows. No
+      `no metadata answer` in the log with vynull.
+- [ ] HIL v330 checks (on v331), Wi-Fi remote OFF, Ethernet connected:
+      - log: `web UI available at http://pajoniiir.local` at boot;
+      - `http://<eth IP>/` serves the page (no redirect), and
+        `curl http://<eth IP>/api/status` returns 200 (not 403);
+      - `http://pajoniiir.local/` works from a host with mDNS;
+      - a request with another Host (`curl -H 'Host: evil.example'
+        http://<eth IP>/api/status`) still gets 403;
+      - audio unaffected while a browser polls the page during playback
+        (`PROBE` baseline, no crackle).
 
 ### Phase 3: DDJ-400 Integration (planned, after Phase 2)
 

@@ -97,9 +97,13 @@ void controller_usb_audio_stream_get_work(uint32_t *callbacks,
                                           uint32_t *cycles,
                                           uint32_t *max_cycles,
                                           uint32_t *submit_cycles);
+/* v329: cycles spent preparing isoc packets (ring read + packing) before the
+ * submits, wrapping counter. Any task. */
+uint32_t controller_usb_audio_stream_get_prep_cycles(void);
 /* v323 cadence probe: longest gap between completed isoc URBs (us), gaps
- * of 6 ms or more, and how many of those overlapped an SD download write /
- * deck loader read, all since the previous call. Any task. */
+ * of 1.5 URB periods or more (6 ms before v329, 9 ms since), and how many
+ * of those overlapped an SD download write / deck loader read, all since
+ * the previous call. Any task. */
 void controller_usb_audio_stream_take_cadence(uint32_t *gap_max_us,
                                               uint32_t *late,
                                               uint32_t *late_wr,
