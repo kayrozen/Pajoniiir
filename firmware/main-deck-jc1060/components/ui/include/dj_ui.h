@@ -62,6 +62,26 @@ typedef struct {
     bool master, on_air, playing;
 } dj_ui_link_peer_t;
 
+/* v338: another player on the network, as the DJ LINK PLAYERS panel shows it
+ * (tap the master chip in the top bar). Text is copied; wave is the 400-column
+ * PWAV preview (height in the low 5 bits, whiteness in the high 3) or NULL. */
+#define DJ_NEIGHBOR_ROWS      4
+#define DJ_NEIGHBOR_WAVE_COLS 400
+typedef struct {
+    uint8_t number;
+    const char *name;                 /* "CDJ-3000" */
+    bool master, on_air, playing, synced;
+    float bpm;                        /* <= 0 = unknown */
+    float pitch_pct;
+    bool has_track;                   /* false = "NO TRACK" */
+    const char *title, *artist;       /* "" / NULL = not known (yet) */
+    int32_t position_ms;              /* < 0 = unknown */
+    int32_t duration_ms;              /* <= 0 = unknown */
+    bool position_estimated;          /* shown with '~' */
+    const uint8_t *wave;              /* NULL = none (yet) */
+    uint32_t wave_gen;                /* repainted when it changes */
+} dj_ui_neighbor_t;
+
 /* DJ Link tempo master shown in the top bar of every tab. */
 typedef struct {
     uint8_t player;                   /* 0 = no master */
@@ -239,6 +259,9 @@ void dj_ui_set_brightness(uint8_t pct);                                     /* s
 void dj_ui_set_wireless(bool on);
 void dj_ui_set_link_enabled(bool on);
 void dj_ui_set_link_peers(const dj_ui_link_peer_t *peers, uint8_t count);  /* max DJ_LINK_ROWS shown, text copied */
+void dj_ui_set_link_neighbors(const dj_ui_neighbor_t *n, uint8_t count);  /* v338: max DJ_NEIGHBOR_ROWS, copied */
+void dj_ui_show_neighbors(bool on);                                       /* v338: also a tap on the master chip */
+bool dj_ui_neighbors_visible(void);                                       /* the caller feeds data only while true */
 void dj_ui_set_recording(bool on);
 
 /* ---- Full-screen overlays (on lv_layer_top) ---- */

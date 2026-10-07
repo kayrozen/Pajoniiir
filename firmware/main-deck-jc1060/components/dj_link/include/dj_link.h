@@ -21,6 +21,7 @@
 #include "esp_netif.h"
 
 #include "dj_link_db.h"
+#include "dj_link_neighbor.h"
 #include "dj_link_master.h"
 #include "dj_link_session.h"
 #include "dj_link_state.h"
@@ -43,6 +44,15 @@ typedef struct {
      * while sync control is on. Must not block; deck_core decides. NULL = not
      * wanted. */
     void (*deck_command)(uint8_t deck, dj_link_deck_cmd_t cmd);
+    /* v342: our USB key exported read-only over NFS while DJ Link runs
+     * (dj_link_nfsd_service.h). export_root NULL = nothing is served.
+     * export_available: the key is mounted. The gate hooks wrap every access
+     * to the medium (media_io_gate_begin / _end: the mutex the audio decoder
+     * takes around its USB reads). */
+    const char *export_root;
+    bool (*export_available)(void);
+    void (*export_gate_begin)(void);
+    void (*export_gate_end)(void);
 } dj_link_config_t;
 
 /* Store the hooks. No task, no PCB, no allocation. Call once before
@@ -63,6 +73,38 @@ void dj_link_set_sync_control(bool on);
 
 /* Last published summary; state OFF when the task is not running. */
 void dj_link_get_summary(dj_link_summary_t *out);
+
+/* v338: the other players on the network, with what each has loaded. The
+ * status packet gives BPM, play state and (CDJ-3000, vynull) the position;
+ * title, artist and the 400-column waveform preview come from the dbserver of
+ * the device the track was loaded from, asked once per loaded track by a
+ * session of its own (paused while a download runs). */
+#define DJ_LINK_NEIGHBORS_MAX    4u
+#define DJ_LINK_NEIGHBOR_WAVE_LEN 400u
+
+typedef struct {
+    uint8_t  number;                    /* player 1..6 */
+    char     name[DJLINK_NAME_LEN + 1];
+    bool     master, on_air, playing, synced;
+    float    bpm;                       /* effective BPM, 0 = unknown */
+    float    pitch_pct;
+    bool     has_track;                 /* it reports a track on a dbserver source */
+    bool     has_meta;                  /* title / artist / duration are set */
+    char     title[DJ_LINK_DB_TITLE_MAX];
+    char     artist[DJ_LINK_DB_ARTIST_MAX];
+    uint16_t duration_s;                /* 0 = unknown */
+    bool     has_position;
+    bool     position_estimated;        /* from the beat counter, not a 0x0b */
+    uint32_t position_ms;
+    bool     has_wave;
+    uint32_t wave_gen;                  /* changes with the track and its waveform */
+    uint8_t  wave[DJ_LINK_NEIGHBOR_WAVE_LEN];  /* PWAV: height low 5 bits, whiteness high 3 */
+} dj_link_neighbor_t;
+
+/* Fill out[] (max entries) with the players that are not rekordbox sources,
+ * lowest number first, and return the count. Position is carried on to now.
+ * Any task may call it. */
+uint8_t dj_link_get_neighbors(dj_link_neighbor_t *out, uint8_t max);
 
 /* Library size announced in media responses (0 = no reply). Called by the
  * LVGL task, which may block on the library; the dj_link task never does. */
@@ -170,7 +212,8 @@ typedef struct {
     dj_link_fetch_state_t state;
     uint8_t  peer;
     uint32_t rekordbox_id;
-    uint32_t track_key;         /* dj_link_peer_track_key() of the file */
+    uint32_t track_key;         /* v336: dj_link_media_track_key() of the file */
+    uint32_t legacy_key;        /* v336: its v249 dj_link_peer_track_key() */
     uint32_t done;              /* bytes of the current file */
     uint32_t total;
     uint8_t  percent;           /* of the current file */

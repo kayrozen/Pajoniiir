@@ -40,6 +40,16 @@ typedef struct {
     bool     synced;
     uint8_t  master_handoff;            /* v305: status 0x9f (Mh), 0xff = none */
 
+    /* v338: the track the player reports in its status: the device it came
+     * from (0x28), the slot (0x29), the rekordbox id (0x2c) and the beat
+     * counter (0xa0). source_device 0 / rekordbox_id 0 = no track. */
+    uint8_t  source_device;
+    uint8_t  source_slot;
+    uint32_t rekordbox_id;
+    uint32_t beat_count;                /* 0 = unknown */
+    uint32_t sync_counter;              /* v339: Syncn (0x84): bumped by the player that
+                                         * becomes tempo master, 0 = never */
+
     /* Effective BPM (track BPM adjusted by pitch), 0 = unknown. */
     float    bpm;
     float    pitch_pct;
@@ -131,13 +141,16 @@ void dj_link_table_summarize(const dj_link_table_t *table,
                              dj_link_state_t state,
                              dj_link_summary_t *out);
 
-/* v304: the beat clock network sync follows. anchor_ms is the rx time of the
+/* v339: anchor_frac_us adds the microseconds below anchor_ms (0..999), so the
+ * anchor of an estimated clock is not rounded to a millisecond.
+ * v304: the beat clock network sync follows. anchor_ms is the rx time of the
  * player's last beat packet, period_us its effective beat length. */
 typedef struct {
     bool     valid;
     uint8_t  player;
     uint8_t  beat_in_bar;   /* 1..4 at anchor_ms, 0 = unknown */
     uint32_t anchor_ms;
+    uint16_t anchor_frac_us;
     uint32_t period_us;
 } dj_link_beat_clock_t;
 
@@ -152,6 +165,10 @@ void dj_link_table_beat_clock(const dj_link_table_t *table, uint8_t prefer,
                               uint32_t now_ms, dj_link_beat_clock_t *out);
 
 /* Fraction of the current beat elapsed at now_ms, 0..1; -1 if unknown. */
+/* v339: the highest Syncn any player reports (0 if none): a player taking
+ * the tempo master sends one more. */
+uint32_t dj_link_table_largest_sync(const dj_link_table_t *table);
+
 float dj_link_peer_beat_phase(const dj_link_peer_t *peer, uint32_t now_ms);
 
 /* "DJ LINK: OFF", "DJ LINK: ON - CDJ-3000 #1 174.2 BPM", ... */

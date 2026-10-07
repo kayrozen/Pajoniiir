@@ -7,6 +7,7 @@
  * every run renders the same pixels. */
 #include <stdbool.h>
 #include <stdint.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1993,6 +1994,58 @@ static void bridge_scenario(void)
     playing_render_timing();
 }
 
+/* v338: DJ LINK PLAYERS panel. Runs last: its pumps move the clock. */
+static void neighbors_scenario(void)
+{
+    static uint8_t wave[DJ_NEIGHBOR_WAVE_COLS];
+    for (int i = 0; i < DJ_NEIGHBOR_WAVE_COLS; i++) {
+        const int h = 6 + (int)(12.0 * (1.0 + sin(i * 0.09)) + 6.0 * (1.0 + sin(i * 0.37)));
+        wave[i] = (uint8_t)((((i * 7) / DJ_NEIGHBOR_WAVE_COLS) << 5) | (h > 31 ? 31 : h));
+    }
+    const dj_ui_neighbor_t players[3] = {
+        { .number = 1, .name = "CDJ-3000", .master = true, .on_air = true, .playing = true,
+          .synced = true, .bpm = 128.0f, .pitch_pct = 2.0f, .has_track = true,
+          .title = "Strobe", .artist = "deadmau5", .position_ms = 94000, .duration_ms = 637000,
+          .wave = wave, .wave_gen = 1 },
+        { .number = 2, .name = "XDJ-1000MK2", .bpm = 124.5f, .pitch_pct = -0.5f, .has_track = true,
+          .title = "", .artist = "", .position_ms = -1, .duration_ms = 0, .position_estimated = false,
+          .wave = NULL, .wave_gen = 0 },
+        { .number = 3, .name = "CDJ-2000NXS2", .has_track = false, .position_ms = -1 },
+    };
+    dj_ui_set_link_neighbors(players, 3);
+    if (dj_ui_neighbors_visible()) fail("neighbors panel open at start");
+
+    tap(960, 24);                                   /* the master chip */
+    pump(64);
+    if (!dj_ui_neighbors_visible()) fail("master chip tap did not open the neighbors panel");
+    expect_label("DJ LINK PLAYERS");
+    expect_label("Strobe");
+    expect_label("LOADING...");
+    expect_label("NO TRACK");
+    expect_label("01:34 / 10:37");
+    expect_label("128.0 BPM");
+    capture("neighbors_overlay");
+
+    /* A new waveform and an estimated position (no 0x0b). */
+    const dj_ui_neighbor_t one = {
+        .number = 2, .name = "XDJ-1000MK2", .playing = true, .bpm = 124.5f, .has_track = true,
+        .title = "Insane", .artist = "Kleu", .position_ms = 32000, .duration_ms = 300000,
+        .position_estimated = true, .wave = wave, .wave_gen = 2 };
+    dj_ui_set_link_neighbors(&one, 1);
+    pump(64);
+    expect_label("~00:32 / 05:00");
+    expect_hidden_label("Strobe");
+    capture("neighbors_one_estimated");
+
+    dj_ui_set_link_neighbors(NULL, 0);
+    pump(64);
+    expect_label("NO PLAYER ON THE NETWORK");
+
+    tap(960, 24);                                   /* closes it again */
+    pump(64);
+    if (dj_ui_neighbors_visible()) fail("second tap did not close the neighbors panel");
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2) {
@@ -2181,6 +2234,7 @@ int main(int argc, char **argv)
 
     wave_source_timing();
     bridge_scenario();
+    neighbors_scenario();
 
     if (s_failures != 0) {
         fprintf(stderr, "dj_ui simulator E2E failed: %d failure(s)\n", s_failures);

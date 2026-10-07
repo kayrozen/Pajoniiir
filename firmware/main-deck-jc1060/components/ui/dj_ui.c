@@ -107,6 +107,17 @@ typedef struct {
     bool elapsed;                    /* footer time: elapsed instead of remaining (tap) */
 } deck_t;
 
+/* v338: one row of the DJ LINK PLAYERS panel. */
+#define NB_WAVE_W 340
+#define NB_WAVE_H 64
+typedef struct {
+    lv_obj_t *row, *badge_lbl, *name, *flags, *bpm, *pitch, *title, *artist, *pos;
+    lv_obj_t *wave, *shade, *head;
+    lv_image_dsc_t dsc;                /* over the row's slice of s_nb_px */
+    uint32_t wave_gen;
+    bool wave_valid;
+} nb_row_t;
+
 static struct {
     deck_t deck[DJ_DECKS];
     lv_obj_t *tab_btn[4], *page[4];
@@ -139,6 +150,8 @@ static struct {
     bool recording;
     /* overlays */
     lv_obj_t *saver, *saver_row, *saver_ch[9], *blackout;
+    lv_obj_t *nb_panel, *nb_empty;       /* v338 */
+    nb_row_t nb[DJ_NEIGHBOR_ROWS];
     lv_timer_t *saver_timer; uint32_t saver_step;
     dj_ui_callbacks_t cb;
 } g;
@@ -148,6 +161,11 @@ static struct {
 #define ART_ROW_PIXELS  (DJ_ART_ROW_PX * DJ_ART_ROW_PX)
 #define ART_DECK_PIXELS (DJ_ART_DECK_PX * DJ_ART_DECK_PX)
 static uint16_t *s_art_px;
+
+/* v338: the neighbour waveform previews, one block like the art, kept across
+ * dj_ui_create. */
+#define NB_PIXELS (NB_WAVE_W * NB_WAVE_H)
+static uint16_t *s_nb_px;
 
 static void art_buffers(void)
 {
@@ -1374,6 +1392,90 @@ static lv_obj_t *fullscreen(lv_obj_t *layer)
     return o;
 }
 
+/* ---- v338: DJ LINK PLAYERS panel ---------------------------------------- */
+
+static void nb_buffers(void)
+{
+    if (!s_nb_px) {
+        const size_t bytes = (size_t)DJ_NEIGHBOR_ROWS * NB_PIXELS * sizeof(uint16_t);
+#ifdef ESP_PLATFORM
+        s_nb_px = heap_caps_calloc(1, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#else
+        s_nb_px = calloc(1, bytes);
+#endif
+    }
+}
+
+static void nb_toggle(lv_event_t *e)
+{
+    (void)e;
+    dj_ui_show_neighbors(!dj_ui_neighbors_visible());
+}
+
+static void build_neighbors(lv_obj_t *parent)
+{
+    lv_obj_t *top = lv_display_get_layer_top(lv_obj_get_display(parent));
+    nb_buffers();
+    /* Below the top bar, so the master chip that opens it also closes it. */
+    g.nb_panel = box(top, 8, 46, 1008, 546, C_BG, C_LINE);
+    lv_obj_add_flag(g.nb_panel, LV_OBJ_FLAG_HIDDEN | LV_OBJ_FLAG_CLICKABLE);
+    cap(g.nb_panel, "DJ LINK PLAYERS", 14, 10);
+    txt_r(g.nb_panel, F12, C_DIM, "tap the chip at the top right to close", -14, 10);
+    g.nb_empty = txt(g.nb_panel, F16, C_DIM, "NO PLAYER ON THE NETWORK", 0, 0);
+    lv_obj_align(g.nb_empty, LV_ALIGN_CENTER, 0, 0);
+
+    for (int r = 0; r < DJ_NEIGHBOR_ROWS; r++) {
+        nb_row_t *n = &g.nb[r];
+        n->row = box(g.nb_panel, 8, 34 + r * 126, 990, 120, C_PANEL, C_LINE);
+        lv_obj_add_flag(n->row, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_t *badge = box(n->row, 12, 12, 30, 24, C_INFO, C_INFO);
+        lv_obj_set_style_radius(badge, 3, 0);
+        n->badge_lbl = txt(badge, F16, C_DARK, "1", 0, 0);
+        lv_obj_center(n->badge_lbl);
+        n->name = txt(n->row, F16, C_INK, "", 54, 14);
+        n->flags = txt(n->row, F12, C_OK, "", 54, 40);
+        n->bpm = txt(n->row, F20, C_INK, "---", 12, 62);
+        n->pitch = txt(n->row, F14, C_MUTED, "", 12, 90);
+        n->title = txt(n->row, F16, C_INK, "", 290, 14);
+        lv_label_set_long_mode(n->title, DJ_LONG_DOT);
+        lv_obj_set_width(n->title, 330);
+        n->artist = txt(n->row, F12, C_MUTED, "", 290, 38);
+        lv_label_set_long_mode(n->artist, DJ_LONG_DOT);
+        lv_obj_set_width(n->artist, 330);
+        n->pos = txt(n->row, F20, C_INK, "--:--", 290, 62);
+
+        lv_image_dsc_t *i = &n->dsc;
+        i->header.magic = LV_IMAGE_HEADER_MAGIC;
+        i->header.cf = LV_COLOR_FORMAT_RGB565;
+        i->header.w = NB_WAVE_W;
+        i->header.h = NB_WAVE_H;
+        i->header.stride = NB_WAVE_W * 2;
+        if (s_nb_px) {
+            i->data = (const uint8_t *)(s_nb_px + (size_t)r * NB_PIXELS);
+            i->data_size = NB_PIXELS * 2;
+        }
+        n->wave = box(n->row, 640, 28, NB_WAVE_W, NB_WAVE_H, C_WAVEBG, C_LINE);
+        lv_obj_set_style_radius(n->wave, 2, 0);
+        lv_obj_t *img = lv_image_create(n->wave);
+        lv_obj_set_pos(img, -1, -1);
+        if (s_nb_px) {
+            lv_image_set_src(img, i);
+        }
+        n->shade = box(n->wave, 0, 0, 0, NB_WAVE_H, C_BG, C_BG);   /* the played part */
+        lv_obj_set_style_border_width(n->shade, 0, 0);
+        lv_obj_set_style_radius(n->shade, 0, 0);
+        lv_obj_set_style_bg_opa(n->shade, LV_OPA_60, 0);
+        n->head = box(n->wave, 0, 0, 2, NB_WAVE_H, C_RED, C_RED);
+        lv_obj_set_style_border_width(n->head, 0, 0);
+        lv_obj_set_style_radius(n->head, 0, 0);
+        lv_obj_add_flag(n->shade, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(n->head, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_add_flag(g.master_box, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(g.master_box, 4);
+    lv_obj_add_event_cb(g.master_box, nb_toggle, LV_EVENT_CLICKED, NULL);
+}
+
 static void build_overlays(lv_obj_t *parent)
 {
     lv_obj_t *top = lv_display_get_layer_top(lv_obj_get_display(parent));
@@ -1396,6 +1498,8 @@ static void build_overlays(lv_obj_t *parent)
 
     g.blackout = fullscreen(top);
     lv_obj_center(txt(g.blackout, F16, C_WARN, "UI OFF - PLAYING", 0, 0));
+
+    build_neighbors(parent);
 }
 
 /* ---------------------------------------------------------------- public API */
@@ -2108,4 +2212,109 @@ void dj_ui_set_blackout(bool on)
 {
     if (on) lv_obj_remove_flag(g.blackout, LV_OBJ_FLAG_HIDDEN);
     else lv_obj_add_flag(g.blackout, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* ---- v338: DJ LINK PLAYERS panel API ---- */
+
+static void nb_clock_text(char *out, size_t cap, int32_t ms, int32_t total_ms, bool estimated)
+{
+    char a[12] = "--:--", b[12] = "";
+    if (ms >= 0) snprintf(a, sizeof a, "%02d:%02d", (int)(ms / 60000), (int)((ms / 1000) % 60));
+    if (total_ms > 0) snprintf(b, sizeof b, " / %02d:%02d", (int)(total_ms / 60000), (int)((total_ms / 1000) % 60));
+    snprintf(out, cap, "%s%s%s", estimated && ms >= 0 ? "~" : "", a, b);
+}
+
+/* Centred bars, tallest at the middle; whiteness 0..7 lightens the blue. */
+static void nb_paint_wave(int r, const uint8_t *wave)
+{
+    uint16_t *px = s_nb_px + (size_t)r * NB_PIXELS;
+    const uint16_t bg = lv_color_to_u16(C_WAVEBG);
+    for (int i = 0; i < NB_PIXELS; i++) px[i] = bg;
+    for (int x = 0; x < NB_WAVE_W; x++) {
+        const uint8_t v = wave[(x * DJ_NEIGHBOR_WAVE_COLS) / NB_WAVE_W];
+        const int h = 1 + ((v & 0x1f) * (NB_WAVE_H - 2)) / 31;
+        const int white = v >> 5;                                  /* 0..7 */
+        const uint8_t rr = (uint8_t)(0x1c + (0xe0 * white) / 7);
+        const uint8_t gg = (uint8_t)(0x6a + (0x90 * white) / 7);
+        const uint8_t bb = 0xe8;
+        const uint16_t c = lv_color_to_u16(lv_color_make(rr, gg, bb));
+        const int y0 = (NB_WAVE_H - h) / 2;
+        for (int y = y0; y < y0 + h; y++) px[y * NB_WAVE_W + x] = c;
+    }
+}
+
+void dj_ui_set_link_neighbors(const dj_ui_neighbor_t *list, uint8_t count)
+{
+    if (!g.nb_panel) return;
+    if (!list) count = 0;
+    if (count > DJ_NEIGHBOR_ROWS) count = DJ_NEIGHBOR_ROWS;
+    if (count) lv_obj_add_flag(g.nb_empty, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_remove_flag(g.nb_empty, LV_OBJ_FLAG_HIDDEN);
+
+    for (int r = 0; r < DJ_NEIGHBOR_ROWS; r++) {
+        nb_row_t *n = &g.nb[r];
+        if (r >= count) {
+            lv_obj_add_flag(n->row, LV_OBJ_FLAG_HIDDEN);
+            n->wave_valid = false;
+            continue;
+        }
+        const dj_ui_neighbor_t *p = &list[r];
+        lv_obj_remove_flag(n->row, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text_fmt(n->badge_lbl, "%u", (unsigned)p->number);
+        lv_obj_center(n->badge_lbl);
+        lv_label_set_text(n->name, p->name && p->name[0] ? p->name : "PLAYER");
+        lv_label_set_text_fmt(n->flags, "%s%s%s%s", p->master ? "MASTER  " : "", p->on_air ? "ON AIR  " : "",
+                              p->playing ? "PLAY  " : "", p->synced ? "SYNC" : "");
+        lv_obj_set_style_text_color(n->flags, p->master ? C_OK : C_INFO, 0);
+        if (p->bpm > 0.f) lv_label_set_text_fmt(n->bpm, "%.1f BPM", (double)p->bpm);
+        else lv_label_set_text(n->bpm, "--- BPM");
+        if (p->bpm > 0.f) lv_label_set_text_fmt(n->pitch, "%+.1f%%", (double)p->pitch_pct);
+        else lv_label_set_text(n->pitch, "");
+
+        const bool has_title = p->title && p->title[0];
+        lv_label_set_text(n->title, has_title ? p->title : (p->has_track ? "LOADING..." : "NO TRACK"));
+        lv_obj_set_style_text_color(n->title, has_title ? C_INK : C_DIM, 0);
+        lv_label_set_text(n->artist, p->artist ? p->artist : "");
+        char clock[32];
+        nb_clock_text(clock, sizeof clock, p->has_track ? p->position_ms : -1, p->duration_ms,
+                      p->position_estimated);
+        lv_label_set_text(n->pos, clock);
+
+        /* waveform: repaint on a new track / preview only */
+        const bool have = p->wave && s_nb_px;
+        if (have && (!n->wave_valid || n->wave_gen != p->wave_gen)) {
+            nb_paint_wave(r, p->wave);
+            lv_obj_invalidate(n->wave);
+        }
+        n->wave_valid = have;
+        n->wave_gen = p->wave_gen;
+        if (have) lv_obj_remove_flag(n->wave, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(n->wave, LV_OBJ_FLAG_HIDDEN);
+
+        /* played shade and playhead over the preview */
+        if (have && p->position_ms >= 0 && p->duration_ms > 0) {
+            int32_t x = (int32_t)(((int64_t)p->position_ms * NB_WAVE_W) / p->duration_ms);
+            if (x < 0) x = 0;
+            if (x > NB_WAVE_W - 2) x = NB_WAVE_W - 2;
+            lv_obj_set_width(n->shade, x);
+            lv_obj_set_x(n->head, x);
+            lv_obj_remove_flag(n->shade, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(n->head, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(n->shade, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(n->head, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+void dj_ui_show_neighbors(bool on)
+{
+    if (!g.nb_panel) return;
+    if (on) lv_obj_remove_flag(g.nb_panel, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(g.nb_panel, LV_OBJ_FLAG_HIDDEN);
+}
+
+bool dj_ui_neighbors_visible(void)
+{
+    return g.nb_panel && !lv_obj_has_flag(g.nb_panel, LV_OBJ_FLAG_HIDDEN);
 }

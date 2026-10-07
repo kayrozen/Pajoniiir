@@ -531,7 +531,10 @@ void ui_djui_bridge_update(const ui_djui_frame_t *frame)
         update_deck(d, &frame->deck[d]);
     }
     perf_max(&s_perf.decks_us_max, t0);
-    if (frame->overview_visible && !s_covered_saver && !s_covered_blackout) {
+    /* v338: the DJ LINK PLAYERS panel covers the Overview too (the direct PPA
+     * blit would paint over it). */
+    if (frame->overview_visible && !s_covered_saver && !s_covered_blackout &&
+        !dj_ui_neighbors_visible()) {
         t0 = bridge_now_us();
         update_strips(frame);
         perf_max(&s_perf.strips_us_max, t0);

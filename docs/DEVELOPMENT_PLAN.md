@@ -4367,6 +4367,440 @@ Validated on hardware (v117, 2026-09-21):
     `ui_library.c`, `ui_djui_bridge.c`, `app_main.c`, `web_server.c` with
     `-Werror`; UI simulator JC1060 unchanged. No host test covers the
     queue (dj_link.c and ui_library.c are firmware-only).
+  - HIL v335: accepted.
+
+- v336 persistent media identity for DJ Link downloads (plan step 4).
+  - Before: the cache file, analysis, artwork and cue edits of a peer track
+    were keyed by FNV-1a(peer IP, player number, rekordbox id). A new DHCP
+    lease, another player number, a re-export or the stick moved to another
+    player lost the cache and the cue edits; a re-encoded file under the
+    same id was never fetched again.
+  - `dj_link_db`: `dj_link_media_track_key(path, size)`, FNV-1a of a version
+    tag (`PJM1`), the file path in the export and the size. Pure, host
+    tested (`test_media_track_key`).
+  - `dj_link.c`: the key is computed in the NFS open hook, when the LOOKUP
+    gave the size. A cached `<key>.<ext>` is loaded without reading (the
+    hook refuses the transfer, `dj_link_fetch_failed` goes on with the
+    analysis as a cache hit); otherwise the cache is pruned and the file
+    downloaded as before. So a cache hit now costs the portmapper / MOUNT /
+    LOOKUP round trips (milliseconds on a LAN). The status carries the
+    key and the v249 key (`legacy_key`).
+  - `ui_library.c`: before submitting the load, the hot cue / cue point
+    blob and the memory cue edits stored under the v249 key are copied to
+    the media key if it has none (the old hot cue entry is erased). Once
+    per track, NVS, LVGL task.
+  - Effect on existing caches: every peer track is downloaded once more
+    under its new key; the old files are pruned with the next downloads.
+  - Divergence: upstream package J plans a full 32-byte identity; the P4
+    keys every track with 32 bits (NVS key names), so this stays 32-bit.
+  - Checked: dj_link host suites pass (`test_dj_link_pdb` keeps its known
+    failure); syntax `-Werror` of `dj_link.c` (with and without
+    reassembly), `ui_library.c`, `ui_djui_bridge.c`, `app_main.c`,
+    `web_server.c`; UI simulator JC1060 unchanged.
+
+- Plan step "playlist sort" not done: the operator decided on 2026-10-03
+  (v310) that sorting applies to vynull's track list only, not to
+  playlists. It stays refused (`SORT: ALL TRACKS ONLY`) until the operator
+  asks otherwise.
+
+- v337 PCM formats: WAV beyond 16 bits, AIFF, hi-res sources (plan step 6).
+  - Found while scoping: the firmware WAV path accepted 16-bit PCM only (24-
+    bit WAV, common in DJ libraries, was refused as `WAV ERR`), had no AIFF,
+    and a 88.2 / 96 kHz source (WAV or FLAC) was kept at its rate: its 2 s
+    forward runway filled the whole 4 s / 48 kHz timeline (no history, so no
+    scratch, short cue pre-roll), and the 2:1 sinc resampler, whose cutoff
+    follows the source rate, folded 24-43 kHz content into the audible band.
+  - `audio_pcm_file.c/.h` (pure, host-tested): RIFF/WAVE PCM 16 / 24 / 32-bit
+    integer and 32-bit float, plain or `WAVE_FORMAT_EXTENSIBLE`; FORM/AIFF
+    16 / 24 / 32-bit big-endian; AIFC `NONE` and `sowt`. Mono or stereo.
+    Conversion to int16 with rounding (24-bit keeps its top 16 bits rounded,
+    no dither); a truncated data chunk keeps the whole frames present.
+  - `audio_decim2.c/.h` (pure, host-tested): 2:1 half-band decimation, 63
+    taps (16 stored, Kaiser 8.5, `tools/audio/gen_decim2_table.py`), flat
+    within 0.0005 dB to 0.205 of the input rate, >= 85 dB rejection from
+    0.295 (measured: 96 kHz 1-19 kHz within 0.001 dB, 30 kHz alias -90 dB).
+    Once for 64-128 kHz, twice up to 256 kHz, refused above. Group delay 31
+    input frames (0.32 ms at 48 kHz), not compensated. Single precision.
+  - `audio_engine.c`: `ae_wav_init_from_cache` parses through
+    `audio_pcm_file`; WAV / AIFF and FLAC above 64 kHz set `decim_stages`
+    and the deck runs at the decimated rate (`sample_rate`), the seeks
+    convert to source frames (`sample_rate << decim_stages`) and restart the
+    decimation. The decoders decimate in place right after conversion, in
+    the decode task (~3 M multiply-adds per second per 96 kHz deck); the
+    output task sees 44.1 / 48 kHz PCM only. Decimator state in PSRAM (1 KB
+    per deck). WAV reads cap the frames per call to the 4.6 KB read buffer
+    (576 frames at 32-bit stereo). `decim_stages` is cleared at every load.
+  - `audio_format.c`: `.aif` / `.aiff` / `.aifc` and a FORM/AIFF(C) header
+    go through the PCM (WAV) path.
+  - Unchanged: FLAC still decodes to 16 bits through dr_flac (truncation,
+    as before); AAC / ALAC not supported.
+  - Tests: `tests/audio_pcm_file_jc1060`, `tests/audio_decim2_jc1060`
+    (registered in `run_p4_host_tests.ps1`), pass under ASan/UBSan. Syntax
+    `-Werror` of `audio_engine.c` and, with `-Wdouble-promotion`, of the
+    new files.
+
+- v338a NVS full: hot cues stop persisting (HIL v336).
+  - Symptom: `track cues save failed: ESP_ERR_NVS_NOT_ENOUGH_SPACE`, `hot
+    cue N set failed`; pads without LED and not triggerable (the pads read
+    the blob back from NVS). `partitions.csv` gives `nvs` 0x6000: 5 usable
+    pages, ~90 `hc` blobs (112 B = 6 entries) after the settings.
+  - Cause: every load of a track with analysis cues writes a `hc<key>` seed
+    (`load_track_cues`), nothing ever erases one, and the v336 migration
+    copied blobs to the media key without cleaning up: the old `mc` memory
+    edits were never erased; a failed write was silent; with a blob already
+    under the new key (a seed) the old one was left behind; unloaded tracks
+    never migrate.
+  - `hot_cue_store`: `hot_cue_store_blob_is_seed_only()` (pure: no pad and no
+    cue point made on the deck; the analysis rebuilds it on the next load).
+    A hot cue or memory edits save that fails with NOT_ENOUGH_SPACE erases
+    up to 24 seed-only `hc` blobs, except the keys of the loaded tracks
+    (`hot_cue_store_set_pin_provider`, set by `deck_core_init`) and the key
+    being saved, then retries once. `hot_cue_store_log_usage()` logs
+    `nvs_get_stats()` at boot and on every such failure.
+  - `ui_library_peer_migrate_cues`: the old `hc` / `mc` entry is erased once
+    the new key has data; an analysis seed under the new key no longer
+    blocks the move of the deck's edits; a failed write is logged and keeps
+    the old entry.
+  - Not done: a bigger `nvs` or a second partition (`nvs_cues` at 0x630000,
+    needs a partition table flash); blobs under old v249 keys of tracks that
+    are never loaded again and hold deck edits stay (only seed-only ones are
+    pruned).
+  - Tests: `test_hot_cue_store_jc1060` (rule, full store prunes and retries,
+    pinned and edited blobs survive, nothing to free fails cleanly); the
+    deck_core / ui host suites pass. Syntax `-Werror` of `hot_cue_store.c`,
+    `hot_cue_store_merge.c`, `deck_core.c`, `ui_library.c`.
+  - HIL v338a: accepted (the hot pads are back).
+
+- v338 state of the other players (DJ LINK PLAYERS panel). The plan had no
+  written v338 section; scope taken from the plan table of 2026-10-04: loaded
+  track (title, artist), BPM, position, waveform preview.
+  - `dj_link_peer_t` gains the track the status reports (`source_device`,
+    `source_slot`, `rekordbox_id`, `beat_count`).
+  - `dj_link_neighbor.c/.h` (pure, host tested): per-player cache and
+    request book-keeping (see DJ_LINK_SPEC, v338).
+  - `dj_link.c`: a third dbserver session (service mode, own TCP connection
+    and 64 KB PSRAM ring) asks the source device for the metadata and the
+    waveform of each followed player's track; paused while a download runs;
+    `dj_link_get_neighbors()` hands the UI a copy (position carried on).
+  - `dj_ui`: DJ LINK PLAYERS panel on `lv_layer_top`, opened and closed by a
+    tap on the master chip: per player number, name, MASTER / ON AIR / PLAY /
+    SYNC, BPM and pitch, title, artist, position / duration (`~` when
+    estimated), 340x64 waveform preview in a 4 x 43 KB PSRAM block with
+    played shade and playhead. `ui_settings.c` feeds it 4 times a second
+    only while it is open; the bridge skips the Overview's direct blit while
+    it is.
+  - Why a panel and not on the Overview: the Overview (two decks, FX,
+    footers) has no free area; changing it would move every capture.
+  - Tests: `test_dj_link_state` (track fields), `test_dj_link_neighbor`;
+    UI simulator JC1060 gains `neighbors_overlay` and
+    `neighbors_one_estimated` (24 existing captures unchanged). Syntax
+    `-Werror` of `dj_link.c` (with and without reassembly),
+    `dj_link_neighbor.c`, `dj_ui.c`, `ui_settings.c`, `ui_djui_bridge.c`.
+  - Limits: no real CDJ / vynull run yet; vynull has to send a CDJ status
+    that carries a track (see the HIL procedure); without a 0x0b the position
+    is an estimate.
+  - `tools/djlink/fake_cdj.c`: host tool (built on the P4's own codec) that
+    plays a made-up player for the HIL: keep-alive, status with a loaded
+    track, optional 0x0b position, beat packets with jitter (`--beats
+    --jitter-us`) and the master flag (`--master`).
+
+- v340 internal RAM: the v338 / v339 statics go to PSRAM (HIL v339 boot).
+  - Symptom (HIL v339): `[HEAP] before eth web_server_start: internal
+    free=26447 largest=9216`, `after ... free=10627 largest=3328`, then at
+    a local USB load `alloc FAILED size=4096 caps=0x804 ... largest=2816`,
+    `failed to create ae_loader task`, `track load worker failed
+    ESP_ERR_NO_MEM`; also a `task_wdt` IDLE0 with CPU0 held by httpd.
+  - Audit (linker map and symbol table of the v339 build, 212 KB of internal
+    statics): the v338 / v339 additions were plain statics, so internal:
+    `s_nb_pub`, `s_nb_published` and the `copy` of `dj_link_get_neighbors`
+    2692 B each, `s_nb_cache` 2304, `s_clock_bank` 1440 (dj_link.c);
+    `s_nb` 2400 and `s_ui` 208 (ui_settings.c): 14 428 B. Also internal and
+    left as is: the 60 LVGL objects of the DJ LINK PLAYERS panel, 4.6 KB
+    (measured with a counting allocator around `dj_ui_create`; the other
+    13 KB of its allocations are over the 64 B threshold, so PSRAM, as
+    are the 174 KB of previews). Checked and clean: v337 (`s_decim` is in
+    PSRAM), `dj_link_clock` / `deck_net_sync` (no task, queue or heap: the
+    `latency_us` field and the sub-ms anchor are a few bytes), the v338
+    session (`s_nb_mem` 64 KB ring and the 128 KB PWV3 buffer are PSRAM; one
+    more lwIP TCP PCB while a request is open).
+  - Fix, one class: `EXT_RAM_BSS_ATTR` (the v292 pattern) on those six
+    statics. Read back from the compiled objects: all in `.ext_ram.bss`.
+    `s_nb_published` leaves `s_mux`: its writer (the dj_link task) and its
+    reader (the LVGL task, 4 Hz, only while the panel is open) use a
+    seqlock (`dj_link_nb_publish` / `dj_link_nb_read`), because a 2.7 KB
+    copy from PSRAM with interrupts off is not what the isoc path needs; the
+    reader gives up after 4 tries and the next poll gets it.
+  - Expected: +14.4 KB internal free at every boot point. Not proven to be
+    enough: the web server alone takes 15.8 KB (26447 -> 10627) and its
+    httpd stack is 8 KB of internal RAM (`web_server.c`, `stack_size`).
+    Next step if the HIL still shows `largest` under ~8 KB after the web
+    server: httpd task stack / sockets, a separate class.
+  - httpd / IDLE0 watchdog: not touched (one class per version). Neither
+    v338 nor v339 code runs in a web handler (`web_server.c` references
+    nothing of `dj_link`'s neighbours or clock). Likely a consequence of
+    the failed load (httpd at priority 3 on core 0, IDLE0 starved while it
+    serves); to confirm with the log lines around `task_wdt`.
+  - Tests: syntax `-Werror` of `dj_link.c` (with and without reassembly) and
+    `ui_settings.c`; 27 runner suites and the UI simulator unchanged.
+
+- v342 NFS export of our USB key, read-only (first half of "serve our USB";
+  the dbserver is v343).
+  - Scope. The plan's v340+ item split into v342 NFS, v343 dbserver, v344 the
+    peers' SD slot (see v341). This version is the NFS half only: a CDJ or
+    vynull that sees our player (media query reply since v247) can now fetch
+    `export.pdb`, the analysis files and the audio from `/C/`. It cannot yet
+    browse or load: that needs the dbserver (v343), without which our media
+    still shows as empty to a CDJ's menu. Nothing from upstream packages I / J
+    applies (they are client side); the reference was vynull's `nfs` package
+    (GPL, read for behaviour only, nothing copied) and the esp-djlink client.
+  - `dj_link_nfsd.c/.h` (pure, no I/O): portmapper (GETPORT for MOUNT v1 and
+    NFS v2 over UDP, NULL), MOUNT (NULL, MNT, UMNT, UMNTALL, EXPORT) and NFS
+    v2 (NULL, GETATTR, LOOKUP, READ, READDIR, STATFS), on the esp-djlink codec
+    (`djlink_rpc_call_parse`, `djlink_rpc_reply_build`, fattr). Behaviour taken
+    from what a player does (crate-digger, vynull):
+    - every name from a CDJ is UTF-16LE, a Linux client sends bytes: told apart
+      by content (even length and every high byte 0, or any NUL: a UTF-8 name
+      never has one), decoded to UTF-8 (surrogate pairs included); READDIR
+      names go back in the charset the same client address used last (4
+      clients remembered);
+    - a CDJ rewrites bytes 12..31 of a file handle: only the first 12 count
+      (slot index, generation, hash of the path); the root handle is all zero,
+      as a rekordbox answers; 32 handles, the least recently used recycled and
+      answering STALE afterwards, all dropped when the key goes or comes back;
+    - MNT accepts `/C/` (and `C`, ``) in either charset and answers NOENT to
+      the SD slot `/B/` and anything else; EXPORT lists `/C/` with the group
+      `<our ip>/255.255.0.0` (empty list while the key is not mounted: what an
+      unlinked player answers); GETPORT answers 0 for MOUNT / NFS then;
+    - read-only by construction: SETATTR, WRITE, CREATE, REMOVE, RENAME, LINK,
+      SYMLINK, MKDIR, RMDIR answer ROFS (counted, nothing is ever opened for
+      writing); READLINK INVAL; a path element is a plain name only (no `/`,
+      `\`, `.`, `..`, empty, NUL, lone surrogate), so the export root is a
+      jail even before the backend looks; unknown program / version / procedure
+      get the proper RPC accept status; short arguments GARBAGE_ARGS; a
+      datagram that is not an RPC call gets no reply; READ capped at 8192 and
+      at the room of the reply buffer, 0 bytes past the end, ISDIR on a
+      directory.
+  - `dj_link_nfsd_fs.c/.h` (POSIX, host tested on a temporary directory): the
+    tree behind it, `stat` / `fopen` / `opendir` under a root, `gate_begin` /
+    `gate_end` hooks around every access to the medium, the last file and the
+    last directory kept open for sequential READ / READDIR and closed after
+    2 s idle or when the key goes. File ids are a hash of the path (FAT has no
+    inode), READDIR cookies are entry numbers (stable order, no `.` / `..`).
+  - `dj_link_nfsd_service.c/.h` (firmware): one task `dj_nfsd` (priority 1,
+    core 1, stack and ~19 KB of state and datagram buffers in PSRAM: read back
+    from the compiled object, `.ext_ram.bss`, only ~90 B of small bss internal),
+    two BSD sockets bound to our Ethernet address, not to any address, so the
+    Wi-Fi AP cannot reach the export: UDP 111 (portmapper) and 2049 (MOUNT and
+    NFS on the one port, the portmapper says so). Started by `dj_link_open`
+    with the address DJ Link joined on, stopped by `dj_link_close`; follows the
+    key (`usb_storage_is_mounted`, every 250 ms). Reads take `media_io_gate`,
+    the mutex of the audio decoder's USB reads (priority inheritance: a deck is
+    never made to wait more than one read of at most 8 KB).
+    `dj_link_config_t` gains `export_root`, `export_available`,
+    `export_gate_begin`, `export_gate_end`; `app_main.c` passes `/usb`,
+    `usb_storage_is_mounted`, `media_io_gate_begin` / `_end`.
+  - `sdkconfig.defaults`: `CONFIG_LWIP_MAX_SOCKETS=12` (was 10): the netconn
+    pool is the socket pool; httpd holds about 7, the export 2, and a pull-OTA
+    HTTP client one more.
+  - `tools/djlink/nfs_fetch.c`: host tool, the P4's own client (`djlink_nfs`)
+    on real UDP sockets, to fetch a file from the export (`--bytes` for a Linux
+    client's names, `--window`, `--read-size`, `--pmap`), prints size, time,
+    rate and a byte sum.
+  - Interoperability, run here: an independent client, vynull's `nfs.Dial` /
+    `Exports` / `ReadFile` / `FetchExportPDB` (the code that reads real CDJs),
+    against this server on real UDP sockets in an isolated network namespace
+    (the `unshare -rn` binds 111 without root): exports `[/C/]`, a 137 001-byte
+    `export.pdb` and a 2 500 003-byte file named `Czárdás – Ünïcode.mp3`
+    identical to the source, an empty file, NOENT for a missing one,
+    `FetchExportPDB` finds `PIONEER/rekordbox/export.pdb`. Then `nfs_fetch` on
+    the same socket server: identical file, the missing one reported. This is
+    the server core and the POSIX backend on a PC: the P4 task, its sockets and
+    the USB volume are not covered.
+  - Tests: `test_dj_link_nfsd` (ASan / UBSan): the esp-djlink client fetching
+    through an in-memory pump in UTF-16LE and bytes, every READ size from 512
+    to 8192, windows 1 and 4, every fifth reply lost, a 1400-byte reply buffer,
+    a non-ASCII name, a 0-byte file; raw requests for the mount rules,
+    portmapper answers, export list, hostile names in both charsets, mangled
+    handles, READ edges, READDIR paging (120 entries in 4 calls of 1 KB) and
+    charset memory per client, every write procedure refused (and nothing
+    created), handle recycling, the export going away and coming back, the
+    cached file closing when idle and a file removed under a valid handle. 27
+    runner suites, the dj_link Makefile suites and the UI simulator unchanged.
+    Syntax `-Werror` of `dj_link.c`, `dj_link_nfsd.c`, `dj_link_nfsd_fs.c`,
+    `dj_link_nfsd_service.c`, `app_main.c`.
+  - Not done / limits: the dbserver (v343), so no browsing and no LOAD from a
+    CDJ yet; the SD slot `/B/` (v344); no TCP NFS and no mount of `/` or of
+    subdirectories; the export is open to every host on the Ethernet segment
+    (as a CDJ's is) as long as DJ Link is ON: it is read-only and DJ Link
+    already announces the library; no per-client limit, a client reading the
+    key in a loop shares its bandwidth with the decks through the gate only.
+    Nothing ran on the board, against a real CDJ or through vynull's CDJ
+    discovery.
+
+- v341b health monitor below the audio priorities (replaces v341a).
+  - v341a moved httpd to core 1 on the evidence that every task watchdog of
+    HIL v341 was `IDLE0` starved with `cpu0=httpd` or `cpu0=ae_output` and
+    `cpu1=IDLE1`. Comparing with upstream (`dvucinozd/Pajoniiir`, branch
+    codex/fork-improvements, commit `75136aef`) showed that upstream keeps
+    httpd on core 0 (priority 3, 8 KB stack, same as ours) and passes its
+    soaks, and that it fixed a different defect that we share: v341a is
+    reverted (`web_server.c` is back to core 0, identical to HEAD).
+  - Defect: `health_monitor_cb` ran from the `esp_timer` task (priority 22,
+    core 0) every 5 s and called `audio_engine_get_diagnostics_snapshot`,
+    which takes `AE_LOCK`, a recursive FreeRTOS mutex (priority inheritance).
+    The priority-5 decoder holds it during `decode_one_frame` and seeks (our
+    HIL window before the crash: `dec_max D1` 2-3 ms rising to 7.2 ms). A
+    snapshot waiting on it lifts the decoder to priority 22, above the
+    priority-6 `ae_output`: the output runs late while its USB clock stays
+    on time, which is what `pace_wait max=28526us behind=211 uac_low=0`
+    looks like with the mix time unchanged. Upstream measured the same on
+    its board (late blocks with normal DMA cadence) before finding it.
+  - Fix, one class: the monitor is a task, `svclog_mon`, priority 2, core 1,
+    period 5 s (`vTaskDelayUntil`), same callback and same coalescing. Below
+    both audio workers, so inheritance cannot outrank the output. The stack
+    (4 KB) is in PSRAM like `eth_web`, not internal as upstream (our internal
+    RAM is the v340 problem); the task only reads counters and queues
+    service-log records. A failed create logs and costs the summaries only.
+    `/api/status` (httpd, priority 3) also calls the snapshot: it cannot lift
+    the decoder above its own priority 5, so it is left alone.
+  - Not claimed: that this ends the task watchdogs. A 5 s IDLE0 starvation is
+    not a few-millisecond inversion, and the three httpd watchdogs (one with
+    no audio) are still unexplained. If one comes back, the previous-boot
+    trace line (`cpu0=` / `cpu1=`) and the browser or client that was talking
+    to the board are what to send. The audit of the pacing loop, AutoIP and
+    the heap-walking callers (v341a notes) stands: the loop does not spin
+    (`vTaskDelay(1)` steps, forced idle every 64 blocks or 100 ms), AutoIP did
+    not engage (every boot had a DHCP lease), and nothing in `web_server.c`
+    walks the heap.
+  - Checked: syntax `-Werror` of `app_main.c` and `web_server.c`. Not run:
+    build, flash, HIL.
+
+- v341 fader start, on air, AutoIP (first part of the plan's "v340+" item;
+  numbered v341 because v340 is the internal RAM fix above).
+  - Scope decision. The plan line read "serve our USB keys (dbserver + NFS
+    read-only), then the SD slot /B/, AutoIP, fader start and on air; the
+    biggest job, to be cut up". The plan has no written v340 section, and the
+    upstream packages I / J (`docs/FORK_IMPROVEMENTS.md`, branch
+    codex/fork-improvements) only describe the client side (browse, download,
+    cache): nothing to import for serving. Done here: the three items that are
+    one protocol packet or one config each and testable on the host. Left, in
+    this order (one per version, hardware between):
+    - v342 NFS export, read-only: UDP ONC-RPC server on the dj_link task
+      (portmapper GETPORT, MOUNT MNT of `/C/`, NFS v2 GETATTR / LOOKUP / READ /
+      READDIR) over the local USB volume, path-jailed, with the XDR / RPC
+      codec pure and tested against the existing client (`djlink_nfs`). Buffers
+      and the task stack in PSRAM; HIL v339 showed what internal RAM allows.
+    - v343 dbserver, served: the discovery port 12523 and the TCP menu / track
+      metadata / waveform / artwork requests a CDJ or vynull sends, answered
+      from our library (the dj_link_db client already parses these replies;
+      vynull's `dbserver` package is the reference for the replies). Needs the
+      library's rekordbox ids and the P4's own memory budget settled first.
+    - v344 SD slot `/B/` of the peers: the Library's source cycle becomes
+      (player, slot), `dj_link_browse_select` and `dj_link_fetch_start` take a
+      slot, the NFS export is `/B/` instead of `/C/`, the media key tags the
+      slot, and a slot's presence comes from the status packet's media bytes
+      (`0x6f` USB, `0x73` SD; vynull's template uses 0x00 = loaded, 0x04 =
+      absent, to be confirmed on a real player). Touches `ui_library.c` source
+      handling and the cache key, so it is its own version.
+    All of v342 - v344 need a real CDJ or vynull in CDJ mode to mean anything.
+  - Fader start (port 50001, type 0x02): `dj_link_mixer.c` (pure) keeps the
+    last command per channel 1..4 and gives START / STOP once per change (a
+    mixer repeats a command; a deck the operator paused must not restart on the
+    repeat). Only mixers (device number 33 and up) count. A deck's channel is
+    its player number (1..4: the packets carry four). `dj_link.c` hands the
+    event to deck_core as `DECK_CORE_NET_FADER_START / _STOP` through the same
+    queue as the v305 sync commands. `deck_core` (`apply_net_fader`) does what
+    PLAY and CUE do: START plays a paused deck from where it stands (its cue
+    point after CUE); STOP sends a playing deck back to the cue point, paused.
+    Honoured only while LINK SYNC is on (checked in dj_link and again in
+    deck_core), only on a loaded deck, not while the jog holds the deck, and a
+    command that changes nothing is dropped. Not modelled: a CDJ's fader start
+    needs its own "fader start" setting and an on-cue standby; here the LINK
+    SYNC switch is the permission.
+  - On air (type 0x03): the same module keeps the 4 channel flags with the
+    time of the last packet; our CDJ status sets flag `0x08` for a deck whose
+    channel is on air and the mixer spoke within 5 s (`DJ_LINK_ON_AIR_HOLD_MS`:
+    a guess, a real DJM's cadence is not known to me). Never for an empty deck.
+  - AutoIP: `sdkconfig.defaults` `CONFIG_LWIP_AUTOIP=y`, `CONFIG_LWIP_AUTOIP_TRIES=3`
+    (about 7 s of DHCP before the fallback). IDF's netif posts
+    `IP_EVENT_ETH_GOT_IP` on any IPv4 address change (read in
+    `esp_netif_lwip.c`: `DHCP_CB_CHANGE` includes the address), so the
+    169.254.x.x address reaches `eth_bringup` and dj_link as a normal lease
+    (the broadcast address dj_link uses comes from the netmask: 169.254.255.255)
+    and a DHCP server that shows up later replaces it, which dj_link answers by
+    rejoining. `eth_bringup` logs `(link-local, no DHCP server)`. Effect to
+    know: on a network without DHCP the board now has an address instead of
+    none, so the Ethernet web UI, mDNS and OTA offers are reachable there too.
+  - Not run: nothing on the board. The AutoIP behaviour is read from the IDF
+    source, not observed.
+  - `tools/djlink/fake_cdj.c`: `--mixer` mode (a made-up DJM): `--fader
+    start|stop --target N` (3 packets, then back to rest) and `--on-air 1,3`
+    (every 300 ms).
+  - Tests: `test_dj_link_mixer` (edges, repeats, replaced and cancelled
+    events, refusals, on-air hold and the ms wrap), `test_dj_link_state`
+    (status flag), `deck_core_pfl_led_jc1060` (`test_net_fader_start_stop`:
+    LINK SYNC off, start, repeat, stop to the cue, empty deck, engine error);
+    27 runner suites and the dj_link Makefile suites pass, UI simulator
+    unchanged; syntax `-Werror` of `dj_link.c` (with and without reassembly),
+    `dj_link_mixer.c`, `dj_link_session.c`, `dj_link_master.c`, `deck_core.c`,
+    `app_main.c`, `eth_bringup.c`. End to end on loopback (isolated network
+    namespace): `fake_cdj --mixer` -> 13 packets -> the real module gives
+    1 start and 1 stop event for 3 + 3 packets and on air on channels 1 and 3.
+
+- v339 network clock (package K of the plan): phase on what is heard.
+  - Found while scoping (v304 code): the master's beat clock was its last beat
+    packet, stamped in whole milliseconds, so every packet's jitter went
+    straight into the phase the deck trims to; the deck compared the mixed
+    position (not yet heard) with the master's beats, so a master and a deck
+    "in phase" sounded one output latency apart (UAC ring + URBs, ~20-40 ms);
+    our status sent beat counter 0xffffffff and Syncn 0.
+  - `dj_link_clock.c/.h` (pure, host tested): per player, the arrival times of
+    the beat packets in microseconds (`rx_us`, read once in the lwIP receive
+    callback; `rx_ms` is that / 1000) go into a window of 16 beats. The beat
+    index comes from the time between packets and the bar position, so a lost
+    packet leaves a gap, not a wrong phase. Period = the packet's own BPM
+    (exact); the least-squares slope replaces it only when it differs by more
+    than 3 standard errors (at most 0.3 %): a crystal off its announced tempo.
+    Phase = the mean of the window (error sigma / sqrt(16) instead of sigma:
+    2 ms uniform jitter gives at most 0.5 ms). A tempo change (> 0.3 %), a bar
+    that does not follow, a silence over 4 beats or 3 packets in a row far
+    from the line restart the window; one early / late packet is skipped.
+    Locked at 4 beats; before that the table's last-packet clock stands.
+  - `dj_link.c`: beat packets (0x28) feed the bank; the clock handed to
+    deck_core is refined by it (`anchor_frac_us` carries the microseconds;
+    `deck_net_clock_bar_position` subtracts them). Logs: `beat clock: player
+    #N, X BPM (last packet)` when a master appears, then once `beat clock:
+    player #N regression on 16 beats, rms R us` when the estimate takes over.
+  - Output latency: `deck_net_sync_local_t.latency_us` (the same
+    `audio_engine_output_latency_us()` the UI uses for the audible position,
+    published by the UI task with `deck_core_set_output_latency_us()`, capped
+    at 200 ms). The loop judges the phase on the heard position (mixed minus
+    latency x playback rate) and a bar snap targets a mixed position that
+    sounds aligned. Host test: with 40 ms the heard phase locks within 0.01
+    beat; without the compensation it stays 0.083 beat (40 ms) behind (what
+    v304 to v338 did).
+  - Our status: beat counter 0xa0 (1-based number of the last grid beat
+    reached, 0 before the first, 0xffffffff without a grid) and bar position
+    0xa6 from the grid window at the playhead of the moment; Syncn 0x84: read
+    from the peers' status (`dj_link_table_largest_sync`), and a deck that
+    takes the tempo master sends the highest + 1 (beat-link does the same),
+    kept when it lets go, reset with the link. Written after the codec's
+    status build (`djlink_status_t` has no field for it): the vendored codec
+    is untouched.
+  - Not done: the master's own output latency (a CDJ's few ms) is not
+    modelled; fader start (`02`) and on-air (`03`) are still ignored; no
+    run against a real CDJ - the constants (tolerances, window) come from
+    simulation and from jitter injected through `fake_cdj`.
+  - Tests: `test_dj_link_clock` (jitter 2 ms -> 0.5 ms, period vs hint, lost
+    packets, restarts, outliers, 64-bit times), `test_dj_link_state` (beat
+    counter, Syncn), `test_deck_net_sync` (sub-ms anchor, latency
+    compensated / ignored / clamped), 27 runner suites, UI simulator
+    unchanged. Syntax `-Werror` of `dj_link.c` (with and without
+    reassembly), `dj_link_clock.c`, `dj_link_state.c`, `dj_link_session.c`,
+    `deck_core.c`, `deck_net_sync.c`, `ui.c`, `app_main.c`. End to end on
+    loopback (isolated network namespace): `fake_cdj --beats --jitter-us
+    3000` -> 19 packets in 9 s -> locked on 16 beats, period 500000 us,
+    rms 1.7 ms.
 
   UI simulator: `overview_bridge_download` (new) and the deck / row bars
   checked by object. The `library_busy` and `library_bridge_peer` baselines

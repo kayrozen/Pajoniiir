@@ -181,6 +181,7 @@ int ui_library_page_selection_after_delta(int total_tracks,
 #include <unistd.h>          /* v321: lseek/read for the peer seek table */
 #include "dj_link.h"
 #include "dj_link_session.h"
+#include "hot_cue_store.h"
 #include "ui_peer_nav.h"
 #include "djlink/status.h"
 #include "ui_artwork.h"
@@ -1826,6 +1827,51 @@ static void ui_library_poll_peer_late(void)
     memset(&s_peer_late, 0, sizeof(s_peer_late));
 }
 
+/* v336: peer cache files and cue edits moved from the v249 key (peer IP,
+ * player number, rekordbox id) to the media key (path + size). Before the
+ * first load under the new key, move the hot cue / cue point blob and the
+ * memory cue edits saved under the old one, so they survive the change.
+ * v338: the old entry is erased whenever the new key has its own (a seed of
+ * an earlier load is replaced by the deck's edits, never the other way
+ * round), a failed write is logged and keeps the old entry. Once per track;
+ * NVS, LVGL task, before the load is submitted. */
+static void ui_library_peer_migrate_cues(uint32_t legacy_key, uint32_t key)
+{
+    if (legacy_key == 0u || key == 0u || legacy_key == key) {
+        return;
+    }
+    hot_cue_store_blob_t old_hc;
+    if (hot_cue_store_load(legacy_key, &old_hc) == ESP_OK) {
+        hot_cue_store_blob_t cur;
+        const bool have = hot_cue_store_load(key, &cur) == ESP_OK;
+        const bool keep_cur = have && (!hot_cue_store_blob_is_seed_only(&cur) ||
+                                       hot_cue_store_blob_is_seed_only(&old_hc));
+        esp_err_t rc = keep_cur ? ESP_OK : hot_cue_store_save(key, &old_hc);
+        if (rc == ESP_OK) {
+            (void)hot_cue_store_clear(legacy_key);
+            ESP_LOGW(TAG, "peer cues: %08x -> %08x (media key%s)", (unsigned)legacy_key,
+                     (unsigned)key, keep_cur ? ", kept" : "");
+        } else {
+            ESP_LOGW(TAG, "peer cues %08x -> %08x not moved: %s", (unsigned)legacy_key,
+                     (unsigned)key, esp_err_to_name(rc));
+        }
+    }
+    hot_cue_store_memory_blob_t old_mc;
+    if (hot_cue_store_memory_load(legacy_key, &old_mc) == ESP_OK) {
+        hot_cue_store_memory_blob_t cur;
+        esp_err_t rc = hot_cue_store_memory_load(key, &cur) == ESP_OK
+                           ? ESP_OK
+                           : hot_cue_store_memory_save(key, &old_mc);
+        if (rc == ESP_OK) {
+            old_mc.count = 0;   /* an empty blob erases the key */
+            (void)hot_cue_store_memory_save(legacy_key, &old_mc);
+        } else {
+            ESP_LOGW(TAG, "peer memory cues %08x -> %08x not moved: %s",
+                     (unsigned)legacy_key, (unsigned)key, esp_err_to_name(rc));
+        }
+    }
+}
+
 /* The download is complete: load the cached file like a local track.
  * v335: false while another load is still running (the other deck's
  * download finished just before): poll again, do not drop it. */
@@ -1849,6 +1895,7 @@ static bool ui_library_load_peer_file(ui_peer_fetch_t *f, const dj_link_fetch_st
         return true;
     }
     ui_library_peer_fetch_refresh_item(f, st);
+    ui_library_peer_migrate_cues(st->legacy_key, st->track_key);
     media_catalog_track_t item = f->item;
     item.track_key = st->track_key;
     ESP_LOGW(TAG, "peer load: deck %u <- %s%s", (unsigned)deck + 1u, st->path,

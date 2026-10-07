@@ -4,6 +4,14 @@
 
 #include <string.h>
 
+bool hot_cue_store_blob_is_seed_only(const hot_cue_store_blob_t *blob)
+{
+    hot_cue_store_blob_t n = *blob;
+    hot_cue_store_normalize(&n);
+    return (n.valid_mask & (uint32_t)~n.source_mask) == 0u &&
+           (!n.has_cue || n.cue_from_source);
+}
+
 void hot_cue_store_normalize(hot_cue_store_blob_t *blob)
 {
     blob->version = HOT_CUE_STORE_VERSION;

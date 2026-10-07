@@ -76,7 +76,7 @@ Phase 1 — passive observer (highest value, lowest risk):
   line. Not yet done: bar position, control_link/beat-grid feed, Overview.
   Without Phase 2 keep-alives the CDJs may send no `0a` status, so the master
   is then inferred from beats (shown with `?`). Broadcasts are only heard on
-  the P4's own subnet (no AutoIP / link-local yet).
+  the P4's own subnet (v341: AutoIP / link-local, see below).
 - Status (v304, JC1060, not yet hardware-tested): bar position and the sync
   feed are done. The P4 follows the network master; taking master
   (`2a` / `26` / `27`) is Phase 4, v305.
@@ -144,7 +144,8 @@ Phase 2 — virtual CDJ:
 - Media query `05` gets a `06` reply, unicast only: our USB slot,
   "PAJONIIIR LIBRARY", track count, 500 ms per-querier limit, no reply when
   the library is empty. The advertised media cannot be browsed yet: we do not
-  serve our own NFS export or dbserver (the v249 NFS code is a client only).
+  serve our own dbserver (v343); since v342 our USB is exported over NFS (see
+  the v342 entry in the phased plan below).
 - Since v333 a network load-track no longer needs the source to be browsed
   nor the row to be listed: the download job opens its own dbserver session
   (Phase 2c), and an unlisted row is titled `TRACK <id>` until the job's
@@ -254,7 +255,7 @@ two options:
    removed custom "CDJ Link" idea that this spec warns about.
 
 Recommendation for v249: an NFSv2 read-only client, fetch-to-cache and then
-load, never streaming into the deck. Serving our own USB over NFS (so CDJs can
+load, never streaming into the deck. (v342: done, see the end of the phased plan.) Serving our own USB over NFS (so CDJs can
 load our tracks) stays a separate, later step (v250+).
 
 Phase 2c — peer track download (NFS client, peer → us):
@@ -423,6 +424,20 @@ Phase 2c — peer track download (NFS client, peer → us):
 
       A NFS LOOKUP-size check on the audio is the next step if a source
       re-exports audio under the same id.
+
+      Since v336 the cache key is the media identity
+      (`dj_link_media_track_key`): FNV-1a of a version tag, the file path in
+      the player's export and the file size from the NFS LOOKUP. The audio
+      LOOKUP therefore runs on every load; the open hook loads `<key>.<ext>`
+      from the cache without reading when it is there, else prunes and
+      downloads. The key no longer changes with the peer's IP (DHCP),
+      player number, a re-export (new rekordbox ids) or the same stick in
+      another player, and a re-encoded file (other size) is downloaded
+      again. Cue edits follow the key: on the first load under it, the hot
+      cue / cue point blob and the memory cue edits saved under the v249 key
+      are copied to it (the old hot cue entry is erased). 32-bit like every
+      track key of the P4 (NVS `hc%08x` / `mc%08x`); upstream package J
+      plans a 32-byte identity.
   - Artwork (v300): the artwork id is argument 8 of a title item
     (item type `& 0xff == 0x04`), both in the list render and in the
     metadata `0x2002` reply, so the browse row carries it. After the grid,
@@ -579,10 +594,64 @@ Phase 4 — control integration:
     task applies them like the buttons, so the P4 stays authoritative.
   - LINK SYNC OFF keeps the v301 behaviour: the status shows master whenever
     SYNC MASTER is set, and `2a` / `26` / `27` are only logged.
-  - Not done: Syncn (`0x84`) is still sent as 0, and fader start `02` /
-    on-air `03` are ignored.
-- Optional: TCP metadata query — pull track titles/waveform of CDJ-loaded
-  tracks for display (P4 can also serve its own ANLZ data).
+  - v342: our USB key is exported over NFS, read-only (`dj_link_nfsd*.c`,
+    `dj_link_nfsd_service.c`; DEVELOPMENT_PLAN v342 has the details). The
+    portmapper answers on UDP 111 and MOUNT + NFS v2 on UDP 2049, both bound to
+    our Ethernet address, from DJ Link starting to it stopping, while the key is
+    mounted. `/C/` is the USB slot (`/B/`, the SD slot, is not served);
+    names are UTF-16LE to a CDJ and bytes to a Linux client; a CDJ's rewritten
+    handle bytes 12..31 are ignored; every write procedure answers ROFS.
+    Checked against vynull's NFS client (the code that reads real CDJs) on a
+    PC, not on the board, not against a CDJ. A CDJ still cannot browse our
+    media: the dbserver (TCP, port 12523 discovery then the menu / metadata /
+    waveform / artwork requests) is v343, the peers' SD slot v344.
+  - v341: fader start (type `02`, port 50001) and on air (type `03`) from a
+    mixer (device number 33 and up) are used: START / STOP once per change per
+    channel 1..4 (a deck's channel is its player number), applied by deck_core
+    as PLAY / back to the cue, only while LINK SYNC is on; on air sets flag
+    `0x08` of our status for 5 s after the mixer's last packet. AutoIP
+    (`CONFIG_LWIP_AUTOIP`, 3 DHCP probes) gives the board a 169.254.x.x address
+    when no DHCP server answers, so a CDJ cabled straight to it can talk.
+    Serving our own dbserver / NFS and the SD slot of the peers are v342 -
+    v344 (see DEVELOPMENT_PLAN).
+  - v339: Syncn (`0x84`) is sent: the highest value on the network + 1 when a
+    deck takes the tempo master, kept afterwards; our status also carries the
+    beat counter (`0xa0`) and bar position (`0xa6`). Not done: fader start
+    `02` and on-air `03` are ignored.
+  - v339: the clock a deck follows is estimated (see DEVELOPMENT_PLAN v339):
+    beat packets stamped in us, a 16-beat window, the packet's BPM as the
+    period, the mean of the window as the phase, restart on a tempo change,
+    a jump of the bar or a silence; and the deck judges the phase on the
+    heard position (mixed minus the output latency).
+- v338: TCP metadata query for the other players (done; the "optional" item
+  of earlier versions). Tracks of CDJ-loaded players are described on the
+  DJ LINK PLAYERS panel (tap the master chip in the top bar):
+  - Status 0x0a already carries the track: source device (0x28), slot
+    (0x29), rekordbox id (0x2c) and the beat counter (0xa0); the peer table
+    keeps them (`source_device`, `source_slot`, `rekordbox_id`,
+    `beat_count`; no track when the id or the source is 0, or BPM 0xffff).
+  - `dj_link_neighbor.c` (pure) follows up to 4 players (not rekordbox
+    sources) whose track is on a dbserver source (SD 2, USB 3, rekordbox 4;
+    a CD has nothing to ask) and tells the session what to ask next:
+    metadata (title, artist, duration, BPM) with the 0x2002-style metadata
+    request, then the waveform request (0x2904) reduced to the 400-column
+    PWAV preview. One request per loaded track; a changed track restarts the
+    slot, an answer for an older track is ignored, a request failing 3 times
+    (4 s apart) is dropped until the player loads another track (a missing
+    waveform leaves the text).
+  - The session is the service mode of `dj_link_db` (v333), a third TCP
+    connection of its own, started to the device the track came from (not
+    necessarily the player), as our deck 1 player number, kept only while a
+    request is open, paused while a download runs. Memory: the 64 KB ring
+    stays in PSRAM once allocated (freed when DJ Link goes OFF); a 128 KB
+    PWV3 buffer only during a waveform request.
+  - Position: the 0x0b packet (CDJ-3000) when the player sends one, carried
+    on while it plays; else estimated from the beat counter at the effective
+    BPM (`~mm:ss`, within a first-beat offset). Played shade and playhead
+    over the preview follow it.
+  - Not done: the Overview itself shows nothing of this (no free space); the
+    panel is on the top layer and covers the Overview's direct blit while
+    open. Nothing for mixers.
 
 ## Component layout (proposed)
 

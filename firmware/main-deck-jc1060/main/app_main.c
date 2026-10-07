@@ -42,10 +42,18 @@ static const char *TAG = "main";
 
 void p4_tcm_heap_guard_keep(void);
 
-// Periodic health monitor (esp_timer task, not the audio path): reads the
+// Periodic health monitor (a task of its own, not the audio path): reads the
 // counters the audio engine already maintains and emits rate-limited service-log
 // summaries for anomalies and low-memory edges. No hot-path work.
-#define AUDIO_MON_PERIOD_US       (5ll * 1000000ll)
+/* v341b (upstream 75136aef): the snapshot takes AE_LOCK, a recursive mutex
+ * with priority inheritance, which the priority-5 decoder holds during
+ * decode_one_frame and seeks. Run from the priority-22 esp_timer task, a
+ * waiting snapshot lifted the decoder above the priority-6 output and the
+ * output ran late with its DMA / USB clock still on time. Below both audio
+ * workers the inheritance can no longer outrank the output. */
+#define AUDIO_MON_PERIOD_MS       5000u
+#define AUDIO_MON_PRIORITY        2u
+#define AUDIO_MON_STACK           4096u
 #define LOW_INTERNAL_HEAP_BYTES   (24u * 1024u)
 #define LOW_PSRAM_BYTES           (256u * 1024u)
 
@@ -192,6 +200,15 @@ static void health_monitor_cb(void *arg)
     }
 }
 
+static void health_monitor_task(void *arg)
+{
+    TickType_t wake = xTaskGetTickCount();
+    for (;;) {
+        vTaskDelayUntil(&wake, pdMS_TO_TICKS(AUDIO_MON_PERIOD_MS));
+        health_monitor_cb(arg);
+    }
+}
+
 static const char *reset_reason_str(void)
 {
     switch (esp_reset_reason()) {
@@ -317,6 +334,7 @@ static void on_dj_link_beat_clock(const dj_link_beat_clock_t *clock)
     const deck_net_clock_t net = {
         .valid = clock->valid,
         .anchor_ms = clock->anchor_ms,
+        .anchor_frac_us = clock->anchor_frac_us,
         .period_us = clock->period_us,
         .beat_in_bar = clock->beat_in_bar,
         .player = clock->player,
@@ -340,6 +358,12 @@ static void on_dj_link_deck_command(uint8_t deck, dj_link_deck_cmd_t cmd)
         break;
     case DJ_LINK_DECK_CMD_MASTER_DROP:
         deck_core_net_command(deck, DECK_CORE_NET_MASTER_DROP);
+        break;
+    case DJ_LINK_DECK_CMD_FADER_START:
+        deck_core_net_command(deck, DECK_CORE_NET_FADER_START);
+        break;
+    case DJ_LINK_DECK_CMD_FADER_STOP:
+        deck_core_net_command(deck, DECK_CORE_NET_FADER_STOP);
         break;
     default:
         break;
@@ -648,15 +672,15 @@ void app_main(void)
     audio_recorder_init();
 #endif
 
-    /* Periodic health monitor -> rate-limited service-log anomaly summaries. */
-    {
-        const esp_timer_create_args_t mon_args = {
-            .callback = health_monitor_cb, .name = "svclog_mon"
-        };
-        esp_timer_handle_t mon = NULL;
-        if (esp_timer_create(&mon_args, &mon) == ESP_OK) {
-            esp_timer_start_periodic(mon, AUDIO_MON_PERIOD_US);
-        }
+    /* Periodic health monitor -> rate-limited service-log anomaly summaries.
+     * v341b: a priority-2 task on core 1, its stack in PSRAM like eth_web (the
+     * internal RAM is spoken for; the task only reads counters and queues
+     * service-log records, no flash or DMA work). Diagnostics only: a failed
+     * create costs the summaries, not the audio. */
+    if (xTaskCreatePinnedToCoreWithCaps(health_monitor_task, "svclog_mon", AUDIO_MON_STACK,
+                                        NULL, AUDIO_MON_PRIORITY, NULL, 1,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        ESP_LOGW(TAG, "svclog_mon task create failed: no health summaries");
     }
     app_settings_t settings = app_settings_get();
     audio_engine_set_cue_mode(settings.cue_mode);
@@ -719,6 +743,12 @@ void app_main(void)
             .eth_netif = eth_bringup_netif,
             .beat_clock = on_dj_link_beat_clock,
             .deck_command = on_dj_link_deck_command,
+            // v342: the USB key read-only over NFS while DJ Link runs; every
+            // access to it takes the same gate as the audio decoder's reads.
+            .export_root = USB_STORAGE_MOUNT_POINT,
+            .export_available = usb_storage_is_mounted,
+            .export_gate_begin = media_io_gate_begin,
+            .export_gate_end = media_io_gate_end,
         };
         esp_err_t dj_rc = dj_link_init(&dj_cfg);
         if (dj_rc == ESP_OK) {

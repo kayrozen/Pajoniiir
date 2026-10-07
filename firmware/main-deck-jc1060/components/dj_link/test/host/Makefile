@@ -15,10 +15,28 @@ LIBRARY = ../../../library
 PDB_SRC = ../../dj_link_pdb.c $(LIBRARY)/rekordbox_pdb.c
 ANLZ_SRC = ../../dj_link_anlz.c $(LIBRARY)/rekordbox_anlz.c
 
-all: test_dj_link_state test_dj_link_master test_dj_link_db test_dj_link_pdb test_dj_link_anlz
+all: test_dj_link_state test_dj_link_master test_dj_link_db test_dj_link_pdb test_dj_link_anlz test_dj_link_neighbor test_dj_link_clock test_dj_link_mixer test_dj_link_nfsd
 
 test_dj_link_state: test_dj_link_state.c $(SRC)
 	$(CC) $(CFLAGS) -o $@ test_dj_link_state.c $(SRC) $(LDFLAGS)
+
+# v338: the cache of what the other players loaded (pure; the waveform preview
+# comes from dj_link_anlz.c).
+test_dj_link_neighbor: test_dj_link_neighbor.c ../../dj_link_neighbor.c ../../dj_link_anlz.c
+	$(CC) $(CFLAGS) -o $@ test_dj_link_neighbor.c ../../dj_link_neighbor.c ../../dj_link_anlz.c $(LDFLAGS)
+
+# v339: the beat clock estimator (pure).
+test_dj_link_clock: test_dj_link_clock.c ../../dj_link_clock.c
+	$(CC) $(CFLAGS) -o $@ test_dj_link_clock.c ../../dj_link_clock.c $(LDFLAGS)
+
+# v341: fader start and on-air from a mixer (pure).
+test_dj_link_mixer: test_dj_link_mixer.c ../../dj_link_mixer.c $(SRC)
+	$(CC) $(CFLAGS) -o $@ test_dj_link_mixer.c ../../dj_link_mixer.c $(SRC) $(LDFLAGS)
+
+# v342: the read-only NFS export of our USB key: the server core and its POSIX
+# backend against the esp-djlink NFS client, on a temporary directory.
+test_dj_link_nfsd: test_dj_link_nfsd.c ../../dj_link_nfsd.c ../../dj_link_nfsd_fs.c
+	$(CC) $(CFLAGS) -std=gnu11 -o $@ test_dj_link_nfsd.c ../../dj_link_nfsd.c ../../dj_link_nfsd_fs.c $(SRC) $(LDFLAGS)
 
 test_dj_link_master: test_dj_link_master.c ../../dj_link_master.c $(SRC)
 	$(CC) $(CFLAGS) -o $@ test_dj_link_master.c ../../dj_link_master.c $(SRC) $(LDFLAGS)

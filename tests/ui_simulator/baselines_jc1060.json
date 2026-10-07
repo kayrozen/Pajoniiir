@@ -27,6 +27,8 @@
     "overview_bridge": "ef8301e9d7186f80ae97441e2f536c4de34378551f86281c6800975ec22c20a0",
     "overview_bridge_scroll": "20ff576fa92d21aee3e45a0de8346b6e45e5f4437b9b1068ea67331622554caa",
     "overview_bridge_elapsed": "91e2ac8cc91429dab7c232a04a32bc0dd519a4a6b16be6de2299ab27bd75f9d4",
-    "overview_bridge_download": "6c010551ab153a9e6cbef3c4719cf55cec144f168a4223d361ba0df0cff5e40f"
+    "overview_bridge_download": "6c010551ab153a9e6cbef3c4719cf55cec144f168a4223d361ba0df0cff5e40f",
+    "neighbors_overlay": "8610ce6f5e452f6d398d5c016acba9bff631ba65ef9b6483e8d09b50350c2f89",
+    "neighbors_one_estimated": "4f446b88d00ba508122d057b9fbb3d2ed5fb8ac92f42c11cebce9a876e99518b"
   }
 }

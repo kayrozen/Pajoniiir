@@ -528,11 +528,19 @@ int dj_link_session_status(const dj_link_session_t *s, uint8_t library_number,
         st.bpm100 = deck->bpm100 ? deck->bpm100 : 0xffffu;
         st.flags = (deck->playing ? DJLINK_FLAG_PLAYING : 0u) |
                    (deck->sync ? DJLINK_FLAG_SYNC : 0u) |
-                   (deck->master ? DJLINK_FLAG_MASTER : 0u);
+                   (deck->master ? DJLINK_FLAG_MASTER : 0u) |
+                   (deck->on_air ? DJLINK_FLAG_ON_AIR : 0u);
         st.master_meaningful = deck->master ? 0x01u : 0x00u;
     }
     st.master_handoff = deck->master_handoff;   /* 0 builds as 0xff */
+    if (deck->loaded && deck->beat_valid) {
+        st.beat = deck->beat_counter;
+        st.beat_in_bar = deck->beat_in_bar_now;
+    }
     int n = djlink_status_build(&st, counter, out, cap);
+    if (n >= 0x88) {
+        djlink_wr32(&out[0x84], deck->sync_counter);   /* Syncn: not in the codec's struct */
+    }
     return n > 0 ? n : 0;
 }
 
@@ -543,6 +551,7 @@ void dj_link_report_beats(dj_link_deck_report_t *r, const void *grid, size_t cou
         return;
     }
     r->beat_count = 0u;
+    r->beat_number0 = 0u;
     if (!grid || !get || count == 0u) {
         return;
     }
@@ -559,11 +568,34 @@ void dj_link_report_beats(dj_link_deck_report_t *r, const void *grid, size_t cou
         }
     }
     size_t i = lo > 0u ? lo - 1u : 0u;
+    r->beat_number0 = (uint32_t)i + 1u;
     while (i < count && r->beat_count < DJ_LINK_REPORT_BEATS &&
            get(grid, i, &r->beats[r->beat_count])) {
         r->beat_count++;
         i++;
     }
+}
+
+bool dj_link_deck_beat_now(const dj_link_deck_report_t *r, uint32_t now_ms,
+                           uint32_t *number, uint8_t *in_bar)
+{
+    if (!r || !r->loaded || r->beat_count == 0u || r->beat_number0 == 0u) {
+        return false;
+    }
+    const uint32_t pos = dj_link_deck_playhead(r, now_ms);
+    int last = -1;
+    for (uint8_t i = 0; i < r->beat_count; i++) {
+        if (r->beats[i].time_ms <= pos) {
+            last = i;
+        }
+    }
+    if (number) {
+        *number = last < 0 ? 0u : r->beat_number0 + (uint32_t)last;
+    }
+    if (in_bar) {
+        *in_bar = last < 0 ? 0u : r->beats[last].beat_in_bar;
+    }
+    return true;
 }
 
 uint32_t dj_link_deck_playhead(const dj_link_deck_report_t *r, uint32_t now_ms)

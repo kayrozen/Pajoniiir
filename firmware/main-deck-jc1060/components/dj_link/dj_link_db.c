@@ -1057,3 +1057,23 @@ uint32_t dj_link_peer_track_key(uint32_t peer_ip, uint8_t peer_number, uint32_t 
     }
     return h != 0u ? h : 1u;
 }
+
+uint32_t dj_link_media_track_key(const char *path, uint32_t size)
+{
+    /* Versioned so it never collides on purpose with the v249 keys. */
+    static const char tag[] = "PJM1";
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i + 1u < sizeof(tag); i++) {
+        h ^= (uint8_t)tag[i];
+        h *= 16777619u;
+    }
+    for (const char *c = path ? path : ""; *c; c++) {
+        h ^= (uint8_t)*c;
+        h *= 16777619u;
+    }
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        h ^= (uint8_t)(size >> shift);
+        h *= 16777619u;
+    }
+    return h != 0u ? h : 1u;
+}

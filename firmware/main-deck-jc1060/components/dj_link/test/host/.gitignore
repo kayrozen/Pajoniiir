@@ -3,3 +3,7 @@ test_dj_link_master
 test_dj_link_db
 test_dj_link_pdb
 test_dj_link_anlz
+test_dj_link_neighbor
+test_dj_link_clock
+test_dj_link_mixer
+test_dj_link_nfsd

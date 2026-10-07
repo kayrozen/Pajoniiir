@@ -142,12 +142,18 @@ typedef enum {
     DECK_CORE_NET_SYNC_OFF,
     DECK_CORE_NET_MASTER_TAKE,
     DECK_CORE_NET_MASTER_DROP,
+    DECK_CORE_NET_FADER_START,   /* v341: a DJ Link mixer raised this deck's fader */
+    DECK_CORE_NET_FADER_STOP,    /* v341: lowered it: back to the cue, paused */
 } deck_core_net_cmd_t;
 void deck_core_net_command(uint8_t deck, deck_core_net_cmd_t cmd);
 /* v304: the DJ Link beat clock, from the dj_link task (seqlock, never
  * blocks). The getter is for the UI (top bar beat-in-bar). */
 void deck_core_set_net_clock(const deck_net_clock_t *clock);
 void deck_core_get_net_clock(deck_net_clock_t *out);
+/* v339: time from a mixed frame to the speaker (audio_engine_output_latency_us),
+ * published by the UI task, which owns its smoothing; deck_net_sync judges the
+ * phase on the heard position. Lock-free. */
+void deck_core_set_output_latency_us(uint32_t us);
 /* v304: the clock deck_net_sync compares anchors with (esp_timer ms). */
 uint32_t deck_core_net_clock_now_ms(void);
 /* v275: tempo fader range (6/10/16 %, anything else -> 10) shared by both

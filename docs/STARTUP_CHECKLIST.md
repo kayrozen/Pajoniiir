@@ -1556,6 +1556,206 @@ phases 0-6 done, v293 removed the legacy widgets and
         downloaded, in order;
       - after both: deck 1's file still in the cache (LOAD it again: cache
         hit); audio as v332.
+- [x] HIL v335: accepted.
+- [x] v336: cache and cue-edit key = media identity (path + size), cue
+      edits migrated from the v249 key on the first load. Host tests, syntax
+      and UI simulator pass.
+- [ ] HIL v336, vynull:
+      - a track with hot cue / memory cue edits made before v336: first load
+        downloads again (new key) and the edits are still there (log `peer
+        cues: xxxxxxxx -> yyyyyyyy`);
+      - load it again: cache hit (`(cached)`), no download;
+      - restart vynull or renew the P4's DHCP lease (other IP), or let our
+        player number change: still a cache hit, edits kept;
+      - re-encode or replace the file in vynull (other size): downloaded
+        again.
+- [ ] Playlist sort: left out (operator decision of v310: sort on vynull's
+      track list only); ask before doing it.
+- [x] v337: WAV 24/32-bit and float, AIFF / AIFC, 88.2-192 kHz sources
+      decimated 2:1 (once or twice) in the decode task. Host tests pass.
+- [ ] HIL v337, local USB and vynull, one deck playing (MT on and off):
+      - 24-bit WAV 44.1 kHz, 16-bit AIFF, 24-bit AIFF, a FLAC and a WAV at
+        96 kHz (log `WAV cache: 96000 Hz (decimated)` / `FLAC cache`): they
+        load and play at the right pitch and speed, highs clean;
+      - on the 96 kHz track: cue, hot cue, seek, loop, scratch (history
+        present), beat grid aligned with the audio;
+      - `PROBE` and decode diag (`diag decode D..`): decode time per batch
+        on the 96 kHz deck, no `pcm_under`.
+- [x] v338a: NVS full no longer stops hot cues (seed-only blobs pruned on
+      NOT_ENOUGH_SPACE, v336 migration cleans up). Host tests and syntax pass.
+- [ ] HIL v338a (the board whose NVS is full is the test):
+      - boot log `NVS (boot): N used, M free ...`;
+      - load tracks: on `NVS full, pruned N seed-only hot cue blobs` the
+        save goes through (no `save failed`), the loaded tracks of both decks
+        keep their pads and LEDs;
+      - set a hot cue, reload the track: it is still there; reboot: still
+        there;
+      - after a v336 peer track migrates: `peer cues: ...` once, `mc`/`hc`
+        under the old key gone (the next `NVS (...)` line shows more free).
+- [x] HIL v338a: accepted (hot pads are back).
+- [x] v338: DJ LINK PLAYERS panel (state of the other players). Host tests,
+      syntax and UI simulator pass.
+- [x] v339: network beat clock estimated in us, phase judged on the heard
+      position, beat counter and Syncn in our status. Host tests, syntax and
+      UI simulator pass.
+- [x] v342: NFS export of our USB key (read-only), `dj_link_nfsd*`. Host
+      tests, syntax, UI simulator and an interop run against vynull's NFS client
+      pass; nothing ran on the board.
+- [ ] Before building v342: `CONFIG_LWIP_MAX_SOCKETS=12` is a Kconfig default;
+      the local `sdkconfig` keeps 10. menuconfig > Component config > LWIP >
+      Max number of open sockets, or regenerate `sdkconfig`.
+- [ ] HIL v342, DJ Link ON, the rekordbox USB key mounted, a PC on the same
+      Ethernet segment (build `tools/djlink/nfs_fetch.c`, line in its header):
+      - boot / DJ Link start: `dj_nfsd: serving /usb read-only as /C/ on
+        a.b.c.d (UDP 111 portmap, 2049 mount+nfs)` then `export /C/ on (/usb)`;
+        `[HEAP]` boot lines and the internal free after DJ Link starts match
+        v341b within a few hundred bytes (the service is PSRAM except a task
+        control block and two sockets); no `alloc FAILED`;
+      - from the PC: `rpcinfo -u <ip> 100005 1` and `rpcinfo -u <ip> 100003 2`
+        answer; `showmount -e <ip>` lists `/C/`;
+      - `nfs_fetch --ip <ip> --path /PIONEER/rekordbox/export.pdb --out
+        /tmp/export.pdb` and `cmp` it with the file on the key: identical;
+        the same with `--bytes`; a track from `/Contents/...` (a non-ASCII
+        name too): identical, note the rate and `retransmits`;
+      - `nfs_fetch --path /nope` reports NOT FOUND; `nfs_fetch` with `..` in the
+        path gets nothing outside the key; a Linux `mount -t nfs -o
+        vers=2,proto=udp,port=2049,mountport=2049,nolock <ip>:/C/ /mnt` (if the
+        kernel still has NFSv2) reads files, and `touch` / `rm` fail with a
+        read-only error;
+      - AUDIO FIRST: a deck playing an MP3 from the same key while the PC
+        downloads a large file (and again with a second `nfs_fetch` at the same
+        time): `HB` windows keep `pcm_under` 0, `pkt_fail=0 lost=0`, `behind`
+        near 55, `dec_max` (compare with the idle value), `gap_max` as before,
+        no `task_wdt`; write down the download rate with and without the deck
+        playing. If audio degrades, the `read` of 8 KB under the gate is the
+        suspect: lower the READ size the clients get (`nfs_fetch --read-size
+        1024`) and report it;
+      - unplug the key while a download runs: `export /C/ off`, the PC's fetch
+        fails or stalls, no panic, no `dj_nfsd` task watchdog; plug it back:
+        `export /C/ on`, a new fetch works;
+      - DJ Link OFF in Settings: the ports close (`nmap -sU -p 111,2049 <ip>`),
+        `dj_nfsd` is gone; ON again: back;
+      - the export is not reachable on the Wi-Fi AP address (Wi-Fi remote ON):
+        `rpcinfo -u <ap ip> 100003 2` times out;
+      - a real CDJ or vynull in CDJ mode cannot browse our media yet (v343): a
+        CDJ that mounts `/C/` by itself (rare) would read the tree, nothing more
+        is expected.
+- [x] v341b: health monitor moved from the esp_timer task (priority 22) to a
+      priority-2 task on core 1; httpd back on core 0 (v341a withdrawn).
+      Syntax checked.
+- [ ] HIL v341b, same scenario as the v341 crash (a deck in PLAY, 5 minutes,
+      web UI open on `pajoniiir.local` if it was before):
+      - boot log has no `svclog_mon task create failed`;
+      - `HB` windows over the 5 minutes: `pkt_fail=0 lost=0`, `behind` near 55,
+        `pace_wait max` under ~12 ms, `gap_max` as in v339; compare `dec_max`
+        with a seek going on (jog a deck) - no `behind` spike;
+      - no `task_wdt`. If one comes back, keep the whole block with the
+        `previous boot WDT trace` line (`cpu0=` / `cpu1=`) and say what talked
+        to the board (browser tab, page, curl): httpd stays on core 0 as upstream,
+        so a watchdog with `cpu0=httpd` is then httpd's own and is the next
+        version;
+      - the service log still gets its summaries (`/api/diagnostic-log` after a
+        minute of playback with a forced anomaly, e.g. unplug the DDJ audio).
+- [x] v341: fader start, on air, AutoIP. Host tests, syntax and UI simulator
+      pass. Not done, by decision: serving our USB (v342 NFS, v343 dbserver)
+      and the peers' SD slot (v344).
+- [ ] Before building v341: AutoIP is a Kconfig default; the local `sdkconfig`
+      keeps "is not set". menuconfig > Component config > LWIP > Enable IPV4
+      Link-Local Addressing (AUTOIP), or regenerate `sdkconfig`.
+- [ ] HIL v341, DJ Link ON, LINK SYNC on (Settings), a track on each deck:
+      - the two decks join as players 3 and 4 (log `deck N joined as player #`);
+        `fake_cdj --mixer --target 3 --fader start --ip <PC IP>` (build line in
+        `tools/djlink/fake_cdj.c`; a real DJM works the same): log `deck 1:
+        fader start`, then `deck 1 mixer fader start: PLAYING`; `--fader stop`:
+        `back to the cue ... (paused)`; the deck on player 4 is untouched with
+        `--target 3`;
+      - the same with LINK SYNC OFF: `mixer fader start ignored (LINK SYNC off)`,
+        nothing moves; with the jog touched: `ignored: jog held`;
+      - three START packets in a row move the deck once; pausing the deck by
+        hand and receiving no new command leaves it paused;
+      - `fake_cdj --mixer --on-air 1,3`: log `deck 1 (player #3): on air by the
+        mixer`; a CDJ or `tcpdump -X` on 50002 shows flag 0x08 in byte 0x89 of
+        our status; Ctrl-C the tool: `off air` about 5 s later;
+      - AutoIP: unplug the router (or cable the P4 straight to a PC with no
+        DHCP server): after about 7 s `ETH Got IP: 169.254.x.x (link-local, no
+        DHCP server)`, DJ Link joins on it; plug the router back: a normal
+        lease arrives, `Ethernet IP changed - rejoining`, DJ Link rejoins, the
+        web UI answers on the new address; `[HEAP]` boot lines unchanged;
+      - no audio artefact (nothing in the audio path changed).
+- [x] v340: the v338 / v339 statics moved to PSRAM (14.4 KB internal RAM).
+      Syntax and host tests pass.
+- [ ] HIL v340 (boot, before anything else of v338 / v339):
+      - `[HEAP]` lines of the boot: write down internal free / largest at
+        `after audio_engine_init`, `before` and `after
+        p4_local_controller_start`, `before` and `after eth
+        web_server_start`; against the v339 log (26447 / 9216 before the web
+        server, 10627 / 3328 after) free must be about 14 KB higher at each
+        point;
+      - a local USB load right after boot: no `alloc FAILED`, no
+        `failed to create ae_loader task`, the deck loads;
+      - open the DJ LINK PLAYERS panel with a fake player: the rows update
+        (the neighbours now come through the seqlock), no `[HEAP]` line;
+      - if the free internal RAM after the web server is still under ~15 KB or
+        `largest` under 8 KB, send the log: the httpd stack (8 KB internal)
+        is the next candidate;
+      - the `task_wdt` IDLE0 / httpd: note whether it comes back; if it does,
+        the lines just before it.
+- [ ] HIL v339 (needs the DDJ-400 / FLX4 and a master that sends beats: a
+      real CDJ, or `fake_cdj --ip <PC IP> --player 5 --playing --beats
+      --jitter-us 3000 --master --bpm 126` from `tools/djlink/fake_cdj.c`
+      (build line in its header); `--bpm` far from the deck's tempo to see
+      the pitch move; vynull is not needed for this one):
+      - log `beat clock: player #5, 126.00 BPM (last packet)`, then about 4
+        beats later `beat clock: player #5 regression on N beats, rms R us`
+        (N grows to 16); with `--jitter-us 3000` the rms is about 1700 us and
+        the clock holds;
+      - SYNC on a playing deck: `DJ Link bar snap ...` once, then
+        `LOCKED`; phase error in the `DJ Link sync LOCKED, pitch ..., phase
+        +0.0xx beat` line stays inside +/-0.02 beat for a minute, no re-snap;
+      - compare with v338: same setup, the lock no longer wanders with the
+        jitter (v338 followed every packet);
+      - PHASE BY EAR / SCOPE (the point of the latency term): the master's
+        click (or the CDJ's output) and the deck on two channels of a scope
+        or a recorder: the beats coincide within a few ms; in v338 the deck
+        was one output latency (tens of ms) late. If they are off by a
+        constant, note its sign and size: that is the master's own latency or
+        a wrong `CONFIG_AUDIO_DISPLAY_LATENCY_MS`, and the value to carry;
+      - stop the master: `WAIT`, tempo kept, no seek; restart it: re-snaps once;
+      - a pitch fader move on the master (`--pitch` is static; move it on a
+        CDJ): the clock restarts each time the tempo changes by 0.3 %, then
+        locks again; the deck follows the tempo without a seek;
+      - our status: a CDJ or `tcpdump -X` on 50002 shows 0xa0 / 0xa6 moving
+        with the deck's beats, and 0x84 going up by one when the deck becomes
+        the tempo master (log `deck N tempo master: Syncn M`);
+      - no `[HEAP]` / `alloc FAILED`, no audio artefact (nothing in the
+        audio path changed: only the phase target does).
+- [ ] HIL v338, DJ Link ON, a peer that sends a CDJ status with a track and
+      serves the dbserver (a real player, or vynull plus `tools/djlink/fake_cdj.c`):
+      - vynull's own CDJ status is an idle template (no track, BPM 0xffff), so
+        alone it only gives `NO TRACK`. `fake_cdj` broadcasts the status and
+        keep-alive of a made-up player 5 that "has loaded" a vynull track:
+        `fake_cdj --ip <PC IP> --source 17 --slot 4 --id <analysed track id>
+        --bpm 128 --playing --position` (17 = vynull's device number in
+        rekordbox mode, 3 in `--mode cdj`; slot 4 = its library; the id of a
+        track vynull analysed, else there is no waveform). Build line in the
+        file header. Start vynull first, then the tool; Ctrl-C ends the
+        player (gone from the panel after 5 s);
+      - tap the chip at the top right of any tab: the panel opens; tap it
+        again: it closes; with the Overview open the waveforms underneath do
+        not show through, and come back when it closes;
+      - one row per player: number, name, BPM, pitch, MASTER / ON AIR /
+        PLAY / SYNC; no player: `NO PLAYER ON THE NETWORK`;
+      - log `neighbor #N: "title" - artist (Ns)` once per loaded track, then
+        `neighbor #N: waveform NNN bytes`; the row shows the title, artist,
+        position / duration and the waveform preview with the played shade;
+      - the peer loads another track: the row goes `LOADING...`, then the
+        new title and waveform (no stale preview); it ejects: `NO TRACK`;
+      - with a position packet (0x0b) the time is `mm:ss`; without, `~mm:ss`;
+      - start a download while the panel is open: the neighbor log lines stop
+        until it ends, the download time does not change (v335 numbers), no
+        crackle, no `[HEAP]` / `alloc FAILED`;
+      - no `neighbor #N ... timeout / failed` line against vynull; against a
+        player that refuses a 4th dbserver client, at most 3 tries per track.
 - [x] v334: the analysis waits (<= 3 s) for the job's metadata answer; the
       deck takes title / artist / BPM / duration from it.
 - [ ] HIL v334: network load of a track already in the cache, unlisted and

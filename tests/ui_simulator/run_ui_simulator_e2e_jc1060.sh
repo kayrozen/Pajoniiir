@@ -120,6 +120,8 @@ CAPTURES=(
     overview_bridge_scroll
     overview_bridge_elapsed
     overview_bridge_download
+    neighbors_overlay
+    neighbors_one_estimated
 )
 
 declare -A ACTUAL

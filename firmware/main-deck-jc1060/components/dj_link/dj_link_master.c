@@ -259,6 +259,8 @@ const char *dj_link_deck_cmd_str(dj_link_deck_cmd_t cmd)
     case DJ_LINK_DECK_CMD_SYNC_OFF:    return "sync off";
     case DJ_LINK_DECK_CMD_MASTER_TAKE: return "take master";
     case DJ_LINK_DECK_CMD_MASTER_DROP: return "drop master";
+    case DJ_LINK_DECK_CMD_FADER_START: return "fader start";
+    case DJ_LINK_DECK_CMD_FADER_STOP: return "fader stop";
     default:                           return "none";
     }
 }

@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -34,7 +35,10 @@
 #include "djlink/sync.h"
 
 #include "dj_link_anlz.h"
+#include "dj_link_clock.h"
 #include "dj_link_master.h"
+#include "dj_link_mixer.h"
+#include "dj_link_nfsd_service.h"
 #include "dj_link_pdb.h"
 #include "dj_link_session.h"
 #include "sd_io_gate.h"
@@ -69,6 +73,7 @@ typedef struct {
     uint16_t port;
     uint16_t len;
     uint32_t rx_ms;
+    int64_t  rx_us;    /* v339: the same instant, microseconds (esp_timer) */
     uint32_t src_ip;   /* host order */
     bool     unicast;  /* addressed to our IP, not broadcast/multicast */
     uint8_t  data[DJLINK_MAX_PACKET];
@@ -113,6 +118,10 @@ static atomic_uint s_local_track_count; /* written by the LVGL task */
 /* v305: tempo master negotiation (dj_link_master.h), dj_link task only;
  * s_sync_control is the LINK SYNC switch, written by any task. */
 static atomic_bool s_sync_control;
+
+/* v341: fader start and on-air from a mixer; dj_link task only (60 B). */
+static dj_link_mixer_t s_mixer;
+static bool s_on_air_logged[2];
 static dj_link_master_t s_master;
 static dj_link_master_phase_t s_master_logged;
 
@@ -221,7 +230,9 @@ static void dj_link_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
             const ip4_addr_t *dest = ip4_current_dest_addr();
             slot->port = (uint16_t)(uintptr_t)arg;
             slot->len = len;
-            slot->rx_ms = dj_link_now_ms();
+            /* One read for both: the ms stamp is the us stamp / 1000. */
+            slot->rx_us = esp_timer_get_time();
+            slot->rx_ms = (uint32_t)(slot->rx_us / 1000);
             slot->src_ip = addr ? lwip_ntohl(ip4_addr_get_u32(ip_2_ip4(addr))) : 0u;
             slot->unicast = !ip4_addr_isbroadcast(dest, ip_current_input_netif()) &&
                             !ip4_addr_ismulticast(dest);
@@ -609,6 +620,8 @@ static bool dj_link_db_io_next_detail(void *ctx, uint32_t *index, uint32_t *reko
     return found;
 }
 
+static void dj_link_clock_note_beat(uint8_t player, int64_t rx_us);   /* v339 */
+
 static const dj_link_peer_t *dj_link_find_peer(uint8_t number)
 {
     for (size_t i = 0; i < DJ_LINK_MAX_PEERS; i++) {
@@ -884,6 +897,12 @@ static struct {
     uint32_t key;
     uint32_t keep[2];
     uint8_t  slot;                     /* v333: dbserver slot of the session */
+    /* v336: key = media identity (dj_link_media_track_key: path + size),
+     * known once the NFS lookup gave the size (dj_link_fetch_io_open);
+     * legacy_key = the v249 key, to migrate cue edits. */
+    uint32_t legacy_key;
+    char     ext[8];
+    bool     audio_cached;             /* the lookup found it in the cache */
     bool     detail_done;              /* v333: metadata answered (or given up) */
     /* v334: the analysis waits for the metadata answer first (bounded), so a
      * cache hit - which skips the download the metadata used to ride on -
@@ -1183,6 +1202,7 @@ static FILE *dj_link_fetch_open_tmp(void)
 }
 
 static bool dj_link_fetch_cached(const char *path);
+static void dj_link_fetch_prune(void);
 
 static int dj_link_fetch_io_open(void *ctx, uint32_t size)
 {
@@ -1198,6 +1218,16 @@ static int dj_link_fetch_io_open(void *ctx, uint32_t size)
             s_job.pdb_unchanged = true;
             return -1;
         }
+    } else {
+        /* v336: the size is known: the media key, then the cache. */
+        s_job.key = dj_link_media_track_key(s_fetch->track.file_path, size);
+        snprintf(s_job.path, sizeof(s_job.path), "%s/%08" PRIX32 ".%s", DJ_LINK_CACHE_DIR,
+                 s_job.key, s_job.ext);
+        if (dj_link_fetch_cached(s_job.path)) {
+            s_job.audio_cached = true;   /* dj_link_fetch_failed: analysis */
+            return -1;
+        }
+        dj_link_fetch_prune();
     }
     s_job.staged = 0u;
     if (dj_link_fetch_diag_discard()) {
@@ -1297,6 +1327,7 @@ static void dj_link_fetch_end(dj_link_fetch_state_t state, const char *error, bo
         st->error[0] = '\0';
         if (state == DJ_LINK_FETCH_DONE) {
             st->track_key = s_job.key;
+            st->legacy_key = s_job.legacy_key;
             memcpy(st->path, s_job.path, sizeof(st->path));
         } else if (error) {
             snprintf(st->error, sizeof(st->error), "%s", error);
@@ -1477,13 +1508,10 @@ static void dj_link_fetch_file(uint32_t now_ms)
         dj_link_fetch_end(DJ_LINK_FETCH_FAILED, "NO FILE EXTENSION", false);
         return;
     }
-    snprintf(s_job.path, sizeof(s_job.path), "%s/%08" PRIX32 ".%s", DJ_LINK_CACHE_DIR,
-             s_job.key, ext);
-    if (dj_link_fetch_cached(s_job.path)) {
-        dj_link_fetch_analysis(true, now_ms);
-        return;
-    }
-    dj_link_fetch_prune();
+    /* v336: the cache key needs the file size: the NFS lookup runs on every
+     * load, and the open hook either finds <key>.<ext> cached (no read) or
+     * prunes and opens FETCH.TMP. */
+    snprintf(s_job.ext, sizeof(s_job.ext), "%s", ext);
     s_job.state = DJ_LINK_FETCH_AUDIO;
     portENTER_CRITICAL(&s_mux);
     dj_link_fetch_status_t *st = dj_link_fetch_cur_status();
@@ -1657,7 +1685,7 @@ static void dj_link_fetch_begin(uint32_t id, uint8_t peer, uint32_t rekordbox_id
         return;
     }
     s_job.ip = p->ip;
-    s_job.key = dj_link_peer_track_key(p->ip, peer, rekordbox_id);
+    s_job.legacy_key = dj_link_peer_track_key(p->ip, peer, rekordbox_id);
     if (!dj_link_fetch_sd_ready()) {
         dj_link_fetch_end(DJ_LINK_FETCH_FAILED, "NO SD CARD", false);
         return;
@@ -1763,6 +1791,10 @@ static void dj_link_fetch_failed(uint32_t now_ms)
     if (s_job.state == DJ_LINK_FETCH_PDB && s_job.pdb_unchanged) {
         ESP_LOGW(TAG, "fetch #%u: export.pdb unchanged, cached copy kept", (unsigned)s_job.peer);
         dj_link_fetch_audio(now_ms);
+        return;
+    }
+    if (s_job.state == DJ_LINK_FETCH_AUDIO && s_job.audio_cached) {
+        dj_link_fetch_analysis(true, now_ms);   /* v336: cache hit by media key */
         return;
     }
     /* HFS+ media keep the rekordbox folder as ".PIONEER" (crate-digger). */
@@ -2190,8 +2222,304 @@ static esp_err_t dj_link_open(void)
         s_status_counter[1] = 0u;
         memset(s_beat_tracker, 0, sizeof(s_beat_tracker));
         s_players_wait_ms = DJ_LINK_RX_WAIT_MS;
+        /* v342: our USB key, read-only over NFS, on the address just joined with.
+         * Best effort: DJ Link works without it. */
+        if (s_config.export_root) {
+            const dj_link_nfsd_service_cfg_t cfg = {
+                .root = s_config.export_root,
+                .available = s_config.export_available,
+                .gate_begin = s_config.export_gate_begin,
+                .gate_end = s_config.export_gate_end,
+            };
+            const esp_err_t nrc = dj_link_nfsd_service_start(&cfg, ip);
+            if (nrc != ESP_OK) {
+                ESP_LOGW(TAG, "NFS export not started: %s", esp_err_to_name(nrc));
+            }
+        }
     }
     return rc;
+}
+
+/* ---- v338: what the other players loaded ------------------------------------ */
+
+/* One dbserver session of its own (the browse and the download job have
+ * theirs) asks the device a player's track came from for the title and
+ * artist, then for the waveform, once per loaded track
+ * (dj_link_neighbor.c keeps the books). It runs in the dj_link task, holds a
+ * connection only while a request is open, and pauses while a download runs:
+ * a player serves a handful of dbserver clients, and the download comes
+ * first. Nothing here touches the audio path or LVGL. */
+#define DJ_LINK_NB_REQ_MS  8000u      /* one answer, else it counts as a failure */
+
+typedef struct {
+    dj_link_db_t client;
+    uint8_t tcp_ring[DJ_LINK_TCP_RING_BYTES];
+} dj_link_nb_mem_t;
+
+static dj_link_nb_mem_t *s_nb_mem;            /* PSRAM, kept once allocated */
+static dj_link_tcp_t s_nb_tcp;
+/* v340: the v338 / v339 state (neighbour cache and its published copies, beat
+ * clocks) is control data, touched by tasks only, never by an interrupt or the
+ * audio path. As plain statics it cost 14 KB of internal RAM at boot (HIL
+ * v339: `ae_loader` task creation failed); EXT_RAM_BSS_ATTR keeps it in PSRAM
+ * (CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY). */
+EXT_RAM_BSS_ATTR static dj_link_nb_cache_t s_nb_cache;   /* dj_link task */
+static struct {
+    bool active;                              /* client started */
+    uint8_t device;                           /* dbserver device of the session */
+    uint8_t slot;
+    bool req_open;
+    dj_link_nb_req_t req;
+    uint32_t deadline_ms;
+    uint8_t *wave;                            /* waveform reply, while wanted */
+} s_nbs;
+/* The players the UI lists, built by the task and copied under s_mux to
+ * s_nb_published for dj_link_get_neighbors. */
+typedef struct {
+    dj_link_peer_t peer[DJ_LINK_NEIGHBORS_MAX];
+    dj_link_nb_slot_t slot[DJ_LINK_NEIGHBORS_MAX];
+    uint8_t count;
+} dj_link_nb_pub_t;
+EXT_RAM_BSS_ATTR static dj_link_nb_pub_t s_nb_pub;       /* dj_link task */
+/* Written by the dj_link task only, read by the LVGL task: a seqlock, so the
+ * 2.7 KB copy neither disables interrupts (it is PSRAM now) nor waits. */
+EXT_RAM_BSS_ATTR static dj_link_nb_pub_t s_nb_published;
+static uint32_t s_nb_seq;                     /* odd while s_nb_published is written */
+
+static void dj_link_nb_publish(const dj_link_nb_pub_t *src)
+{
+    (void)__atomic_add_fetch(&s_nb_seq, 1u, __ATOMIC_RELEASE);   /* odd */
+    if (src) {
+        memcpy(&s_nb_published, src, sizeof(s_nb_published));
+    } else {
+        memset(&s_nb_published, 0, sizeof(s_nb_published));
+    }
+    (void)__atomic_add_fetch(&s_nb_seq, 1u, __ATOMIC_RELEASE);   /* even */
+}
+
+/* False if the writer kept interfering (dst is then not valid). */
+static bool dj_link_nb_read(dj_link_nb_pub_t *dst)
+{
+    for (int tries = 0; tries < 4; tries++) {
+        const uint32_t before = __atomic_load_n(&s_nb_seq, __ATOMIC_ACQUIRE);
+        if (before & 1u) {
+            continue;
+        }
+        memcpy(dst, &s_nb_published, sizeof(*dst));
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&s_nb_seq, __ATOMIC_ACQUIRE) == before) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int dj_link_nb_db_connect(void *ctx, uint32_t ip, uint16_t port)
+{
+    return dj_link_tcp_open(ctx, ip, port);
+}
+
+static int dj_link_nb_db_send(void *ctx, const uint8_t *buf, size_t len)
+{
+    return dj_link_tcp_write(ctx, buf, len);
+}
+
+static void dj_link_nb_db_close(void *ctx)
+{
+    dj_link_tcp_close(ctx);
+}
+
+/* The only row this session asks metadata for: the open request's track. */
+static bool dj_link_nb_db_next_detail(void *ctx, uint32_t *index, uint32_t *rekordbox_id)
+{
+    (void)ctx;
+    if (!s_nbs.req_open || s_nbs.req.want_wave) {
+        return false;
+    }
+    *index = 0u;
+    *rekordbox_id = s_nbs.req.rekordbox_id;
+    return true;
+}
+
+static void dj_link_nb_end_request(void)
+{
+    if (s_nbs.wave) {
+        if (s_nb_mem) {
+            dj_link_db_cancel_blob(&s_nb_mem->client);   /* dst must not outlive this */
+        }
+        heap_caps_free(s_nbs.wave);
+        s_nbs.wave = NULL;
+    }
+    s_nbs.req_open = false;
+}
+
+static void dj_link_nb_fail_request(uint32_t now_ms, const char *why)
+{
+    ESP_LOGW(TAG, "neighbor #%u id %u: %s %s", (unsigned)s_nbs.req.number,
+             (unsigned)s_nbs.req.rekordbox_id, s_nbs.req.want_wave ? "waveform" : "metadata", why);
+    const dj_link_nb_req_t req = s_nbs.req;
+    dj_link_nb_end_request();
+    dj_link_nb_on_fail(&s_nb_cache, &req, now_ms);
+}
+
+static void dj_link_nb_db_track(void *ctx, uint32_t index, const dj_link_peer_track_t *t,
+                                bool detail)
+{
+    (void)ctx;
+    (void)index;
+    if (!detail || !t || !s_nbs.req_open || s_nbs.req.want_wave ||
+        t->rekordbox_id != s_nbs.req.rekordbox_id) {
+        return;
+    }
+    if (t->title[0] == '\0') {          /* the source does not know the track */
+        dj_link_nb_fail_request(dj_link_now_ms(), "no title");
+        return;
+    }
+    const dj_link_nb_req_t req = s_nbs.req;
+    s_nbs.req_open = false;
+    dj_link_nb_on_meta(&s_nb_cache, &req, t);
+    ESP_LOGI(TAG, "neighbor #%u: \"%s\" - %s (%us)", (unsigned)req.number, t->title, t->artist,
+             (unsigned)t->duration_s);
+}
+
+static void dj_link_nb_db_blob(void *ctx, uint32_t rekordbox_id, uint16_t request, size_t len,
+                               bool answered)
+{
+    (void)ctx;
+    (void)answered;
+    if (!s_nbs.req_open || !s_nbs.req.want_wave || request != DJLINK_DB_TYPE_WAVEFORM_REQUEST ||
+        rekordbox_id != s_nbs.req.rekordbox_id) {
+        return;
+    }
+    const dj_link_nb_req_t req = s_nbs.req;
+    dj_link_nb_on_wave(&s_nb_cache, &req, s_nbs.wave, len);
+    s_nbs.req_open = false;
+    heap_caps_free(s_nbs.wave);
+    s_nbs.wave = NULL;
+    ESP_LOGI(TAG, "neighbor #%u: waveform %u bytes", (unsigned)req.number, (unsigned)len);
+}
+
+/* Stop the session (never from inside its own callbacks). */
+static void dj_link_nb_halt(void)
+{
+    dj_link_nb_end_request();
+    if (s_nb_mem && s_nbs.active) {
+        dj_link_db_stop(&s_nb_mem->client);   /* closes s_nb_tcp */
+    }
+    s_nbs.active = false;
+}
+
+/* Open (or reopen) the session to the device the request names. */
+static bool dj_link_nb_start_session(const dj_link_nb_req_t *req, uint32_t ip, uint32_t now_ms)
+{
+    if (!s_nb_mem) {
+        s_nb_mem = heap_caps_calloc(1, sizeof(*s_nb_mem), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_nb_mem) {
+            return false;
+        }
+    }
+    static const dj_link_db_io_t io = {
+        .connect = dj_link_nb_db_connect,
+        .send = dj_link_nb_db_send,
+        .close = dj_link_nb_db_close,
+        .track = dj_link_nb_db_track,
+        .next_detail = dj_link_nb_db_next_detail,
+        .blob = dj_link_nb_db_blob,
+        .ctx = &s_nb_tcp,
+    };
+    dj_link_db_stop(&s_nb_mem->client);   /* closes s_nb_tcp */
+    s_nb_tcp.ring = s_nb_mem->tcp_ring;
+    dj_link_db_init(&s_nb_mem->client, &io, 0u);
+    dj_link_db_start_service(&s_nb_mem->client, ip, req->device, req->slot,
+                             dj_link_session_number(&s_session[0]), now_ms);
+    s_nbs.active = true;
+    s_nbs.device = req->device;
+    s_nbs.slot = req->slot;
+    return dj_link_db_phase(&s_nb_mem->client) != DJ_LINK_DB_FAILED;
+}
+
+/* dj_link task, every pass: follow the table, run the open request, start
+ * the next one. */
+static bool dj_link_nb_service(uint32_t now_ms)
+{
+    const bool downloading = s_job.state == DJ_LINK_FETCH_PDB || s_job.state == DJ_LINK_FETCH_AUDIO;
+    if (downloading || dj_link_session_number(&s_session[0]) == 0u) {
+        if (s_nbs.active || s_nbs.req_open) {
+            dj_link_nb_halt();
+        }
+        return false;
+    }
+    bool changed = dj_link_nb_sync(&s_nb_cache, &s_table);
+
+    if (s_nbs.active) {
+        dj_link_tcp_pump(&s_nb_tcp, &s_nb_mem->client, now_ms);
+        dj_link_db_poll(&s_nb_mem->client, now_ms);
+    }
+    if (s_nbs.req_open) {
+        if (dj_link_db_phase(&s_nb_mem->client) == DJ_LINK_DB_FAILED) {
+            dj_link_nb_fail_request(now_ms, dj_link_db_error(&s_nb_mem->client));
+        } else if ((int32_t)(now_ms - s_nbs.deadline_ms) >= 0) {
+            dj_link_nb_fail_request(now_ms, "timeout");
+        } else {
+            return changed;
+        }
+        changed = true;
+    }
+    /* A track change under the open request is caught by the match in the
+     * answer; nothing left to ask closes the connection. */
+    dj_link_nb_req_t req;
+    if (!dj_link_nb_next(&s_nb_cache, now_ms, &req)) {
+        if (s_nbs.active) {
+            dj_link_nb_halt();
+        }
+        return changed;
+    }
+    const dj_link_peer_t *src = dj_link_find_peer(req.device);
+    if (!src || src->ip == 0u) {
+        dj_link_nb_on_fail(&s_nb_cache, &req, now_ms);
+        return true;
+    }
+    if (!s_nbs.active || s_nbs.device != req.device || s_nbs.slot != req.slot ||
+        dj_link_db_phase(&s_nb_mem->client) == DJ_LINK_DB_FAILED) {
+        if (!dj_link_nb_start_session(&req, src->ip, now_ms)) {
+            dj_link_nb_on_fail(&s_nb_cache, &req, now_ms);
+            dj_link_nb_halt();
+            return true;
+        }
+    }
+    s_nbs.req = req;
+    s_nbs.req_open = true;
+    s_nbs.deadline_ms = now_ms + DJ_LINK_NB_REQ_MS;
+    if (req.want_wave) {
+        s_nbs.wave = heap_caps_malloc(DJ_LINK_ANLZ_WAVE_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_nbs.wave ||
+            !dj_link_db_want_blob(&s_nb_mem->client, DJLINK_DB_TYPE_WAVEFORM_REQUEST,
+                                  req.rekordbox_id, s_nbs.wave, DJ_LINK_ANLZ_WAVE_MAX, now_ms)) {
+            dj_link_nb_fail_request(now_ms, s_nbs.wave ? "session busy" : "no memory");
+            return true;
+        }
+    }
+    return changed;
+}
+
+/* The players the UI lists: not rekordbox sources, lowest number first. */
+static void dj_link_nb_snapshot(void)
+{
+    memset(&s_nb_pub, 0, sizeof(s_nb_pub));
+    for (unsigned n = 1u; n <= DJ_LINK_MAX_PLAYER_NUMBER && s_nb_pub.count < DJ_LINK_NEIGHBORS_MAX;
+         n++) {
+        const dj_link_peer_t *p = dj_link_find_peer((uint8_t)n);
+        if (!p || p->device_type == DJ_LINK_DEVICE_TYPE_REKORDBOX ||
+            (!p->has_status && !p->has_beat && !p->has_position)) {
+            continue;
+        }
+        const dj_link_nb_slot_t *slot = dj_link_nb_find(&s_nb_cache, (uint8_t)n);
+        s_nb_pub.peer[s_nb_pub.count] = *p;
+        if (slot) {
+            s_nb_pub.slot[s_nb_pub.count] = *slot;
+        }
+        s_nb_pub.count++;
+    }
 }
 
 static void dj_link_remote_reset(void)
@@ -2203,12 +2531,15 @@ static void dj_link_remote_reset(void)
 
 static void dj_link_close(void)
 {
+    dj_link_nfsd_service_stop();                /* v342: before the address goes */
     /* Before the TCP/UDP teardown: the fetch PCB needs the netif index. */
     dj_link_fetch_abort("DJ LINK STOPPED");
     if (s_fetch_db && s_fetch_db_active) {
         dj_link_db_stop(&s_fetch_db->client);   /* closes s_fetch_tcp */
         s_fetch_db_active = false;
     }
+    dj_link_nb_halt();                          /* v338 */
+    dj_link_nb_reset(&s_nb_cache);
     /* A browse in progress starts over (new generation) once reopened. */
     if (s_browse_peer != 0u) {
         dj_link_browse_restart(s_browse_peer);
@@ -2411,6 +2742,12 @@ static bool dj_link_handle(const dj_link_rx_slot_t *slot)
         dj_link_on_sync_packet(slot);
         return false;
     }
+    /* v341: a mixer's fader start and channels on air. */
+    if (slot->port == DJLINK_PORT_BEAT && (type == 0x02u || type == 0x03u)) {
+        if (dj_link_mixer_ingest(&s_mixer, slot->data, slot->len, slot->rx_ms)) {
+            return false;
+        }
+    }
     if (slot->port == DJLINK_PORT_STATUS && type == 0x1au) {
         ESP_LOGW(TAG, "unexpected load ack from #%u (we send no loads)",
                  (unsigned)slot->data[0x21]);
@@ -2419,6 +2756,9 @@ static bool dj_link_handle(const dj_link_rx_slot_t *slot)
     if (dj_link_table_ingest_from(&s_table, slot->port, slot->data, slot->len,
                                   slot->src_ip, slot->rx_ms) != DJ_LINK_RX_ACCEPTED) {
         return false;
+    }
+    if (slot->port == DJLINK_PORT_BEAT && type == 0x28u) {
+        dj_link_clock_note_beat(slot->data[0x21], slot->rx_us);
     }
     /* Beat, position and status all carry the player number at 0x21. */
     dj_link_session_note_device(&s_session[0], slot->data[0x21], slot->rx_ms);
@@ -2441,6 +2781,51 @@ static bool dj_link_drain(void)
     return changed;
 }
 
+/* v339: the beat clocks of the players, estimated from the beat packets'
+ * microsecond arrival times (dj_link_clock.c). dj_link task only. */
+EXT_RAM_BSS_ATTR static dj_link_clock_bank_t s_clock_bank;
+static uint32_t s_sync_counter[2];       /* v339: Syncn of each of our decks */
+static bool     s_master_was[2];         /* v339: deck asserted master last pass */
+static bool     s_clock_locked;          /* v339: the estimate is the clock handed out */
+
+/* The table was reset (link down, new lease): the clocks and Syncn go too. */
+static void dj_link_clock_reset_all(void)
+{
+    dj_link_clock_bank_reset(&s_clock_bank);
+    dj_link_mixer_reset(&s_mixer);
+    memset(s_on_air_logged, 0, sizeof(s_on_air_logged));
+    s_clock_locked = false;
+    memset(s_sync_counter, 0, sizeof(s_sync_counter));
+    memset(s_master_was, 0, sizeof(s_master_was));
+}
+
+/* A beat packet from `player` was just ingested: its tempo and bar are in the
+ * table. */
+static void dj_link_clock_note_beat(uint8_t player, int64_t rx_us)
+{
+    const dj_link_peer_t *p = dj_link_find_peer(player);
+    if (!p || !p->has_beat || p->beat_bpm <= 0.0f) {
+        return;
+    }
+    dj_link_clock_bank_beat(&s_clock_bank, player, rx_us, p->beat_in_bar,
+                            (uint32_t)(60000000.0f / p->beat_bpm + 0.5f));
+}
+
+/* The table's clock (last packet as the anchor) refined by the estimator once
+ * it holds enough beats. The player and the staleness rule stay the table's. */
+static void dj_link_clock_refine(dj_link_beat_clock_t *c)
+{
+    dj_link_clock_fit_t fit;
+    if (!c->valid || !dj_link_clock_bank_get(&s_clock_bank, c->player, &fit) || !fit.locked) {
+        return;
+    }
+    const int64_t us = fit.anchor_us;
+    c->anchor_ms = (uint32_t)(us / 1000);
+    c->anchor_frac_us = (uint16_t)(us % 1000);
+    c->period_us = fit.period_us;
+    c->beat_in_bar = fit.beat_in_bar;
+}
+
 /* v304: last clock handed to s_config.beat_clock. dj_link task only. */
 static dj_link_beat_clock_t s_beat_clock;
 
@@ -2452,6 +2837,7 @@ static void dj_link_beat_clock_service(uint32_t now_ms)
     dj_link_beat_clock_t c;
     dj_link_table_beat_clock(&s_table, s_beat_clock.valid ? s_beat_clock.player : 0u,
                              now_ms, &c);
+    dj_link_clock_refine(&c);
     if (dj_link_master_asserts(&s_master, 0u) || dj_link_master_asserts(&s_master, 1u)) {
         /* v305: we are the master; the peers follow us, so SYNC on our other
          * deck follows ours (local beat sync), not a peer echoing it. */
@@ -2459,15 +2845,29 @@ static void dj_link_beat_clock_service(uint32_t now_ms)
     }
     if (c.valid == s_beat_clock.valid && c.player == s_beat_clock.player &&
         c.beat_in_bar == s_beat_clock.beat_in_bar && c.anchor_ms == s_beat_clock.anchor_ms &&
-        c.period_us == s_beat_clock.period_us) {
+        c.anchor_frac_us == s_beat_clock.anchor_frac_us && c.period_us == s_beat_clock.period_us) {
         return;
     }
     if (c.valid != s_beat_clock.valid || c.player != s_beat_clock.player) {
         if (c.valid) {
-            ESP_LOGI(TAG, "beat clock: player #%u, %.2f BPM", (unsigned)c.player,
-                     (double)(60000000.0f / (float)c.period_us));
+            dj_link_clock_fit_t fit;
+            const bool have = dj_link_clock_bank_get(&s_clock_bank, c.player, &fit);
+            ESP_LOGI(TAG, "beat clock: player #%u, %.2f BPM (%s)", (unsigned)c.player,
+                     (double)(60000000.0f / (float)c.period_us),
+                     have && fit.locked ? "regression" : "last packet");
         } else {
             ESP_LOGI(TAG, "beat clock: none");
+        }
+    }
+    /* v339: say once when the estimate takes over from the last packet. */
+    dj_link_clock_fit_t fit;
+    const bool locked = c.valid && dj_link_clock_bank_get(&s_clock_bank, c.player, &fit) &&
+                        fit.locked;
+    if (locked != s_clock_locked) {
+        s_clock_locked = locked;
+        if (locked) {
+            ESP_LOGI(TAG, "beat clock: player #%u regression on %u beats, rms %u us",
+                     (unsigned)c.player, (unsigned)fit.beats, (unsigned)fit.rms_us);
         }
     }
     s_beat_clock = c;
@@ -2481,6 +2881,8 @@ static void dj_link_publish(dj_link_state_t state)
     summary.rx_dropped += atomic_load_explicit(&s_ring_filtered, memory_order_relaxed);
     summary.our_number = dj_link_session_number(&s_session[0]);
     summary.our_number_d2 = dj_link_session_number(&s_session[1]);
+    dj_link_nb_snapshot();                 /* outside the lock */
+    dj_link_nb_publish(&s_nb_pub);
     portENTER_CRITICAL(&s_mux);
     s_published = summary;
     portEXIT_CRITICAL(&s_mux);
@@ -2518,11 +2920,51 @@ static void dj_link_master_service(dj_link_deck_report_t report[2], uint32_t now
         dj_link_deck_command(d, out.cmd[d]);
         report[d].master = dj_link_master_asserts(&s_master, d);
         report[d].master_handoff = dj_link_master_handoff(&s_master, d);
+        /* v339: a deck that takes the tempo master sends one more than the
+         * highest Syncn on the network (beat-link does the same), so the
+         * players can tell the newest master. Kept when it lets go. */
+        if (report[d].master && !s_master_was[d]) {
+            const uint32_t largest = dj_link_table_largest_sync(&s_table);
+            s_sync_counter[d] = (largest > s_sync_counter[d] ? largest : s_sync_counter[d]) + 1u;
+            ESP_LOGI(TAG, "deck %u tempo master: Syncn %u", (unsigned)d + 1u,
+                     (unsigned)s_sync_counter[d]);
+        }
+        s_master_was[d] = report[d].master;
+        report[d].sync_counter = s_sync_counter[d];
     }
     if (s_master.phase != s_master_logged) {
         s_master_logged = s_master.phase;
         ESP_LOGW(TAG, "tempo master: deck %u %s (peer #%u)", (unsigned)s_master.deck + 1u,
                  dj_link_master_phase_str(s_master.phase), (unsigned)s_master.peer);
+    }
+}
+
+/* v341: what the mixer asked of our decks since the last pass. A deck holds
+ * a player number 1..4 (the packets carry four channels). Fader start acts
+ * only while LINK SYNC is on - the same switch that lets the network sync and
+ * take over our decks - and deck_core checks it again; on air only decides a
+ * status flag. */
+static void dj_link_mixer_service(dj_link_deck_report_t report[2], uint32_t now_ms)
+{
+    const bool control = atomic_load(&s_sync_control);
+    for (uint8_t d = 0; d < 2u; d++) {
+        const uint8_t number = dj_link_session_number(&s_session[d]);
+        const dj_link_fader_event_t e = dj_link_mixer_fader_take(&s_mixer, number);
+        if (e != DJ_LINK_FADER_NONE && control && report[d].loaded) {
+            dj_link_deck_command(d, e == DJ_LINK_FADER_START ? DJ_LINK_DECK_CMD_FADER_START
+                                                             : DJ_LINK_DECK_CMD_FADER_STOP);
+        } else if (e != DJ_LINK_FADER_NONE) {
+            ESP_LOGI(TAG, "deck %u: mixer fader %s ignored (%s)", (unsigned)d + 1u,
+                     e == DJ_LINK_FADER_START ? "start" : "stop",
+                     !control ? "LINK SYNC off" : "no track");
+        }
+        const bool on_air = dj_link_mixer_on_air(&s_mixer, number, now_ms);
+        if (on_air != s_on_air_logged[d]) {
+            s_on_air_logged[d] = on_air;
+            ESP_LOGI(TAG, "deck %u (player #%u): %s by the mixer", (unsigned)d + 1u,
+                     (unsigned)number, on_air ? "on air" : "off air");
+        }
+        report[d].on_air = on_air;
     }
 }
 
@@ -2562,11 +3004,16 @@ static bool dj_link_players_service(uint32_t now_ms)
     memcpy(report, s_deck_report, sizeof(report));
     portEXIT_CRITICAL(&s_mux);
     dj_link_master_service(report, now_ms);
+    dj_link_mixer_service(report, now_ms);
 
     if ((uint32_t)(now_ms - s_status_ms) >= DJ_LINK_STATUS_MS) {
         s_status_ms = now_ms;
         uint8_t library = dj_link_session_number(&s_session[0]);
         for (int d = 0; d < 2; d++) {
+            /* v339: the beat counter of the moment, from the grid window. */
+            report[d].beat_valid = dj_link_deck_beat_now(&report[d], now_ms,
+                                                         &report[d].beat_counter,
+                                                         &report[d].beat_in_bar_now);
             int n = dj_link_session_status(&s_session[d], library, &report[d],
                                            s_status_counter[d] + 1u, s_tx, sizeof(s_tx));
             if (n > 0) {
@@ -2627,6 +3074,7 @@ static void dj_link_task(void *arg)
     uint32_t last_publish_ms = 0;
     uint32_t last_ip_check_ms = 0;
     dj_link_table_reset(&s_table);
+    dj_link_clock_reset_all();
     dj_link_master_reset(&s_master);
     s_master_logged = DJ_LINK_MASTER_IDLE;
     atomic_store(&s_ring_filtered, 0u);
@@ -2641,11 +3089,17 @@ static void dj_link_task(void *arg)
                 open = false;
             }
             dj_link_table_reset(&s_table);
+            dj_link_clock_reset_all();
             dj_link_master_reset(&s_master);
             dj_link_beat_clock_service(dj_link_now_ms());
             state = DJ_LINK_STATE_OFF;
             s_browse_peer = 0u;
             dj_link_browse_free();
+            dj_link_nb_halt();                 /* v338: no session, cache and memory gone */
+            dj_link_nb_reset(&s_nb_cache);
+            dj_link_nb_publish(NULL);
+            heap_caps_free(s_nb_mem);
+            s_nb_mem = NULL;
             /* Freed before s_running drops, so a successor task can never
              * see (or lose) this ring. */
             heap_caps_free(s_ring);
@@ -2681,6 +3135,7 @@ static void dj_link_task(void *arg)
             dj_link_close();
             open = false;
             dj_link_table_reset(&s_table);
+            dj_link_clock_reset_all();
             ESP_LOGW(TAG, "Ethernet IP lost - PCBs closed");
         }
         if (!open) {
@@ -2723,6 +3178,7 @@ static void dj_link_task(void *arg)
         dj_link_service_remote(now_ms);
         dj_link_browse_service(now_ms);
         dj_link_fetch_service(now_ms);
+        changed |= dj_link_nb_service(now_ms);
 
         changed |= dj_link_players_service(now_ms);
 
@@ -2733,6 +3189,7 @@ static void dj_link_task(void *arg)
                 dj_link_close();
                 open = false;
                 dj_link_table_reset(&s_table);
+                dj_link_clock_reset_all();
                 ESP_LOGW(TAG, "Ethernet IP changed - rejoining");
                 continue;
             }
@@ -2979,6 +3436,52 @@ esp_err_t dj_link_set_enabled(bool enable)
     }
     ESP_LOGW(TAG, "started");
     return ESP_OK;
+}
+
+uint8_t dj_link_get_neighbors(dj_link_neighbor_t *out, uint8_t max)
+{
+    /* One reader at a time (LVGL task); PSRAM, not 2.7 KB of internal RAM. */
+    EXT_RAM_BSS_ATTR static dj_link_nb_pub_t copy;
+    if (!out || max == 0u) {
+        return 0u;
+    }
+    if (!dj_link_nb_read(&copy)) {
+        return 0u;          /* the next poll (250 ms) gets it */
+    }
+
+    const uint32_t now_ms = dj_link_now_ms();
+    uint8_t n = copy.count < max ? copy.count : max;
+    for (uint8_t i = 0; i < n; i++) {
+        const dj_link_peer_t *p = &copy.peer[i];
+        const dj_link_nb_slot_t *s = &copy.slot[i];
+        dj_link_neighbor_t *o = &out[i];
+        memset(o, 0, sizeof(*o));
+        o->number = p->device_number;
+        snprintf(o->name, sizeof(o->name), "%s", p->name);
+        o->master = p->master;
+        o->on_air = p->on_air;
+        o->playing = p->playing;
+        o->synced = p->synced;
+        o->bpm = p->bpm;
+        o->pitch_pct = p->pitch_pct;
+        o->has_track = p->rekordbox_id != 0u;
+        if (s->number != 0u && s->has_meta) {
+            o->has_meta = true;
+            snprintf(o->title, sizeof(o->title), "%s", s->title);
+            snprintf(o->artist, sizeof(o->artist), "%s", s->artist);
+            o->duration_s = s->duration_s;
+        }
+        if (s->number != 0u && s->has_wave) {
+            o->has_wave = true;
+            memcpy(o->wave, s->wave, sizeof(o->wave));
+        }
+        o->wave_gen = s->gen;
+        if (o->has_track) {
+            o->has_position = dj_link_nb_position_ms(p, now_ms, &o->position_ms,
+                                                     &o->position_estimated);
+        }
+    }
+    return n;
 }
 
 void dj_link_get_summary(dj_link_summary_t *out)

@@ -180,6 +180,15 @@ typedef struct {
     bool     sync;
     bool     master;             /* v305: set by dj_link while LINK SYNC is on */
     uint8_t  master_handoff;     /* v305: Mh, set by dj_link; 0 = none */
+    uint32_t sync_counter;       /* v339: Syncn, set by dj_link */
+    bool     on_air;             /* v341: a mixer flagged this deck's channel, set by dj_link */
+    /* v339: the beat counter (0xa0) and bar position (0xa6) of the status,
+     * set by dj_link from the grid window at the playhead of the moment
+     * (dj_link_deck_beat_now). beat_valid false = no grid: 0xffffffff. */
+    bool     beat_valid;
+    uint32_t beat_counter;       /* 1-based number of the last grid beat reached, 0 before the first */
+    uint8_t  beat_in_bar_now;    /* 1..4, 0 = unknown */
+    uint32_t beat_number0;       /* 1-based number of beats[0] (dj_link_report_beats) */
     /* v301: playhead, for the position 0x0b and beat 0x28 packets. */
     uint32_t position_ms;        /* playhead when reported */
     uint32_t duration_ms;        /* 0 = unknown */
@@ -196,6 +205,12 @@ typedef bool (*dj_link_grid_get_fn)(const void *grid, size_t i, dj_link_report_b
 /* Fill r->beats / r->beat_count with the window around r->position_ms. */
 void dj_link_report_beats(dj_link_deck_report_t *r, const void *grid, size_t count,
                           dj_link_grid_get_fn get);
+
+/* v339: the grid beat the playhead has reached at now_ms, from the window:
+ * its 1-based number in the track (0 = before the first) and its bar
+ * position. False without a window. */
+bool dj_link_deck_beat_now(const dj_link_deck_report_t *r, uint32_t now_ms,
+                           uint32_t *number, uint8_t *in_bar);
 
 /* Playhead at now_ms: the reported one, advanced at speed while playing (for
  * at most DJ_LINK_REPORT_HOLD_MS) and clamped to the duration. */

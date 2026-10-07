@@ -68,3 +68,16 @@ esp_err_t hot_cue_store_clear(uint32_t track_key)
     }
     return ESP_ERR_NOT_FOUND;
 }
+
+#if defined(HOT_CUE_STORE_VERSION) && defined(HOT_CUE_STORE_MEMORY_MAX)
+/* v338: the JC1060 deck_core registers its loaded tracks; no NVS here. */
+void hot_cue_store_set_pin_provider(hot_cue_store_pin_fn fn)
+{
+    (void)fn;
+}
+
+void hot_cue_store_log_usage(const char *why)
+{
+    (void)why;
+}
+#endif

@@ -45,7 +45,12 @@ static void ip_event_cb(void* arg, esp_event_base_t event_base,
         ip_event_got_ip_t* evt = (ip_event_got_ip_t*)event_data;
         s_ip_info = evt->ip_info;
         s_got_ip = true;
-        ESP_LOGI(TAG, "ETH Got IP: " IPSTR, IP2STR(&evt->ip_info.ip));
+        /* v341: 169.254.x.x is the AutoIP fallback (no DHCP answer); a lease
+         * from a server that appears later arrives as another event. */
+        const bool link_local = (esp_ip4_addr1(&evt->ip_info.ip) == 169 &&
+                                 esp_ip4_addr2(&evt->ip_info.ip) == 254);
+        ESP_LOGI(TAG, "ETH Got IP: " IPSTR "%s", IP2STR(&evt->ip_info.ip),
+                 link_local ? " (link-local, no DHCP server)" : "");
     }
 }
 

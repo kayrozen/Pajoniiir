@@ -164,3 +164,19 @@ CONFIG_AUDIO_KEYLOCK_WSOLA2=y
 # menuconfig (Component config > LWIP > Enable reassembly incoming fragmented
 # IP4 packets) or regenerate sdkconfig.
 CONFIG_LWIP_IP4_REASSEMBLY=y
+# v341: IPv4 link-local (AutoIP, RFC 3927). A CDJ wired straight to the P4, or a
+# switch with no DHCP server, leaves the board without an address; after this
+# many unanswered DHCP DISCOVERs lwIP takes 169.254.x.x (ARP-probed), like a
+# Pioneer player does, and keeps asking DHCP: a server that shows up later
+# replaces it (IP_EVENT_ETH_GOT_IP again, which dj_link answers by rejoining).
+# 3 probes is about 7 s: a slow router gets its lease before the fallback. An
+# existing sdkconfig keeps "is not set": enable it in menuconfig (Component
+# config > LWIP > Enable IPV4 Link-Local Addressing) or regenerate sdkconfig.
+CONFIG_LWIP_AUTOIP=y
+CONFIG_LWIP_AUTOIP_TRIES=3
+# v342: two more sockets for the NFS export of our USB key (portmapper and
+# mount + nfs, dj_link_nfsd_service.c). The netconn pool is the socket pool:
+# httpd keeps about 7 of the default 10, and a pull-OTA HTTP client needs one
+# more, so 2 more would have left no margin. An existing sdkconfig keeps its
+# value: menuconfig > Component config > LWIP > Max number of open sockets.
+CONFIG_LWIP_MAX_SOCKETS=12

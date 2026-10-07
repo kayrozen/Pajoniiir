@@ -40,7 +40,8 @@ extern "C" {
  * (esp_timer ms, the clock the dj_link task stamps packets with). */
 typedef struct {
     bool     valid;
-    uint32_t anchor_ms;     /* rx time of the master's last beat packet */
+    uint32_t anchor_ms;     /* rx time of the master's last beat (esp_timer ms) */
+    uint16_t anchor_frac_us; /* v339: microseconds past anchor_ms, 0..999 */
     uint32_t period_us;     /* effective beat length, master pitch applied */
     uint8_t  beat_in_bar;   /* 1..4 at anchor_ms, 0 = unknown */
     uint8_t  player;        /* master's device number, for logs and UI */
@@ -70,10 +71,16 @@ typedef struct {
     deck_net_sync_status_t status;
 } deck_net_sync_t;
 
+/* v339: the playhead is the mixed position; it is heard one output latency
+ * later (UAC ring + URBs in flight). Phase is judged on what is heard, so two
+ * decks that "line up" on paper do not sound a few tens of ms apart. */
+#define DECK_NET_SYNC_LATENCY_MAX_US 200000u
+
 typedef struct {
     bool     playing;
     bool     hold;              /* jog touched / scratching: keep the pitch */
-    uint32_t position_ms;       /* playhead, track time */
+    uint32_t position_ms;       /* playhead, track time (mixed, not yet heard) */
+    uint32_t latency_us;        /* v339: mixed to heard, 0 = none (tests, PC) */
     const anlz_beat_t *beats;   /* loaded track's grid, NULL = none */
     uint16_t beat_count;
 } deck_net_sync_local_t;

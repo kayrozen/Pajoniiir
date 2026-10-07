@@ -124,6 +124,19 @@ static dj_link_rx_t ingest_status(dj_link_table_t *table, const uint8_t *buf,
         p->synced  = (st.flags & DJLINK_FLAG_SYNC) != 0u;
     }
     p->master_handoff = st.master_handoff;
+    /* Syncn is not in the codec's struct: 0x84, u32, in every status that long. */
+    p->sync_counter = len > 0x87u ? djlink_rd32(&buf[0x84]) : 0u;
+    if (st.bpm100 == DJ_LINK_BPM100_NO_TRACK || st.source_device == 0u || st.rekordbox_id == 0u) {
+        p->source_device = 0u;
+        p->source_slot = 0u;
+        p->rekordbox_id = 0u;
+        p->beat_count = 0u;
+    } else {
+        p->source_device = st.source_device;
+        p->source_slot = st.source_slot;
+        p->rekordbox_id = st.rekordbox_id;
+        p->beat_count = st.beat == 0xffffffffu ? 0u : st.beat;
+    }
     if (st.bpm100 == DJ_LINK_BPM100_NO_TRACK) {
         p->bpm = 0.0f;
     } else {
@@ -314,6 +327,17 @@ void dj_link_table_beat_clock(const dj_link_table_t *table, uint8_t prefer,
     out->beat_in_bar = p->beat_in_bar >= 1u && p->beat_in_bar <= 4u ? p->beat_in_bar : 0u;
     out->anchor_ms = p->beat_rx_ms;
     out->period_us = (uint32_t)(60000000.0f / p->beat_bpm + 0.5f);
+}
+
+uint32_t dj_link_table_largest_sync(const dj_link_table_t *table)
+{
+    uint32_t largest = 0u;
+    for (size_t i = 0; table && i < DJ_LINK_MAX_PEERS; i++) {
+        if (table->peers[i].in_use && table->peers[i].sync_counter > largest) {
+            largest = table->peers[i].sync_counter;
+        }
+    }
+    return largest;
 }
 
 float dj_link_peer_beat_phase(const dj_link_peer_t *peer, uint32_t now_ms)

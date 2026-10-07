@@ -173,6 +173,43 @@ static void test_status_master_wins(void)
     CHECK(strcmp(text, "DJ LINK: ON joining - CDJ-3000 #2 --- BPM") == 0);
 }
 
+/* v338: the track a player reports. */
+static void test_status_track(void)
+{
+    dj_link_table_t t;
+    uint8_t buf[DJLINK_MAX_PACKET];
+    dj_link_table_reset(&t);
+
+    size_t n = make_status(buf, 2, DJLINK_FLAG_PLAYING, 12800, PITCH_ZERO);
+    buf[0x28] = 2;                       /* its own USB */
+    buf[0x29] = DJLINK_SLOT_USB;
+    djlink_wr32(&buf[0x2c], 4711u);
+    djlink_wr32(&buf[0xa0], 96u);
+    CHECK(dj_link_table_ingest(&t, DJLINK_PORT_STATUS, buf, n, 500) == DJ_LINK_RX_ACCEPTED);
+    const dj_link_peer_t *p = &t.peers[0];
+    CHECK(p->device_number == 2);
+    CHECK(p->source_device == 2 && p->source_slot == DJLINK_SLOT_USB);
+    CHECK(p->rekordbox_id == 4711u);
+    CHECK(p->beat_count == 96u);
+
+    /* Beat counter 0xffffffff = unavailable. */
+    djlink_wr32(&buf[0xa0], 0xffffffffu);
+    CHECK(dj_link_table_ingest(&t, DJLINK_PORT_STATUS, buf, n, 600) == DJ_LINK_RX_ACCEPTED);
+    CHECK(p->rekordbox_id == 4711u && p->beat_count == 0u);
+
+    /* Source without an id, or no track (BPM 0xffff): forgotten. */
+    djlink_wr32(&buf[0x2c], 0u);
+    CHECK(dj_link_table_ingest(&t, DJLINK_PORT_STATUS, buf, n, 700) == DJ_LINK_RX_ACCEPTED);
+    CHECK(p->source_device == 0 && p->rekordbox_id == 0u);
+    djlink_wr32(&buf[0x2c], 4712u);
+    CHECK(dj_link_table_ingest(&t, DJLINK_PORT_STATUS, buf, n, 800) == DJ_LINK_RX_ACCEPTED);
+    CHECK(p->rekordbox_id == 4712u);
+    buf[0x92] = 0xff;
+    buf[0x93] = 0xff;
+    CHECK(dj_link_table_ingest(&t, DJLINK_PORT_STATUS, buf, n, 900) == DJ_LINK_RX_ACCEPTED);
+    CHECK(p->source_device == 0 && p->rekordbox_id == 0u && p->bpm == 0.0f);
+}
+
 static void test_position(void)
 {
     dj_link_table_t t;
@@ -956,6 +993,77 @@ static dj_link_deck_report_t playing_deck(uint32_t position_ms, uint32_t stamp_m
     return d;
 }
 
+/* v339: the beat counter and bar position of our status, from the window. */
+static void test_beat_counter_and_syncn(void)
+{
+    uint32_t n = 99;
+    uint8_t bar = 9;
+    dj_link_deck_report_t d = playing_deck(0u, 0u);
+    CHECK(d.beat_number0 == 1u);                          /* playhead before the first beat */
+    CHECK(dj_link_deck_beat_now(&d, 0u, &n, &bar) && n == 0u && bar == 0u);
+    CHECK(dj_link_deck_beat_now(&d, 250u, &n, &bar) && n == 1u && bar == 1u);
+    CHECK(dj_link_deck_beat_now(&d, 1000u, &n, &bar) && n == 2u && bar == 2u);   /* 750 + 250 */
+    /* Mid-track: the window starts at the beat at or before the playhead. */
+    d = playing_deck(31250u, 5000u);                       /* beat index 62 = number 63 */
+    CHECK(d.beat_number0 == 63u && d.beats[0].time_ms == 31250u);
+    CHECK(dj_link_deck_beat_now(&d, 5000u, &n, &bar) && n == 63u && bar == (uint8_t)((62 % 4) + 1));
+    CHECK(dj_link_deck_beat_now(&d, 5000u + 800u, &n, &bar) && n == 64u);    /* +1 beat */
+    /* Past the report hold the playhead stops extrapolating: 1 s = 2 beats. */
+    CHECK(dj_link_deck_beat_now(&d, 5000u + 5000u, &n, &bar) && n == 65u);
+    /* No grid: unavailable. */
+    d = playing_deck(0u, 0u);
+    d.beat_count = 0u;
+    CHECK(!dj_link_deck_beat_now(&d, 0u, &n, &bar));
+
+    /* The status carries counter, bar and Syncn. */
+    uint32_t clk = 0;
+    dj_link_session_t s = make_active(&clk);
+    d = playing_deck(31250u, 5000u);
+    d.beat_valid = dj_link_deck_beat_now(&d, 5000u + 800u, &d.beat_counter, &d.beat_in_bar_now);
+    d.sync_counter = 7u;
+    uint8_t buf[DJLINK_MAX_PACKET];
+    int len = dj_link_session_status(&s, 4, &d, 3, buf, sizeof(buf));
+    CHECK(len == (int)DJLINK_STATUS_PACKET_LEN);
+    CHECK(djlink_rd32(&buf[0xa0]) == 64u);
+    CHECK(buf[0xa6] == (uint8_t)((63 % 4) + 1));
+    CHECK(djlink_rd32(&buf[0x84]) == 7u);
+    /* Without a grid the counter stays unavailable and Syncn 0. */
+    d = playing_deck(0u, 0u);
+    d.beat_count = 0u;
+    len = dj_link_session_status(&s, 4, &d, 4, buf, sizeof(buf));
+    CHECK(len > 0 && djlink_rd32(&buf[0xa0]) == 0xffffffffu && djlink_rd32(&buf[0x84]) == 0u);
+
+    /* v341: on air, as a mixer flagged the deck's channel. */
+    d = playing_deck(0u, 0u);
+    d.on_air = false;
+    len = dj_link_session_status(&s, 4, &d, 5, buf, sizeof(buf));
+    CHECK(len > 0 && (buf[0x89] & DJLINK_FLAG_ON_AIR) == 0u);
+    d.on_air = true;
+    len = dj_link_session_status(&s, 4, &d, 6, buf, sizeof(buf));
+    CHECK(len > 0 && (buf[0x89] & DJLINK_FLAG_ON_AIR) != 0u && (buf[0x89] & DJLINK_FLAG_PLAYING) != 0u);
+    djlink_status_t on_air_st;
+    CHECK(djlink_status_parse(buf, (size_t)len, &on_air_st) == DJLINK_OK &&
+          (on_air_st.flags & DJLINK_FLAG_ON_AIR));
+    /* An empty deck is never on air. */
+    d.loaded = false;
+    len = dj_link_session_status(&s, 4, &d, 7, buf, sizeof(buf));
+    CHECK(len > 0 && (buf[0x89] & DJLINK_FLAG_ON_AIR) == 0u);
+
+    /* Syncn of the peers: read from every status, the highest wins. */
+    dj_link_table_t pt;
+    dj_link_table_reset(&pt);
+    uint8_t pkt[DJLINK_MAX_PACKET];
+    size_t pl = make_status(pkt, 1, 0, 12800, PITCH_ZERO);
+    djlink_wr32(&pkt[0x84], 3u);
+    CHECK(dj_link_table_ingest(&pt, DJLINK_PORT_STATUS, pkt, pl, 100) == DJ_LINK_RX_ACCEPTED);
+    pl = make_status(pkt, 2, 0, 12800, PITCH_ZERO);
+    djlink_wr32(&pkt[0x84], 9u);
+    CHECK(dj_link_table_ingest(&pt, DJLINK_PORT_STATUS, pkt, pl, 100) == DJ_LINK_RX_ACCEPTED);
+    CHECK(dj_link_table_largest_sync(&pt) == 9u);
+    CHECK(dj_link_table_largest_sync(NULL) == 0u);
+    CHECK(pt.peers[0].sync_counter == 3u);
+}
+
 static void test_report_beats(void)
 {
     dj_link_deck_report_t d = playing_deck(0u, 0u);
@@ -1162,6 +1270,7 @@ int main(void)
     test_beat_clock();
     test_beat_master_inferred();
     test_status_master_wins();
+    test_status_track();
     test_position();
     test_players_ip();
     test_keepalive_sources();
@@ -1176,6 +1285,7 @@ int main(void)
     test_session_pair_numbers();
     test_session_two_decks();
     test_session_status();
+    test_beat_counter_and_syncn();
     test_report_beats();
     test_deck_playhead();
     test_session_position();

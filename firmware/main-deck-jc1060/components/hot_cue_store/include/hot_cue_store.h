@@ -9,6 +9,7 @@ typedef int esp_err_t;
 #define ESP_ERR_INVALID_ARG  0x102
 #define ESP_ERR_INVALID_SIZE 0x104
 #define ESP_ERR_NOT_FOUND    0x105
+#define ESP_ERR_NVS_NOT_ENOUGH_SPACE 0x110d
 #else
 #include "esp_err.h"
 #endif
@@ -48,6 +49,23 @@ esp_err_t hot_cue_store_decode(const void *raw, size_t len, hot_cue_store_blob_t
 esp_err_t hot_cue_store_load(uint32_t track_key, hot_cue_store_blob_t *out_blob);
 esp_err_t hot_cue_store_save(uint32_t track_key, const hot_cue_store_blob_t *blob);
 esp_err_t hot_cue_store_clear(uint32_t track_key);
+
+/* v338: the NVS partition is small (24 KB, ~90 hot cue blobs) and every
+ * loaded track with analysis cues leaves one. A blob that holds only what
+ * the analysis seeded (no pad or cue point made on the deck) is rebuilt by
+ * the next load, so it can be dropped to make room. */
+bool hot_cue_store_blob_is_seed_only(const hot_cue_store_blob_t *blob);
+
+/* Track keys that must keep their blob (the pads of a loaded track read it).
+ * Fills keys[] with up to max keys and returns the count. Called from a
+ * save that ran out of space, so it must not block. */
+typedef size_t (*hot_cue_store_pin_fn)(uint32_t *keys, size_t max);
+void hot_cue_store_set_pin_provider(hot_cue_store_pin_fn fn);
+
+/* A save (hot cue or memory edits) that fails with NOT_ENOUGH_SPACE erases the
+ * seed-only hot cue blobs of the tracks that are not pinned, then retries
+ * once. Logs the NVS usage; why names the caller. No-op on the host. */
+void hot_cue_store_log_usage(const char *why);
 
 /* Blob layout version written by hot_cue_store_normalize. */
 #define HOT_CUE_STORE_VERSION 2u

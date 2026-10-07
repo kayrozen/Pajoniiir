@@ -21,6 +21,8 @@
 #endif
 #endif
 #include "audio_decoder.h"
+#include "audio_decim2.h"
+#include "audio_pcm_file.h"
 #include "audio_eof_policy.h"
 #include "audio_start_gate.h"
 #include "audio_cue_preroll.h"
@@ -314,6 +316,12 @@ typedef struct {
     uint16_t       wav_block_align;
     uint64_t       wav_total_frames;
     uint64_t       wav_current_frame;
+    /* v337: the PCM layout (WAV 16/24/32/float, AIFF, AIFC) of wav_*. */
+    audio_pcm_format_t wav_fmt;
+    /* v337: 2:1 decimation stages of a WAV / AIFF / FLAC source above 64
+     * kHz (audio_decim2); sample_rate is the decimated rate, the source
+     * rate is sample_rate << decim_stages. Decode task only. */
+    uint8_t        decim_stages;
 
     /* Firmware FLAC decode over the PSRAM preloaded buffer (dr_flac).
      * void* to keep dr_flac.h out of the struct definition; cast in ae_flac_*. */
@@ -407,6 +415,10 @@ typedef struct {
 } audio_engine_state_t;
 
 static audio_engine_state_t  s_engines[AUDIO_ENGINE_DECK_COUNT];
+#if AE_FW
+/* v337: hi-res decimators, decode task only; PSRAM (1 KB per deck). */
+static EXT_RAM_BSS_ATTR audio_decim2_t s_decim[AUDIO_ENGINE_DECK_COUNT][2];
+#endif
 
 static inline audio_pcm_ring_t *pcm_ring_for_deck(uint8_t deck)
 {
@@ -1839,19 +1851,6 @@ static bool any_deck_loaded(void)
 #endif
 
 #if AE_FW
-static uint16_t ae_wav_rd_u16le(const uint8_t *p)
-{
-    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-}
-
-static uint32_t ae_wav_rd_u32le(const uint8_t *p)
-{
-    return (uint32_t)p[0] |
-           ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) |
-           ((uint32_t)p[3] << 24);
-}
-
 static bool ae_fw_read_exact(audio_fw_preload_t *fw,
                              size_t offset,
                              void *dst,
@@ -1860,86 +1859,83 @@ static bool ae_fw_read_exact(audio_fw_preload_t *fw,
     return fw && audio_fw_preload_read_at(fw, offset, dst, bytes) == bytes;
 }
 
+static bool ae_pcm_cache_read(void *ctx, size_t offset, void *dst, size_t bytes)
+{
+    return ae_fw_read_exact((audio_fw_preload_t *)ctx, offset, dst, bytes);
+}
+
+static uint8_t ae_deck_of(const audio_engine_state_t *eng)
+{
+    return (uint8_t)(eng - s_engines);
+}
+
+/* v337: decimation for a source rate; false if it is too high. */
+static bool ae_decim_setup(audio_engine_state_t *eng, uint32_t source_rate)
+{
+    const int stages = audio_decim2_stages(source_rate);
+    if (stages < 0) {
+        return false;
+    }
+    eng->decim_stages = (uint8_t)stages;
+    const uint8_t deck = ae_deck_of(eng);
+    audio_decim2_reset(&s_decim[deck][0]);
+    audio_decim2_reset(&s_decim[deck][1]);
+    return true;
+}
+
+/* v337: n source frames of out_pcm decimated in place; output frames. */
+static size_t ae_decim_run(audio_engine_state_t *eng, int16_t *pcm, size_t n)
+{
+    const uint8_t deck = ae_deck_of(eng);
+    for (uint8_t i = 0; i < eng->decim_stages; i++) {
+        n = audio_decim2_process(&s_decim[deck][i], pcm, n, pcm);
+    }
+    return n;
+}
+
+/* v337: WAV 16/24/32-bit integer and 32-bit float (plain or EXTENSIBLE),
+ * AIFF and AIFC (NONE / sowt), mono or stereo (audio_pcm_file). Sources above
+ * 64 kHz are decimated 2:1 once or twice (audio_decim2). v336 and before:
+ * 16-bit WAV only. */
 static esp_err_t ae_wav_init_from_cache(audio_engine_state_t *eng,
                                         audio_fw_preload_t *fw)
 {
-    uint8_t header[12];
-    if (!eng || !fw || eng->file_size < sizeof(header) ||
-        !ae_fw_read_exact(fw, 0u, header, sizeof(header))) {
+    if (!eng || !fw) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (audio_format_detect_header(header, sizeof(header)) != AUDIO_FORMAT_WAV) {
+    audio_pcm_format_t f;
+    const audio_pcm_result_t r = audio_pcm_parse(ae_pcm_cache_read, fw, eng->file_size, &f);
+    if (r != AUDIO_PCM_OK) {
+        ESP_LOGW(TAG, "PCM file refused: %s",
+                 r == AUDIO_PCM_NOT_PCM ? "not WAV / AIFF" :
+                 r == AUDIO_PCM_UNSUPPORTED ? "unsupported encoding" : "bad chunks");
+        return r == AUDIO_PCM_BAD_FILE ? ESP_FAIL : ESP_ERR_NOT_SUPPORTED;
+    }
+    if (!ae_decim_setup(eng, f.sample_rate)) {
+        ESP_LOGW(TAG, "PCM file refused: %u Hz", (unsigned)f.sample_rate);
         return ESP_ERR_NOT_SUPPORTED;
     }
-
-    bool have_fmt = false;
-    bool have_data = false;
-    uint16_t audio_format = 0;
-    uint16_t channels = 0;
-    uint16_t bits_per_sample = 0;
-    uint16_t block_align = 0;
-    uint32_t sample_rate = 0;
-    size_t data_offset = 0;
-    size_t data_size = 0;
-    size_t pos = 12u;
-
-    while (pos + 8u <= eng->file_size && !have_data) {
-        uint8_t chunk[8];
-        if (!ae_fw_read_exact(fw, pos, chunk, sizeof(chunk))) return ESP_FAIL;
-        uint32_t chunk_size = ae_wav_rd_u32le(chunk + 4);
-        size_t payload = pos + 8u;
-        size_t padded_size = (size_t)chunk_size + (size_t)(chunk_size & 1u);
-        if (payload > eng->file_size || padded_size > eng->file_size - payload) {
-            return ESP_FAIL;
-        }
-
-        if (memcmp(chunk, "fmt ", 4) == 0) {
-            uint8_t fmt[16];
-            if (chunk_size < sizeof(fmt) ||
-                !ae_fw_read_exact(fw, payload, fmt, sizeof(fmt))) {
-                return ESP_FAIL;
-            }
-            audio_format = ae_wav_rd_u16le(fmt + 0);
-            channels = ae_wav_rd_u16le(fmt + 2);
-            sample_rate = ae_wav_rd_u32le(fmt + 4);
-            block_align = ae_wav_rd_u16le(fmt + 12);
-            bits_per_sample = ae_wav_rd_u16le(fmt + 14);
-            have_fmt = true;
-        } else if (memcmp(chunk, "data", 4) == 0) {
-            data_offset = payload;
-            data_size = chunk_size;
-            have_data = true;
-        }
-        pos = payload + padded_size;
-    }
-
-    if (!have_fmt || !have_data || audio_format != 1u) return ESP_ERR_NOT_SUPPORTED;
-    if ((channels != 1u && channels != 2u) || bits_per_sample != 16u) {
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-    if (sample_rate == 0u || block_align == 0u ||
-        block_align != (uint16_t)(channels * sizeof(int16_t))) {
-        return ESP_FAIL;
-    }
-
     eng->format = AUDIO_FORMAT_WAV;
-    eng->sample_rate = sample_rate;
-    eng->channels = (int)channels;
+    eng->wav_fmt = f;
+    eng->sample_rate = f.sample_rate >> eng->decim_stages;
+    eng->channels = (int)f.channels;
     eng->wav_ready = true;
-    eng->wav_data_offset = data_offset;
-    eng->wav_data_size = data_size;
-    eng->wav_data_pos = data_offset;
-    eng->wav_block_align = block_align;
-    eng->wav_total_frames = data_size / block_align;
+    eng->wav_data_offset = f.data_offset;
+    eng->wav_data_size = f.data_size;
+    eng->wav_data_pos = f.data_offset;
+    eng->wav_block_align = f.block_align;
+    eng->wav_total_frames = f.data_size / f.block_align;
     eng->wav_current_frame = 0u;
-    eng->file_pos = data_offset;
+    eng->file_pos = f.data_offset;
     atomic_store_bool(&eng->eof, eng->wav_total_frames == 0u);
     if (eng->duration_ms == 0u) {
         eng->duration_ms = (uint32_t)((eng->wav_total_frames * 1000ull) /
-                                      (uint64_t)sample_rate);
+                                      (uint64_t)f.sample_rate);
     }
-    ESP_LOGI(TAG, "WAV cache: %u Hz, %u ch, %u frames",
-             (unsigned)sample_rate, (unsigned)channels,
+    ESP_LOGI(TAG, "%s cache: %u Hz%s, %u ch, %u-bit%s, %u frames",
+             f.aiff ? "AIFF" : "WAV", (unsigned)f.sample_rate,
+             eng->decim_stages ? " (decimated)" : "", (unsigned)f.channels,
+             (unsigned)f.bytes_per_sample * 8u, f.is_float ? " float" : "",
              (unsigned)eng->wav_total_frames);
     return ESP_OK;
 }
@@ -1948,8 +1944,15 @@ static esp_err_t ae_wav_init_from_cache(audio_engine_state_t *eng,
 static void ae_wav_seek_to_ms(audio_engine_state_t *eng, uint32_t position_ms)
 {
     if (!eng || !eng->wav_ready || eng->sample_rate == 0u || eng->wav_block_align == 0u) return;
-    uint64_t frame = ((uint64_t)position_ms * (uint64_t)eng->sample_rate) / 1000ull;
+    /* v337: source frames (the decimated rate shifted back). */
+    const uint64_t src_rate = (uint64_t)eng->sample_rate << eng->decim_stages;
+    uint64_t frame = ((uint64_t)position_ms * src_rate) / 1000ull;
     if (frame > eng->wav_total_frames) frame = eng->wav_total_frames;
+#if AE_FW
+    if (eng->decim_stages) {
+        (void)ae_decim_setup(eng, (uint32_t)src_rate);   /* new position, fresh history */
+    }
+#endif
     eng->wav_current_frame = frame;
     eng->wav_data_pos = eng->wav_data_offset + (size_t)(frame * eng->wav_block_align);
     eng->file_pos = eng->wav_data_pos;
@@ -2103,7 +2106,11 @@ static int ae_wav_decode_one_frame(audio_engine_state_t *eng,
     }
 
 #if AE_FW
-    uint8_t raw[MINIMP3_MAX_SAMPLES_PER_FRAME * 4u];
+    uint8_t raw[AE_WAV_DECODE_READ_BYTES];
+    /* v337: up to 8 bytes per frame (32-bit stereo): fewer frames per call. */
+    if (frames > sizeof(raw) / eng->wav_block_align) {
+        frames = sizeof(raw) / eng->wav_block_align;
+    }
     size_t raw_bytes = frames * eng->wav_block_align;
     if (!ae_fw_read_exact(fw, eng->wav_data_pos, raw, raw_bytes)) {
         /* Still inside the data chunk (checked above), so this is a fault. */
@@ -2111,17 +2118,8 @@ static int ae_wav_decode_one_frame(audio_engine_state_t *eng,
         return 0;
     }
     ae_clear_read_faults(deck);
-    for (size_t i = 0; i < frames; ++i) {
-        const uint8_t *sample = raw + i * eng->wav_block_align;
-        if (eng->channels == 1) {
-            int16_t value = (int16_t)ae_wav_rd_u16le(sample);
-            out_pcm[i * 2u] = value;
-            out_pcm[i * 2u + 1u] = value;
-        } else {
-            out_pcm[i * 2u] = (int16_t)ae_wav_rd_u16le(sample);
-            out_pcm[i * 2u + 1u] = (int16_t)ae_wav_rd_u16le(sample + 2u);
-        }
-    }
+    audio_pcm_to_s16(&eng->wav_fmt, raw, frames, out_pcm);
+    const size_t produced = eng->decim_stages ? ae_decim_run(eng, out_pcm, frames) : frames;
 #else
     (void)out_pcm;
     return 0;
@@ -2131,7 +2129,11 @@ static int ae_wav_decode_one_frame(audio_engine_state_t *eng,
     eng->wav_data_pos += frames * eng->wav_block_align;
     eng->file_pos = eng->wav_data_pos;
     if (eng->wav_current_frame >= eng->wav_total_frames) atomic_store_bool(&eng->eof, true);
+#if AE_FW
+    return (int)produced;
+#else
     return (int)frames;
+#endif
 }
 
 #if AE_FW
@@ -2217,7 +2219,8 @@ static esp_err_t ae_flac_init_from_cache(audio_engine_state_t *eng,
         ESP_LOGE(TAG, "drflac_open cache failed (size=%u)", (unsigned)eng->file_size);
         return ESP_ERR_NOT_SUPPORTED;
     }
-    if (flac->channels != 1u && flac->channels != 2u) {
+    if ((flac->channels != 1u && flac->channels != 2u) ||
+        !ae_decim_setup(eng, flac->sampleRate)) {
         drflac_close(flac);
         return ESP_ERR_NOT_SUPPORTED;
     }
@@ -2226,7 +2229,7 @@ static esp_err_t ae_flac_init_from_cache(audio_engine_state_t *eng,
     eng->flac_recovery_pending = false;
     eng->flac_resume_frame = 0u;
     eng->format = AUDIO_FORMAT_FLAC;
-    eng->sample_rate = flac->sampleRate;
+    eng->sample_rate = flac->sampleRate >> eng->decim_stages;   /* v337 */
     eng->channels = (int)flac->channels;
     if (eng->duration_ms == 0u && flac->sampleRate > 0u) {
         eng->duration_ms = (uint32_t)((flac->totalPCMFrameCount * 1000ull) /
@@ -2255,8 +2258,13 @@ static bool ae_flac_seek_to_ms(audio_engine_state_t *eng,
         return false;
     }
     drflac *flac = (drflac *)eng->flac;
-    uint64_t frame = ((uint64_t)position_ms * (uint64_t)eng->sample_rate) / 1000ull;
+    /* v337: source frames; a new position starts a fresh decimation. */
+    uint64_t frame = ((uint64_t)position_ms * ((uint64_t)eng->sample_rate << eng->decim_stages)) /
+                     1000ull;
     if (frame > flac->totalPCMFrameCount) frame = flac->totalPCMFrameCount;
+    if (eng->decim_stages) {
+        (void)ae_decim_setup(eng, flac->sampleRate);
+    }
     uint32_t fault_before = audio_fw_preload_stream_fault_epoch(fw);
     if (!drflac_seek_to_pcm_frame(flac, (drflac_uint64)frame) ||
         audio_fw_preload_stream_fault_epoch(fw) != fault_before) {
@@ -2347,6 +2355,9 @@ static int ae_flac_decode_one_frame(audio_engine_state_t *eng,
             out_pcm[i * 2u] = scratch[i * channels];
             out_pcm[i * 2u + 1u] = scratch[i * channels + 1u];
         }
+    }
+    if (eng->decim_stages) {
+        return (int)ae_decim_run(eng, out_pcm, (size_t)got);   /* v337 */
     }
     return (int)got;
 }
@@ -5489,6 +5500,7 @@ static esp_err_t audio_engine_load_for_deck(uint8_t deck,
     /* MP3, WAV and FLAC share a bounded seekable compressed-page cache;
      * unknown extensions fall back to MP3 (minimp3 resyncs on the first frame). */
     eng->format = (detected_format == AUDIO_FORMAT_UNKNOWN) ? AUDIO_FORMAT_MP3 : detected_format;
+    eng->decim_stages = 0u;   /* v337: set by the WAV / FLAC init */
     audio_fw_preload_t *fw = &s_fw_preloads[deck];
     audio_fw_preload_set_path(fw, mp3_path);
     eng->fp = NULL;

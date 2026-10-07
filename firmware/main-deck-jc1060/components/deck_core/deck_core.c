@@ -117,6 +117,7 @@ static deck_net_sync_t   s_net_sync[DECK_CORE_DECK_COUNT];
 static bool              s_net_sync_enabled;
 static deck_net_clock_t  s_net_clock;
 static uint32_t          s_net_clock_seq;
+static uint32_t          s_output_latency_us;   /* v339, atomic */
 static bool              s_net_clock_writer;
 static bool net_sync_available(uint8_t *player);
 static void net_sync_engage(uint8_t deck, deck_state_t *state, uint8_t player);
@@ -868,6 +869,20 @@ static uint32_t loaded_track_key_for_deck(uint8_t deck)
         return 0;
     }
     return loaded.track_key;
+}
+
+/* v338: the tracks on the decks keep their hot cue blob when the NVS fills
+ * (hot_cue_store prunes the seed-only ones of the others). */
+static size_t pinned_track_keys(uint32_t *keys, size_t max)
+{
+    size_t n = 0;
+    for (uint8_t d = 0; d < DECK_CORE_DECK_COUNT && n < max; d++) {
+        const uint32_t key = loaded_track_key_for_deck(d);
+        if (key != 0u) {
+            keys[n++] = key;
+        }
+    }
+    return n;
 }
 
 static uint8_t hot_cue_exists_mask_for_deck(uint8_t deck)
@@ -3783,12 +3798,63 @@ static bool sync_engage(uint8_t deck, deck_state_t *state)
     return apply_beat_sync(deck, state);
 }
 
+/* v341: fader start from a DJ Link mixer (dj_link_mixer.h), deck task. It
+ * does what the operator's PLAY and CUE do on a CDJ: the raised fader starts
+ * a paused deck from where it stands (on its cue point after CUE), the lowered
+ * fader sends a playing deck back to its cue point, paused. Only while LINK
+ * SYNC is on (the switch that lets the network control the decks), only on a
+ * loaded deck, and a command that changes nothing is dropped. A deck the jog
+ * holds (touch, scratch) is left alone. */
+static void apply_net_fader(uint8_t deck, deck_state_t *state, bool start)
+{
+    if (!__atomic_load_n(&s_net_sync_enabled, __ATOMIC_ACQUIRE)) {
+        ESP_LOGI(TAG, "deck %u mixer fader %s ignored: LINK SYNC off", (unsigned)deck + 1,
+                 start ? "start" : "stop");
+        return;
+    }
+    const bool uses_audio = deck_uses_audio_engine(deck);
+    if (!uses_audio || loaded_track_key_for_deck(deck) == 0u) {
+        ESP_LOGI(TAG, "deck %u mixer fader %s ignored: no track", (unsigned)deck + 1,
+                 start ? "start" : "stop");
+        return;
+    }
+    if (s_jog_touched[deck] || s_jog_scratch_active[deck]) {
+        ESP_LOGI(TAG, "deck %u mixer fader %s ignored: jog held", (unsigned)deck + 1,
+                 start ? "start" : "stop");
+        return;
+    }
+    const bool playing = audio_engine_deck_is_playing(deck);
+    cue_park_cancel(deck, "mixer fader");
+    if (start && !playing) {
+        s_cue_preview[deck] = false;
+        const esp_err_t rc = audio_engine_deck_play(deck);
+        if (rc == ESP_OK) {
+            state->playing = true;
+        }
+        ESP_LOGW(TAG, "deck %u mixer fader start: %s at %lu ms", (unsigned)deck + 1,
+                 rc == ESP_OK ? "PLAYING" : esp_err_to_name(rc),
+                 (unsigned long)current_deck_position_ms(deck, state));
+    } else if (!start && playing) {
+        s_cue_preview[deck] = false;
+        return_to_cue_paused(deck, state, uses_audio);
+        ESP_LOGW(TAG, "deck %u mixer fader stop: back to the cue %lu ms (paused)",
+                 (unsigned)deck + 1, (unsigned long)state->cue_point_ms);
+    } else {
+        return;
+    }
+    sync_legacy_compat_leds(deck);
+}
+
 /* v305: SYNC / SYNC MASTER asked by the network (dj_link_master.h), deck
  * task. deck_core decides: these are the same changes the buttons make. */
 static void apply_net_command(uint8_t deck, deck_core_net_cmd_t cmd)
 {
     deck = normalize_deck(deck);
     deck_state_t *state = &s_decks[deck];
+    if (cmd == DECK_CORE_NET_FADER_START || cmd == DECK_CORE_NET_FADER_STOP) {
+        apply_net_fader(deck, state, cmd == DECK_CORE_NET_FADER_START);
+        return;
+    }
     switch (cmd) {
     case DECK_CORE_NET_SYNC_ON:
         if (!state->sync_enabled) {
@@ -3862,6 +3928,7 @@ static bool net_sync_service(void)
             .playing = state->playing,
             .hold = s_jog_touched[deck] || s_jog_scratch_active[deck],
             .position_ms = current_deck_position_ms(deck, state),
+            .latency_us = __atomic_load_n(&s_output_latency_us, __ATOMIC_RELAXED),
             .beats = meta ? meta->beats : NULL,
             .beat_count = meta ? meta->beat_count : 0u,
         };
@@ -4056,6 +4123,8 @@ static void deck_task(void *arg)
 esp_err_t deck_core_init(QueueHandle_t *ctrl_event_queue_out)
 {
     deck_loaded_track_store_reset(&s_loaded_tracks);
+    hot_cue_store_set_pin_provider(pinned_track_keys);
+    hot_cue_store_log_usage("boot");
     for (uint8_t i = 0; i < DECK_CORE_DECK_COUNT; i++) {
         init_deck_state(&s_decks[i]);
     }
@@ -4333,6 +4402,11 @@ void deck_core_get_net_clock(deck_net_clock_t *out)
     if (out) {
         net_clock_read(out);
     }
+}
+
+void deck_core_set_output_latency_us(uint32_t us)
+{
+    __atomic_store_n(&s_output_latency_us, us, __ATOMIC_RELAXED);
 }
 
 uint32_t deck_core_net_clock_now_ms(void)

@@ -7,6 +7,7 @@
 #include "audio_engine.h"
 #include <assert.h>
 #include <stdio.h>
+#include <string.h>
 
 int audio_engine_stub_channel_volume[DECK_CORE_DECK_COUNT];
 int audio_engine_stub_pregain[DECK_CORE_DECK_COUNT];
@@ -160,8 +161,65 @@ static void test_net_master_commands(void)
     s_tests_run++;
 }
 
+/* v341: fader start from a DJ Link mixer. */
+static void load_for_fader(uint8_t deck)
+{
+    anlz_metadata_t meta;
+    memset(&meta, 0, sizeof(meta));
+    audio_engine_stub_deck_loaded[deck] = true;
+    assert(deck_core_publish_loaded_track(deck, 1u, 0x1000u + deck, 128, 300000u, &meta) ==
+           ESP_OK);
+}
+
+static void test_net_fader_start_stop(void)
+{
+    reset_all();
+    load_for_fader(CTRL_DECK_1);
+    audio_engine_stub_deck_playing[CTRL_DECK_1] = false;
+
+    /* LINK SYNC off: the mixer is ignored. */
+    deck_core_set_net_sync_enabled(false);
+    deck_core_net_command(CTRL_DECK_1, DECK_CORE_NET_FADER_START);
+    assert(!audio_engine_stub_deck_playing[CTRL_DECK_1]);
+
+    deck_core_set_net_sync_enabled(true);
+    deck_core_net_command(CTRL_DECK_1, DECK_CORE_NET_FADER_START);
+    assert(audio_engine_stub_deck_playing[CTRL_DECK_1]);
+    assert(deck_core_get_deck_state(CTRL_DECK_1).playing);
+
+    /* A start while it plays changes nothing. */
+    audio_engine_stub_deck_position_ms[CTRL_DECK_1] = 12345u;
+    deck_core_net_command(CTRL_DECK_1, DECK_CORE_NET_FADER_START);
+    assert(audio_engine_stub_deck_playing[CTRL_DECK_1]);
+
+    /* The lowered fader returns to the cue, paused. */
+    deck_core_net_command(CTRL_DECK_1, DECK_CORE_NET_FADER_STOP);
+    assert(!audio_engine_stub_deck_playing[CTRL_DECK_1]);
+    assert(!deck_core_get_deck_state(CTRL_DECK_1).playing);
+    assert(deck_core_get_deck_state(CTRL_DECK_1).position_ms ==
+           deck_core_get_deck_state(CTRL_DECK_1).cue_point_ms);
+
+    /* A stop on a paused deck changes nothing. */
+    deck_core_net_command(CTRL_DECK_1, DECK_CORE_NET_FADER_STOP);
+    assert(!audio_engine_stub_deck_playing[CTRL_DECK_1]);
+
+    /* An empty deck is left alone, and the other deck is not touched. */
+    deck_core_net_command(CTRL_DECK_2, DECK_CORE_NET_FADER_START);
+    assert(!audio_engine_stub_deck_playing[CTRL_DECK_2]);
+    assert(!audio_engine_stub_deck_playing[CTRL_DECK_1]);
+
+    /* A failing engine leaves the deck paused. */
+    audio_engine_stub_deck_play_result[CTRL_DECK_1] = ESP_FAIL;
+    deck_core_net_command(CTRL_DECK_1, DECK_CORE_NET_FADER_START);
+    assert(!deck_core_get_deck_state(CTRL_DECK_1).playing);
+    audio_engine_stub_deck_play_result[CTRL_DECK_1] = ESP_OK;
+    deck_core_set_net_sync_enabled(false);
+    s_tests_run++;
+}
+
 int main(void)
 {
+    test_net_fader_start_stop();
     test_pfl_press_lights_led_on_its_deck();
     test_pfl_release_leaves_led_alone();
     test_second_pfl_press_turns_led_off();

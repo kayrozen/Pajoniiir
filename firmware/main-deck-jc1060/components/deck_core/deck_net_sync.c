@@ -40,7 +40,8 @@ bool deck_net_clock_bar_position(const deck_net_clock_t *clock, uint32_t now_ms,
         return false;
     }
     /* Signed: the anchor may be a few ms ahead of a now sampled earlier. */
-    const float elapsed_us = (float)(int32_t)(now_ms - clock->anchor_ms) * 1000.0f;
+    const float elapsed_us = (float)(int32_t)(now_ms - clock->anchor_ms) * 1000.0f -
+                             (float)clock->anchor_frac_us;
     const float beats = elapsed_us / (float)clock->period_us;
     if (beats > DECK_NET_SYNC_STALE_BEATS || beats < -1.0f) {
         return false;
@@ -126,8 +127,19 @@ void deck_net_sync_step(deck_net_sync_t *s, const deck_net_clock_t *clock,
     float m_bar = 0.0f, l_bar = 0.0f, len_ms = 0.0f, l_bpm = 0.0f;
     bool m_known = false, l_known = false;
     const bool have_master = deck_net_clock_bar_position(clock, now_ms, &m_bar, &m_known);
+    /* The position that is being heard: the mixed one minus the output
+     * latency, in track time (the deck plays at 1 + pitch). The snap target
+     * below adds the latency back, so it stays a mixed position. */
+    uint32_t heard_ms = local ? local->position_ms : 0u;
+    float lat_ms = 0.0f;
+    if (local && local->latency_us != 0u) {
+        const uint32_t lat_us = local->latency_us > DECK_NET_SYNC_LATENCY_MAX_US
+                                    ? DECK_NET_SYNC_LATENCY_MAX_US : local->latency_us;
+        lat_ms = (float)lat_us * 0.001f * (1.0f + s->pitch_percent * 0.01f);
+        heard_ms = heard_ms > (uint32_t)lat_ms ? heard_ms - (uint32_t)lat_ms : 0u;
+    }
     const bool have_local = local &&
-        deck_net_sync_local_position(local->beats, local->beat_count, local->position_ms,
+        deck_net_sync_local_position(local->beats, local->beat_count, heard_ms,
                                      &l_bar, &l_known, &len_ms, &l_bpm);
     if (!have_master || !have_local || l_bpm <= 0.0f) {
         /* Keep whatever tempo we had: a master that stops leaves us playing. */
@@ -171,7 +183,7 @@ void deck_net_sync_step(deck_net_sync_t *s, const deck_net_clock_t *clock,
             (uint32_t)(now_ms - s->far_since_ms) >= DECK_NET_SYNC_FAR_HOLD_MS &&
             (!s->snapped || (uint32_t)(now_ms - s->last_snap_ms) >= DECK_NET_SYNC_SNAP_GAP_MS);
         if (s->need_snap || far_due) {
-            float target = (float)local->position_ms + e_bar * len_ms;
+            float target = (float)heard_ms + lat_ms + e_bar * len_ms;
             if (target < 0.0f) target += 4.0f * len_ms;   /* next bar instead */
             out->seek = true;
             out->seek_ms = (uint32_t)(target + 0.5f);

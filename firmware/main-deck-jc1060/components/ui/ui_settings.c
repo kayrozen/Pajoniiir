@@ -75,6 +75,15 @@ const char *ui_settings_master_trim_label(uint8_t preset)
 #include "esp_log.h"
 #include "ui_theme.h"
 
+/* v340: EXT_RAM_BSS_ATTR moves a static to PSRAM when
+ * CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY is set; empty on host builds. */
+#ifdef ESP_PLATFORM
+#include "esp_attr.h"
+#endif
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
+#endif
+
 #ifndef WIN32
 #include "app_settings.h"
 #include "audio_engine.h"
@@ -338,6 +347,53 @@ static void ui_settings_djui_poll_link(ui_djui_settings_view_t *v, uint32_t now_
     };
 }
 
+/* v338: the DJ LINK PLAYERS panel (tap the master chip). Asked only while it
+ * is open, 4 times a second; the position is carried on by dj_link. */
+static uint32_t s_djui_nb_poll_ms;
+static bool s_djui_nb_was_visible;
+
+static void ui_settings_djui_poll_neighbors(uint32_t now_ms)
+{
+    if (!dj_ui_neighbors_visible()) {
+        s_djui_nb_was_visible = false;
+        return;
+    }
+    if (s_djui_nb_was_visible &&
+        !ui_settings_should_poll(now_ms, s_djui_nb_poll_ms, false, 250u)) {
+        return;
+    }
+    s_djui_nb_was_visible = true;
+    s_djui_nb_poll_ms = now_ms;
+
+    /* Static and in PSRAM: 2.4 KB of previews that dj_ui copies before this
+     * returns, polled 4 times a second. */
+    EXT_RAM_BSS_ATTR static dj_link_neighbor_t s_nb[DJ_LINK_NEIGHBORS_MAX];
+    EXT_RAM_BSS_ATTR static dj_ui_neighbor_t s_ui[DJ_NEIGHBOR_ROWS];
+    const uint8_t count = dj_link_get_neighbors(s_nb, DJ_LINK_NEIGHBORS_MAX);
+    for (uint8_t i = 0; i < count; i++) {
+        const dj_link_neighbor_t *n = &s_nb[i];
+        s_ui[i] = (dj_ui_neighbor_t){
+            .number = n->number,
+            .name = n->name,
+            .master = n->master,
+            .on_air = n->on_air,
+            .playing = n->playing,
+            .synced = n->synced,
+            .bpm = n->bpm,
+            .pitch_pct = n->pitch_pct,
+            .has_track = n->has_track,
+            .title = n->has_meta ? n->title : "",
+            .artist = n->has_meta ? n->artist : "",
+            .position_ms = n->has_position ? (int32_t)n->position_ms : -1,
+            .duration_ms = n->has_meta && n->duration_s ? (int32_t)n->duration_s * 1000 : 0,
+            .position_estimated = n->position_estimated,
+            .wave = n->has_wave ? n->wave : NULL,
+            .wave_gen = n->wave_gen,
+        };
+    }
+    dj_ui_set_link_neighbors(s_ui, count);
+}
+
 /* v304: the master's beat in bar from the clock the dj_link task feeds
  * deck_core with packet timestamps, so it moves with the beats rather than
  * with the 2 Hz summary. Only when that clock is the shown master's. */
@@ -417,6 +473,7 @@ void ui_settings_djui_update(const ui_frame_context_t *ctx)
 
     v->tempo_range_pct = tempo_range_sync();
     ui_settings_djui_poll_link(v, ctx->now_ms);
+    ui_settings_djui_poll_neighbors(ctx->now_ms);
     ui_settings_djui_link_beat(v);
     ui_settings_djui_poll_controller(v);
     if (s_djui_settings_visible &&

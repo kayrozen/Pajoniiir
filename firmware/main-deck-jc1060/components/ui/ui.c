@@ -856,8 +856,10 @@ static void ui_djui_overview_deck(const ui_frame_context_t *ctx, uint8_t deck, u
     /* v262: anchor on the audible position (the mixed one, one output
      * latency ago), then extrapolate. */
     uint64_t now_us = ui_monotonic_time_us();
+    const uint32_t latency_us = ui_output_latency_us();
+    deck_core_set_output_latency_us(latency_us);   /* v339: net sync hears what the UI shows */
     uint32_t audible_ms = ui_audible_position_update(&s_djui_audible[deck], state->position_ms, now_us,
-                                                     ui_output_latency_us());
+                                                     latency_us);
     uint32_t position_ms = ui_position_interpolator_update(&s_djui_interp[deck], audible_ms,
                                                            view->duration_ms, state->playing,
                                                            speed_permille, now_us);

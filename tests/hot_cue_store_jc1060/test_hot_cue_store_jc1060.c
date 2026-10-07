@@ -410,6 +410,93 @@ static void test_memory_decode(void)
     assert(hot_cue_store_memory_load(0, &blob) == ESP_ERR_INVALID_ARG);
 }
 
+void hot_cue_store_test_reset(void);
+
+static hot_cue_store_blob_t seed_blob(uint32_t pos_ms)
+{
+    hot_cue_store_blob_t b = {0};
+    b.valid_mask = 0x01;
+    b.source_mask = 0x01;
+    b.slots[0].pos_ms = pos_ms;
+    b.slots[0].type = HOT_CUE_STORE_TYPE_SINGLE;
+    return b;
+}
+
+static uint32_t s_pinned_key;
+
+static size_t pin_one(uint32_t *keys, size_t max)
+{
+    if (max < 1u) {
+        return 0u;
+    }
+    keys[0] = s_pinned_key;
+    return 1u;
+}
+
+static void test_seed_only_rule(void)
+{
+    hot_cue_store_blob_t b = seed_blob(1000);
+    assert(hot_cue_store_blob_is_seed_only(&b));
+    b.has_cue = 1;
+    b.cue_from_source = 1;
+    b.cue_point_ms = 500;
+    assert(hot_cue_store_blob_is_seed_only(&b));
+    b.cue_from_source = 0;                         /* a CUE press on the deck */
+    assert(!hot_cue_store_blob_is_seed_only(&b));
+    b = seed_blob(1000);
+    b.valid_mask |= 0x02;                          /* pad 2 set on the deck */
+    b.slots[1].pos_ms = 2000;
+    assert(!hot_cue_store_blob_is_seed_only(&b));
+    memset(&b, 0, sizeof(b));                      /* empty */
+    assert(hot_cue_store_blob_is_seed_only(&b));
+}
+
+/* v338: a full store frees the seed-only blobs of unpinned tracks and retries;
+ * pads made on the deck, the loaded tracks and the saved key stay. */
+static void test_full_store_prunes_seed_only(void)
+{
+    hot_cue_store_test_reset();
+    hot_cue_store_blob_t seed = seed_blob(1000);
+    hot_cue_store_blob_t local = seed_blob(1000);
+    local.valid_mask |= 0x02;
+    local.slots[1].pos_ms = 2000;
+    local.slots[1].type = HOT_CUE_STORE_TYPE_SINGLE;
+
+    for (uint32_t k = 1; k <= 16; k++) {
+        assert(hot_cue_store_save(k, (k == 3 || k == 4) ? &local : &seed) == ESP_OK);
+    }
+    s_pinned_key = 5;
+    hot_cue_store_set_pin_provider(pin_one);
+
+    assert(hot_cue_store_save(100, &seed) == ESP_OK);    /* 17th key: pruned, retried */
+    hot_cue_store_blob_t got;
+    assert(hot_cue_store_load(100, &got) == ESP_OK);
+    assert(hot_cue_store_load(3, &got) == ESP_OK && got.valid_mask == 0x03);
+    assert(hot_cue_store_load(4, &got) == ESP_OK && got.valid_mask == 0x03);
+    assert(hot_cue_store_load(5, &got) == ESP_OK);       /* pinned: kept */
+    assert(hot_cue_store_load(1, &got) == ESP_ERR_NOT_FOUND);
+    assert(hot_cue_store_load(16, &got) == ESP_ERR_NOT_FOUND);
+    hot_cue_store_set_pin_provider(NULL);
+}
+
+static void test_full_store_without_room_fails(void)
+{
+    hot_cue_store_test_reset();
+    hot_cue_store_blob_t local = seed_blob(1000);
+    local.valid_mask |= 0x02;
+    local.slots[1].pos_ms = 2000;
+    local.slots[1].type = HOT_CUE_STORE_TYPE_SINGLE;
+    for (uint32_t k = 1; k <= 16; k++) {
+        assert(hot_cue_store_save(k, &local) == ESP_OK);
+    }
+    assert(hot_cue_store_save(100, &local) == ESP_ERR_NVS_NOT_ENOUGH_SPACE);
+    hot_cue_store_blob_t got;
+    for (uint32_t k = 1; k <= 16; k++) {
+        assert(hot_cue_store_load(k, &got) == ESP_OK);   /* nothing of the deck lost */
+    }
+    hot_cue_store_test_reset();
+}
+
 int main(void)
 {
     assert(sizeof(hot_cue_store_blob_t) == sizeof(blob_v1_t) + 8u);
@@ -429,6 +516,9 @@ int main(void)
     test_memory_full();
     test_memory_find_and_step();
     test_memory_decode();
+    test_seed_only_rule();
+    test_full_store_prunes_seed_only();
+    test_full_store_without_room_fails();
     puts("hot_cue_store_jc1060 tests passed");
     return 0;
 }

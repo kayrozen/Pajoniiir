@@ -1579,6 +1579,20 @@ static void test_peer_track_key(void)
     CHECK(dj_link_peer_track_key(0, 0, 0) == 0xc8e581ffu);
 }
 
+static void test_media_track_key(void)
+{
+    const char *p = "/Contents/Artist/Track.mp3";
+    uint32_t k = dj_link_media_track_key(p, 12307765u);
+    CHECK(k != 0u && k == dj_link_media_track_key(p, 12307765u));
+    CHECK(k != dj_link_media_track_key(p, 12307766u));                 /* re-encoded */
+    CHECK(k != dj_link_media_track_key("/Contents/Artist/track.mp3", 12307765u));
+    CHECK(k != dj_link_media_track_key("/Contents/Artist/Track.mp", 12307765u));
+    CHECK(dj_link_media_track_key(NULL, 0u) == dj_link_media_track_key("", 0u));
+    CHECK(dj_link_media_track_key("", 0u) != 0u);
+    /* Not the v249 key of any (ip, number, id) by construction: the tag. */
+    CHECK(dj_link_media_track_key("", 0u) != dj_link_peer_track_key(0, 0, 0));
+}
+
 static void test_discovery_timeout(void)
 {
     mock_t mk;
@@ -1676,6 +1690,7 @@ int main(void)
     test_analysis_blobs();
     test_artwork();
     test_cues();
+    test_media_track_key();
     test_peer_track_key();
     test_discovery_timeout();
     test_bad_reply();

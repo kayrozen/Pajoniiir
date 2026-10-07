@@ -303,6 +303,15 @@ dj_link_peer_load_t dj_link_peer_load_check(const dj_link_peer_track_t *t,
  * rekordbox id): names its cache file and marks it loaded in the Library. */
 uint32_t dj_link_peer_track_key(uint32_t peer_ip, uint8_t peer_number, uint32_t rekordbox_id);
 
+/* v336: media identity of a downloaded peer file, the key of its cache files
+ * and of its cue edits since v336: FNV-1a of a version tag, the file path in
+ * the player's export (as the NFS fetch resolved it) and its size. It does
+ * not depend on the peer's IP, player number or rekordbox id, so it survives
+ * a new DHCP lease, another player number, a re-export and the same stick in
+ * another player; a re-encoded file (other size) gets a new key. The v249
+ * key (dj_link_peer_track_key) stays to migrate cue edits made before. */
+uint32_t dj_link_media_track_key(const char *path, uint32_t size);
+
 #ifdef __cplusplus
 }
 #endif

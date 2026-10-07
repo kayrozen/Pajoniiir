@@ -1339,6 +1339,34 @@ $tests = @(
         )
     },
     @{
+        # JC1060 v337 hi-res 2:1 half-band decimation.
+        Name = "audio_decim2_jc1060"
+        Dir = "tests/audio_decim2_jc1060"
+        Target = "test_audio_decim2_jc1060.exe"
+        Args = @(
+            "-Wall", "-Wextra", "-Wpedantic", "-Werror=implicit-function-declaration", "-std=c99", "-O2",
+            "-I../../firmware/main-deck-jc1060/components/audio_engine/include", "-I../../firmware/main-deck-jc1060/components/audio_engine",
+            "-o", "test_audio_decim2_jc1060.exe",
+            "test_audio_decim2_jc1060.c",
+            "../../firmware/main-deck-jc1060/components/audio_engine/audio_decim2.c",
+            "-lm"
+        )
+    },
+    @{
+        # JC1060 v337 PCM files: WAV 16/24/32/float/extensible, AIFF, AIFC.
+        Name = "audio_pcm_file_jc1060"
+        Dir = "tests/audio_pcm_file_jc1060"
+        Target = "test_audio_pcm_file_jc1060.exe"
+        Args = @(
+            "-Wall", "-Wextra", "-Wpedantic", "-Werror=implicit-function-declaration", "-std=c99",
+            "-I../../firmware/main-deck-jc1060/components/audio_engine/include",
+            "-o", "test_audio_pcm_file_jc1060.exe",
+            "test_audio_pcm_file_jc1060.c",
+            "../../firmware/main-deck-jc1060/components/audio_engine/audio_pcm_file.c",
+            "-lm"
+        )
+    },
+    @{
         # JC1060 v328 start fade-in and PLAY start probe (audio_output_mixer.c).
         Name = "audio_start_ramp_jc1060"
         Dir = "tests/audio_start_ramp_jc1060"

@@ -59,6 +59,8 @@ typedef enum {
     DJ_LINK_DECK_CMD_SYNC_OFF,
     DJ_LINK_DECK_CMD_MASTER_TAKE,
     DJ_LINK_DECK_CMD_MASTER_DROP,
+    DJ_LINK_DECK_CMD_FADER_START,   /* v341: a mixer raised this deck's channel fader */
+    DJ_LINK_DECK_CMD_FADER_STOP,    /* v341: ... lowered it */
 } dj_link_deck_cmd_t;
 
 typedef struct {

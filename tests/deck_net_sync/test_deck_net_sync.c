@@ -40,6 +40,8 @@ typedef struct {
     bool   playing;
     float  pitch;
     unsigned seeks;
+    uint32_t phys_latency_us; /* v339: mixed to heard, what the room hears */
+    bool     compensate;      /* v339: tell the controller about it */
     deck_net_sync_t sync;
     deck_net_sync_out_t out;
     uint32_t now_ms;
@@ -60,7 +62,9 @@ static void sim_init(sim_t *s, double master_bpm, double local_start_ms)
  * not what the controller estimates). */
 static double true_error(const sim_t *s)
 {
-    double local_beats = (s->pos_ms - (double)s_grid[0].time_ms) / LOCAL_BEAT_MS;
+    /* What is heard is the mixed position one output latency ago. */
+    const double heard_ms = s->pos_ms - (double)s->phys_latency_us * 0.001 * (1.0 + s->pitch / 100.0);
+    double local_beats = (heard_ms - (double)s_grid[0].time_ms) / LOCAL_BEAT_MS;
     double d = fmod(s->beat_pos + s->beat_shift - local_beats, 4.0);
     if (d >= 2.0) d -= 4.0;
     if (d < -2.0) d += 4.0;
@@ -90,6 +94,7 @@ static void sim_step(sim_t *s)
     deck_net_sync_local_t local = {
         .playing = s->playing,
         .position_ms = (uint32_t)lround(s->pos_ms),
+        .latency_us = s->compensate ? s->phys_latency_us : 0u,
         .beats = s_grid,
         .beat_count = GRID_BEATS,
     };
@@ -121,6 +126,11 @@ static void test_clock_bar_position(void)
     /* Stale after 2.5 missed beats. */
     assert(!deck_net_clock_bar_position(&c, 1000u + 1300u, &bar, &known));
     assert(deck_net_clock_beat_in_bar(&c, 2300u) == 0u);
+    /* v339: the microseconds below the anchor millisecond count. */
+    c.anchor_frac_us = 500u;
+    assert(deck_net_clock_bar_position(&c, 1250u, &bar, &known));
+    assert(fabsf(bar - (2.0f + 249.5f / 500.0f)) < 1e-4f);
+    c.anchor_frac_us = 0u;
     /* Anchor across the uint32 wrap. */
     c.anchor_ms = 0xFFFFFF00u;
     assert(deck_net_clock_bar_position(&c, 0x00000100u, &bar, &known));
@@ -267,6 +277,65 @@ static void test_out_of_reach_and_disengage(void)
     assert(s.out.status == DECK_NET_SYNC_OFF && !s.out.set_pitch && !s.out.seek);
 }
 
+/* v339: the loop holds what is heard, not the mixed position. */
+static void test_output_latency_compensated(void)
+{
+    make_grid(100u);
+    sim_t s;
+    sim_init(&s, 128.0, 10000.0 + 170.0);
+    s.phys_latency_us = 40000u;
+    s.compensate = true;
+    sim_run(&s, 1000u);
+    deck_net_sync_engage(&s.sync);
+    s.playing = true;
+    sim_step(&s);
+    assert(s.seeks == 1u);
+    assert(fabs(true_error(&s)) < 0.1);       /* the snap is a mixed position: lands heard-aligned */
+    sim_run(&s, 8000u);
+    assert(s.seeks == 1u);
+    assert(s.out.status == DECK_NET_SYNC_LOCKED);
+    assert(fabs(true_error(&s)) < 0.01);      /* heard phase locked */
+    /* So the mixed position leads by the latency: 40 ms = 0.083 of a 480 ms beat. */
+    const double lead = (40.0 * (1.0 + s.pitch / 100.0)) / LOCAL_BEAT_MS;
+    assert(lead > 0.07 && lead < 0.1);
+}
+
+static void test_output_latency_ignored_is_off(void)
+{
+    /* The same room without the compensation: locked on the mixed position,
+     * the speaker is a latency behind (what v304 to v338 did). */
+    make_grid(100u);
+    sim_t s;
+    sim_init(&s, 128.0, 10000.0 + 170.0);
+    s.phys_latency_us = 40000u;
+    s.compensate = false;
+    sim_run(&s, 1000u);
+    deck_net_sync_engage(&s.sync);
+    s.playing = true;
+    sim_run(&s, 9000u);
+    assert(s.out.status == DECK_NET_SYNC_LOCKED);
+    const double e = true_error(&s);
+    assert(e > 0.06 && e < 0.11);             /* heard behind the master by ~0.083 beat */
+}
+
+static void test_output_latency_clamped(void)
+{
+    make_grid(100u);
+    deck_net_sync_t sync;
+    deck_net_sync_engage(&sync);
+    deck_net_clock_t c = { .valid = true, .anchor_ms = 1000u, .period_us = 468750u,
+                           .beat_in_bar = 1u };
+    deck_net_sync_local_t local = { .playing = true, .position_ms = 10000u, .latency_us = 0xFFFFFFFFu,
+                                    .beats = s_grid, .beat_count = GRID_BEATS };
+    deck_net_sync_out_t a, b;
+    deck_net_sync_step(&sync, &c, &local, 1100u, &a);
+    deck_net_sync_t sync2;
+    deck_net_sync_engage(&sync2);
+    local.latency_us = DECK_NET_SYNC_LATENCY_MAX_US;
+    deck_net_sync_step(&sync2, &c, &local, 1100u, &b);
+    assert(a.seek == b.seek && a.seek_ms == b.seek_ms);   /* beyond the cap = the cap */
+}
+
 static void test_hold_keeps_pitch_no_seek(void)
 {
     make_grid(100u);
@@ -293,6 +362,9 @@ int main(void)
     test_master_jump_resnaps_once();
     test_out_of_reach_and_disengage();
     test_hold_keeps_pitch_no_seek();
+    test_output_latency_compensated();
+    test_output_latency_ignored_is_off();
+    test_output_latency_clamped();
     printf("deck_net_sync: all tests passed\n");
     return 0;
 }
